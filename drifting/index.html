@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Generative Modeling via Drifting — an interactive explainer</title>
+  <meta name="description" content="A long, interactive, beginner-friendly explainer of Drifting Models: a one-step generative model that moves the iteration from inference to training."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Generative Modeling via Drifting</h1>
+    <p class="byline">
+      Deng, Li, Li, Du, He &middot; MIT &middot; February 2026 &middot;
+      <a href="https://arxiv.org/abs/2602.04770" target="_blank" rel="noopener">arXiv 2602.04770</a>
+    </p>
+    <p class="lede">
+      Modern generative models — diffusion, flow matching, autoregressive — share a trick: <em>split a hard
+      transformation into many small ones, applied iteratively at inference time</em>. Drifting Models propose
+      the opposite. Push the iteration out of inference entirely, leaving a single forward pass to generate
+      an image. State of the art on one-step ImageNet 256×256 generation: <strong>FID 1.54</strong>,
+      competitive with diffusion models that need <strong>500× the compute per image</strong>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#pushforward">The pushforward view of generation</a></li>
+      <li><a href="#train-iter">Move the iteration to training</a></li>
+      <li><a href="#field">The drifting field $V_{p,q}$</a></li>
+      <li><a href="#antisymmetry">The anti-symmetry trick</a></li>
+      <li><a href="#construction">Building $V$: attract and repel</a></li>
+      <li><a href="#loss">From field to loss</a></li>
+      <li><a href="#feature">Drifting in feature space</a></li>
+      <li><a href="#results">Results: SOTA in one step</a></li>
+      <li><a href="#why">Why this works</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/teaser.png" alt="Drifting Models teaser"/>
+      <figcaption>
+        At training iteration $i$, the generator $f_i$ pushes prior noise to a distribution $q_i$ (orange).
+        Each training step <em>drifts</em> samples, evolving $q_i$ toward the data distribution $p$ (blue).
+        At inference, generation is a single forward pass — no iterations. (Figure 1.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Open the hood of any recent image diffusion model and you'll see the same loop. Start with noise.
+      Take a step. Take another. Take 50, or 250, or 500 more. After all that, you finally have a picture.
+      The model is a function. Generation is a function call. So why are we calling it hundreds of times to
+      make one sample?
+    </p>
+    <p>
+      Because — the story goes — direct mapping from noise to a high-resolution image is too hard for a
+      single neural network. Diffusion's contribution wasn't a better network; it was a clever
+      <em>decomposition</em> of the problem into many tiny denoising steps, each of which the network can
+      handle. Inference is iterative because the original task was too big.
+    </p>
+    <p>
+      Drifting Models call that bluff. The authors argue that the iteration <em>is</em> necessary, but it
+      doesn't have to happen at inference time. Neural network training is already iterative — that's
+      what stochastic gradient descent does. If we design things right, every SGD step can play the role of
+      a small denoising step. By the end of training, the network has internalized the full mapping into
+      its weights, and inference becomes a single forward pass.
+    </p>
+    <p>
+      The result: a 463M-parameter generator that beats 675M-parameter multi-step diffusion models on
+      ImageNet, while running ~500× faster per sample.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="pushforward">
+    <h2>1. The pushforward view of generation</h2>
+
+    <p>
+      To explain how drifting works, we first need to agree on a way of looking at generative models. The
+      cleanest viewpoint is the <strong>pushforward</strong> formulation.
+    </p>
+
+    <p>
+      A generator is a neural network $f: \mathbb{R}^C \to \mathbb{R}^D$. You feed it noise
+      $\varepsilon \sim p_\varepsilon$ (some easy prior, like a Gaussian) and it produces an output
+      $x = f(\varepsilon) \in \mathbb{R}^D$.
+    </p>
+    <p>
+      As $\varepsilon$ varies over its distribution, $x$ inherits a distribution of its own. That
+      distribution is what's called the <strong>pushforward</strong> of $p_\varepsilon$ under $f$:
+    </p>
+    <p class="eq">$$ q = f_\# p_\varepsilon $$</p>
+    <p>
+      Read $f_\#$ as "push the input distribution through $f$." The goal of generative modeling is to find
+      an $f$ such that the resulting $q$ matches $p_\text{data}$ — the distribution of real images, or
+      sentences, or molecules, or whatever.
+    </p>
+
+    <p>The two big paradigms differ in how they realize this push:</p>
+    <ul>
+      <li>
+        <strong>Diffusion / flow matching:</strong> decompose the push into many small steps applied at
+        <em>inference</em> time. The network maps slightly noisy samples to slightly cleaner ones; iterate
+        50–250 times to get from noise to data.
+      </li>
+      <li>
+        <strong>Drifting Models:</strong> the network is non-iterative — one forward pass, noise to image.
+        The iteration happens at <em>training</em> time, where each SGD step drifts the network's output
+        distribution closer to the target.
+      </li>
+    </ul>
+
+    <p>
+      Both viewpoints decompose the same hard mapping into many easy ones. The choice is just <em>when</em>
+      the iteration happens. Drifting Models claim that putting the iteration into training gives you free
+      inference, at no cost in quality.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="train-iter">
+    <h2>2. Move the iteration to training</h2>
+
+    <p>
+      Here is the conceptual move. Training is naturally a sequence: $f_0, f_1, f_2, \dots, f_T$, where
+      $f_{i+1}$ is the network after one SGD step on $f_i$. Each $f_i$ has its own pushforward
+      distribution: $q_i = (f_i)_\# p_\varepsilon$. So training is a sequence of distributions
+      $q_0, q_1, q_2, \dots, q_T$, ideally converging to $p_\text{data}$.
+    </p>
+
+    <p>
+      Now zoom in on a specific noise sample $\varepsilon$. Before the SGD step, it gets mapped to
+      $x_i = f_i(\varepsilon)$. After the SGD step, the <em>same</em> $\varepsilon$ gets mapped to
+      $x_{i+1} = f_{i+1}(\varepsilon)$. The sample moved! Define this movement as the <strong>drift</strong>:
+    </p>
+    <p class="eq">$$ \Delta x_i = f_{i+1}(\varepsilon) - f_i(\varepsilon),\qquad
+       x_{i+1} = x_i + \Delta x_i $$</p>
+    <p>
+      This is just bookkeeping — a tautology about how SGD changes the network's outputs. But it sets up a
+      design question: <strong>what if we got to design $\Delta x_i$ directly?</strong> Pick the perfect
+      drift for each sample at every iteration, then engineer the SGD step to realize it.
+    </p>
+
+    <div class="widget-frame" id="pushforward">
+      <p class="widget-title">Pushforward in motion</p>
+      <p class="widget-sub">Press play. Watch the generator's output distribution $q$ (orange) drift toward
+        a bimodal target $p$ (blue) over training iterations. Try different initializations to see
+        Drifting Models escape mode collapse.</p>
+      <!-- widget injected here -->
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="field">
+    <h2>3. The drifting field $V_{p,q}$</h2>
+
+    <p>
+      Let's give that "perfect drift" a name. Define a vector-valued function:
+    </p>
+    <p class="eq">$$ V_{p,q}: \mathbb{R}^d \to \mathbb{R}^d $$</p>
+    <p>
+      For every sample $x$ in the generator's output distribution, $V_{p,q}(x)$ specifies the drift that
+      sample <em>should</em> take this iteration. Both $p$ (data) and $q$ (current generator
+      distribution) enter the field — the right drift depends on where the data is and where the current
+      generator is, relative to $x$.
+    </p>
+
+    <p>The training-time update for each sample becomes:</p>
+    <p class="eq">$$ x_{i+1} = x_i + V_{p, q_i}(x_i) $$</p>
+
+    <p>
+      Now the design question sharpens. <em>What field $V_{p,q}$ should we use?</em>
+    </p>
+
+    <p>The minimum requirement is simple and powerful:</p>
+
+    <aside class="callout">
+      <strong>Equilibrium condition.</strong> When $q = p$ — i.e., when the generator has finished its
+      job — the drifting field must be zero for every $x$. Nothing should move at the destination.
+      Anything else gives the generator no way to know when to stop.
+    </aside>
+
+    <p>
+      This single requirement — "no drift at equilibrium" — turns out to determine almost everything
+      about the method.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="antisymmetry">
+    <h2>4. The anti-symmetry trick</h2>
+
+    <p>
+      How do we <em>guarantee</em> that the drift vanishes when $q = p$, regardless of what the data
+      actually looks like or where the generator currently is? You could try to enforce it case-by-case,
+      but that gets messy fast.
+    </p>
+
+    <p>
+      The paper's slick trick: demand the drifting field is <strong>anti-symmetric</strong> under
+      swapping its two arguments:
+    </p>
+    <p class="eq">$$ V_{p,q}(x) = -V_{q,p}(x), \quad \forall x $$</p>
+
+    <p>
+      That is: if you swap the roles of $p$ and $q$, the drift just flips sign. It's a constraint on the
+      shape of the field, not on any specific point.
+    </p>
+
+    <p>The equilibrium then follows in three lines.</p>
+
+    <div class="widget-frame" id="antisymmetry-proof">
+      <p class="widget-title">The three-line proof</p>
+      <p class="widget-sub">Click each step. Watch how anti-symmetry forces zero drift at equilibrium.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <p>
+      The argument is so short you can fit it on a napkin:
+    </p>
+    <ol>
+      <li>Assume $q = p$. Then the inputs to $V_{p,q}$ are literally the same as the inputs to $V_{q,p}$.
+        So $V_{p,q}(x) = V_{q,p}(x)$.</li>
+      <li>By anti-symmetry, $V_{q,p}(x) = -V_{p,q}(x)$.</li>
+      <li>Combine: $V_{p,q}(x) = -V_{p,q}(x)$, which forces $V_{p,q}(x) = 0$.</li>
+    </ol>
+
+    <p>
+      Three lines, no calculus, no assumptions about the data. The anti-symmetry constraint is doing all
+      the work. This is the key idea of the paper — everything that follows is plumbing.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="construction">
+    <h2>5. Building $V$: attract and repel</h2>
+
+    <p>
+      Anti-symmetry is a constraint; we still need to <em>build</em> a specific $V$ that satisfies it.
+      The paper's construction comes from <strong>mean-shift</strong>, a classical clustering algorithm
+      that estimates local density gradients with kernels.
+    </p>
+
+    <p>Take a generator sample $x$. Look around in two distributions:</p>
+    <ul>
+      <li><strong>Look at the data.</strong> Sample real data points $y^+ \sim p$ and compute a weighted
+        average of their displacement from $x$:
+        <span class="eq" style="display:block;">
+          $$ V^+_p(x) = \frac{1}{Z_p}\, \mathbb{E}_{y^+ \sim p}\left[ k(x, y^+)\, (y^+ - x) \right] $$
+        </span>
+        This vector points in the direction of nearby data. It <em>attracts</em> $x$.
+      </li>
+      <li><strong>Look at other generator samples.</strong> Sample $y^- \sim q$ and do the same:
+        <span class="eq" style="display:block;">
+          $$ V^-_q(x) = \frac{1}{Z_q}\, \mathbb{E}_{y^- \sim q}\left[ k(x, y^-)\, (y^- - x) \right] $$
+        </span>
+        This points toward nearby <em>other</em> generator samples. We use it as a <em>repulsion</em>: we
+        want $x$ to move <em>away</em> from where other generated samples already are, to prevent the
+        generator from piling onto a few modes.
+      </li>
+    </ul>
+
+    <p>The full drifting field is just attraction minus repulsion:</p>
+    <p class="eq">$$ V_{p,q}(x) = V^+_p(x) - V^-_q(x) $$</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/drift_field.png" alt="Illustration of the drifting field"/>
+      <figcaption>
+        The drifting field at a single sample $x$ (black). Blue arrows: pull from nearby data points
+        ($V^+$). Orange arrows: push from nearby generator samples ($V^-$). The resultant
+        $V = V^+ - V^-$ moves $x$ toward data and away from collisions with itself. (Figure 2.)
+      </figcaption>
+    </figure>
+
+    <p>
+      You can also write this in a single, more symmetric form by substituting the two definitions:
+    </p>
+    <p class="eq">
+      $$ V_{p,q}(x) = \frac{1}{Z_p Z_q}\, \mathbb{E}_{y^+ \sim p,\ y^- \sim q}
+         \left[ k(x, y^+)\, k(x, y^-)\, (y^+ - y^-) \right] $$
+    </p>
+    <p>
+      Now the anti-symmetry is obvious: swap $p$ and $q$ and you swap $y^+ \leftrightarrow y^-$, which
+      flips the sign of $(y^+ - y^-)$. The kernel products and normalizers are unchanged. So
+      $V_{p,q} = -V_{q,p}$, as required.
+    </p>
+
+    <h3>The kernel</h3>
+
+    <p>The kernel $k$ measures sample similarity. The paper uses an exponential kernel:</p>
+    <p class="eq">$$ k(x, y) = \exp\!\left(-\frac{1}{\tau}\|x - y\|\right) $$</p>
+    <p>
+      with temperature $\tau$. In practice, after normalization, this becomes a softmax over distances —
+      essentially the same shape as the contrastive-learning weight in InfoNCE. Close neighbors get heavy
+      weight; distant ones, almost none.
+    </p>
+
+    <div class="widget-frame" id="drift-explorer">
+      <p class="widget-title">The drift field, live</p>
+      <p class="widget-sub">Click anywhere in the empty space to place a generator sample. See the
+        attract vectors (blue) toward data, repel vectors (orange) from other generator samples, and the
+        resultant drift vector. Adjust kernel temperature τ to see how locality changes the field.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <h3>Anti-symmetry is critical (and they prove it)</h3>
+
+    <p>
+      The paper runs a beautiful <em>destructive ablation</em>: deliberately break anti-symmetry by
+      rescaling one term. The results are catastrophic.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Drifting field</th><th>FID ↓</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>$V^+ - V^-$ (anti-symmetric)</strong></td><td class="win"><strong>8.46</strong></td></tr>
+        <tr><td>$1.5\,V^+ - V^-$</td><td>41.05</td></tr>
+        <tr><td>$V^+ - 1.5\,V^-$</td><td>46.28</td></tr>
+        <tr><td>$2\,V^+ - V^-$</td><td>86.16</td></tr>
+        <tr><td>$V^+ - 2\,V^-$</td><td>112.84</td></tr>
+        <tr><td>$V^+$ only (no repulsion)</td><td>177.14</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">B/2 model, 100 epochs on ImageNet (Table 1).</p>
+
+    <p>
+      Without exact balance, the equilibrium condition is no longer mathematically guaranteed, and the
+      generator either piles up at a small number of attractors (too much pull) or runs away from itself
+      forever (too much push). The clean 3:1 ratio of FID between $V^+-V^-$ and $1.5\,V^+-V^-$ — for a
+      tweak that <em>looks</em> harmless — is the cleanest experimental endorsement of the
+      anti-symmetry constraint in the paper.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="loss">
+    <h2>6. From field to loss</h2>
+
+    <p>
+      We have a drifting field. We want each SGD step to realize it. How do we phrase this as a
+      differentiable loss?
+    </p>
+
+    <p>
+      The setup. The optimal $f_{\theta^*}$ has zero drift on its own outputs:
+    </p>
+    <p class="eq">$$ f_{\theta^*}(\varepsilon) = f_{\theta^*}(\varepsilon) + V_{p, q_{\theta^*}}\!\left(f_{\theta^*}(\varepsilon)\right) $$</p>
+    <p>
+      This is a <strong>fixed-point</strong> equation: the network output equals itself plus the
+      drift, because the drift is zero.
+    </p>
+
+    <p>
+      Turn that into a fixed-point iteration. At step $i$, the target for $f_{\theta_{i+1}}$ is:
+      "produce $f_{\theta_i}(\varepsilon) + V(f_{\theta_i}(\varepsilon))$." Minimize the squared distance:
+    </p>
+    <p class="eq">
+      $$ \mathcal{L} = \mathbb{E}_\varepsilon \left\|\, f_\theta(\varepsilon)
+      \,-\, \text{sg}\!\left(f_\theta(\varepsilon) + V_{p, q_\theta}\!\left(f_\theta(\varepsilon)\right)\right) \right\|^2 $$
+    </p>
+
+    <p>
+      Two pieces to notice.
+    </p>
+
+    <p>
+      First, the <strong>stop-gradient</strong> ($\text{sg}$). The target — current output plus drift — is
+      computed from the current network, but then frozen as a constant tensor that doesn't carry gradients.
+      The optimizer only updates $f_\theta$ toward the frozen target. This is the same trick that powers
+      BYOL, SimSiam, and many self-distillation methods. It's what lets us treat the regression target as
+      a fixed point without dealing with the second-order effects of $f_\theta$ influencing its own target.
+    </p>
+
+    <p>
+      Second, the loss <em>value</em> equals $\mathbb{E}_\varepsilon \|V(f(\varepsilon))\|^2$. As the
+      generator approaches equilibrium, $V$ shrinks toward zero, so the loss shrinks toward zero. The loss
+      is a faithful proxy for distance from equilibrium.
+    </p>
+
+    <p>The training step, in pseudocode:</p>
+    <pre class="code"><code># f: generator
+# y_pos: [N_pos, D], real data samples
+
+e = randn([N, C])              # noise
+x = f(e)                       # [N, D], generated samples
+y_neg = x                      # reuse the batch as negatives
+
+V = compute_V(x, y_pos, y_neg)
+x_drifted = stopgrad(x + V)    # frozen target
+
+loss = mse_loss(x - x_drifted)</code></pre>
+
+    <p>
+      Notice that the negatives are <em>the same batch as the positives</em>. Each generator output is a
+      potential $y^-$ for every other generator output. This is the same "look at your batch-mates"
+      pattern from contrastive learning, which is no coincidence — the kernel weighting is structurally
+      the InfoNCE softmax.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="feature">
+    <h2>7. Drifting in feature space</h2>
+
+    <p>
+      One last technical point. Doing all this in raw pixel space doesn't work. The Euclidean distance
+      between two natural images is a terrible measure of semantic similarity — two photographs of the
+      same cat with the lighting slightly different have a huge pixel-wise distance.
+    </p>
+
+    <p>
+      So instead of comparing $x$ and $y$ directly, the paper applies the whole drifting machinery to
+      <em>features</em>:
+    </p>
+    <p class="eq">
+      $$ \mathcal{L} = \sum_j \mathbb{E}\left\|\,\phi_j(x)
+         - \text{sg}\!\left(\phi_j(x) + V\!\left(\phi_j(x)\right)\right)\right\|^2 $$
+    </p>
+    <p>
+      Here $\phi_j$ is the $j$-th-scale activation from a pretrained image encoder. The paper sweeps
+      several options (MoCo, SimCLR, latent-MAE) and finds that the <em>quality of the feature encoder
+      directly determines generation FID</em> — better representations → richer drift signal → better
+      generation.
+    </p>
+
+    <p>
+      This connects Drifting Models to a wider story: many recent advances in image generation (REPA,
+      LightningDiT, others) have shown that aligning the generator's internal representations with a
+      strong pretrained encoder is a powerful regularizer. Drifting Models take it further by making the
+      <em>entire training signal</em> live in feature space.
+    </p>
+
+    <aside class="callout">
+      <strong>Wait — isn't this just GAN?</strong> Not quite. GANs minimize a learned discriminator's
+      output on generator samples. Drifting Models compute a <em>field</em> (a vector at each generator
+      sample) from real and generated data and regress the network toward a stop-gradient target. There's
+      no adversary, no two-player game, no instability from competing objectives. The closest cousin is
+      mean-shift / kernel density estimation, not GAN training.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="visualize-flow">
+    <h2>8. Watching the drift</h2>
+
+    <p>
+      Here is what the whole story looks like in 2-D: a generator distribution $q$ (orange) drifting
+      toward a bimodal target $p$ (blue), with the velocity field shown as arrows. Each frame is one SGD
+      step. The arrows shrink as $q$ approaches $p$ — that's $\|V\|^2$ heading to zero, which is the
+      loss heading to zero.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/drift_field.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      40 SGD steps. The generator starts collapsed in the wrong place; the drifting field pulls it apart
+      into two clean modes matching the data. The same dynamics drive the ImageNet training, just in
+      512-D feature space.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/toy_checkerboard.png" alt="Checkerboard convergence"/>
+      <img src="assets/figures/toy_swiss.png" alt="Swiss roll convergence"/>
+      <figcaption>
+        Real toy experiments from the paper. Top: 2-D checkerboard. Bottom: Swiss roll. The loss
+        $\|V\|^2$ (y-axis, log scale) decreases monotonically as the samples find the data manifold.
+        (Figure 4.)
+      </figcaption>
+    </figure>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/dynamics.png" alt="Bimodal evolution with three initializations"/>
+      <figcaption>
+        Three different initializations of $q$, all converging to the same bimodal $p$. Top: $q$ starts
+        between modes. Middle: $q$ starts far from both. Bottom: $q$ starts collapsed on one mode. In every
+        case, the drifting field gets samples to the right places. The bottom row is the key one — even
+        starting from <em>mode collapse</em>, the repulsion term keeps samples moving until the other mode
+        gets populated. (Figure 3.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>9. Results: SOTA in one step</h2>
+
+    <p>
+      Time for ImageNet 256×256, the standard benchmark for class-conditional image generation. Drifting
+      Models are evaluated against the entire spectrum of recent multi-step and one-step methods.
+    </p>
+
+    <h3>The headline number</h3>
+
+    <table class="results">
+      <thead>
+        <tr><th>Method</th><th>NFE</th><th>FID ↓</th><th>IS ↑</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">Multi-step diffusion/flow</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>DiT-XL/2</td><td>250 × 2</td><td>2.27</td><td>278.2</td></tr>
+        <tr><td>SiT-XL/2</td><td>250 × 2</td><td>2.06</td><td>270.3</td></tr>
+        <tr><td>SiT-XL/2 + REPA</td><td>250 × 2</td><td>1.42</td><td>305.7</td></tr>
+        <tr><td>LightningDiT-XL/2</td><td>250 × 2</td><td>1.35</td><td>295.3</td></tr>
+        <tr><td class="cat">One-step (this paper)</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>Drifting Model, B/2</td><td>1</td><td>1.75</td><td>263.2</td></tr>
+        <tr><td><strong>Drifting Model, L/2</strong></td><td><strong>1</strong></td><td class="win"><strong>1.54</strong></td><td>258.9</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">ImageNet 256×256, latent space (Table 5).</p>
+
+    <p>
+      "NFE" is the number of forward evaluations of the generator per sample. Multi-step diffusion uses
+      250 forward passes <em>per</em> branch and runs two branches for CFG — 500 total. Drifting needs
+      one. So the comparison is something like:
+    </p>
+    <ul>
+      <li><strong>Speed:</strong> 500× faster per sample.</li>
+      <li><strong>Quality:</strong> FID 1.54 vs DiT-XL/2's 2.27 — substantially <em>better</em> than the
+        baseline multi-step model, and within striking distance of the best multi-step variants.</li>
+      <li><strong>Parameter count:</strong> 463M vs 675M — about a third smaller, too.</li>
+    </ul>
+
+    <p>
+      For one-step / few-step methods, this is the cleanest leap forward in a long time. There's no
+      distillation — Drifting Models are trained from scratch with one objective.
+    </p>
+
+    <div class="widget-frame" id="speed-compare">
+      <p class="widget-title">One step vs hundreds: side-by-side</p>
+      <p class="widget-sub">Choose a model and watch the inference flow. Diffusion incrementally denoises;
+        Drifting Models go straight from noise to image. Both end at the same FID.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/sample_macaw.jpg" alt="Generated macaw"/>
+      <img src="assets/figures/sample_lorikeet.jpg" alt="Generated lorikeet"/>
+      <figcaption>
+        Uncurated samples from Drifting Model, L/2. Each image was generated with a single forward pass.
+        (From Figure 7.)
+      </figcaption>
+    </figure>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/sample_owl.jpg" alt="Generated owl"/>
+      <img src="assets/figures/sample_frog.jpg" alt="Generated tree frog"/>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>10. Why this works</h2>
+
+    <p>
+      Drifting Models compress a lot of well-tested ideas into one tight package. None of the individual
+      ingredients are new; the synthesis is.
+    </p>
+
+    <h3>The repulsion term solves mode collapse for free</h3>
+
+    <p>
+      Mode collapse is the classical failure mode of generative models: the generator finds a few
+      high-likelihood points and refuses to produce anything else. Diffusion sidesteps this by
+      construction (every step is a proper denoiser; you can't collapse). GANs notoriously suffer.
+    </p>
+    <p>
+      Drifting Models handle it via the repel term $V^-$. When the generator collapses onto one mode,
+      every $y^-$ neighbor is nearby — so the repel field gets very strong. Samples get pushed away from
+      themselves and out toward the other modes where the attract term $V^+$ takes over. Mode collapse is
+      a <em>self-destabilizing</em> state, exactly the opposite of GAN dynamics.
+    </p>
+
+    <h3>Stop-gradient turns a fixed-point objective into a regression</h3>
+
+    <p>
+      Naively, optimizing $\mathbb{E}\|V\|^2$ requires backpropagation through the kernel sums, which
+      depend on the distribution of generator outputs in non-trivial ways. The stop-gradient trick
+      sidesteps that entirely: freeze the drifted target, regress toward it, take an SGD step, recompute
+      the target, repeat. It's the same recipe that makes BYOL and SimSiam work without target networks.
+    </p>
+
+    <h3>Kernels in feature space, not pixel space</h3>
+
+    <p>
+      Drifting Models would not work in pixel space at high resolution — the Euclidean kernel is too
+      brittle. By working in the feature space of a strong self-supervised encoder, the kernel measures
+      <em>semantic</em> similarity, and the field gradients carry real signal even for high-resolution
+      images. This dovetails with broader 2025 trends (REPA, VA-VAE) showing that aligning generators with
+      pretrained encoders is a powerful regularizer.
+    </p>
+
+    <h3>The anti-symmetry constraint as principled design</h3>
+
+    <p>
+      Most generative models work because their objectives are convex or quasi-convex enough that SGD
+      finds something useful. Drifting Models work because their fixed point is <em>provably</em> at
+      $q = p$, by an algebraic identity, not an empirical happy accident. The ablation table on
+      anti-symmetry is the experimental shadow of that proof — break the symmetry and FID multiplies by
+      5× to 20×.
+    </p>
+
+    <h3>The headline insight</h3>
+
+    <p>
+      The conceptual reframe is the most generalizable contribution. Asking <em>where</em> the iteration
+      lives in a generative pipeline opens up design space the field has barely explored. Diffusion put
+      it at inference. GANs do it implicitly via the adversary. Drifting puts it explicitly in SGD.
+      Where else could it go? Hybrid schemes that iterate at both? Methods that iterate during a single
+      forward pass of a deeper network? The question is now on the table.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Beyond images.</strong> Can the same framework do text? Audio? Video? The kernel
+        formulation depends on a meaningful Euclidean distance in feature space, which is well-defined
+        for images via SSL encoders. Less clear for other modalities.</li>
+      <li><strong>Theory of identifiability.</strong> The paper gives sufficient conditions under which
+        $\|V\| \to 0$ implies $q \to p$, but the conditions are technical and not always met. Sharper
+        theoretical results are an open direction.</li>
+      <li><strong>Scaling.</strong> The paper goes up to L/2 (463M) generators. Whether the trick still
+        works at 7B or 70B parameters is the obvious next question.</li>
+      <li><strong>Training cost.</strong> Each forward pass of Drifting Models is on par with diffusion;
+        but every step computes V over batch-wide kernel matrices, which is $O(N^2)$ in batch size.
+        Whether this stays cheap at large batches is non-trivial.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+
+    <p>
+      If Drifting Models hold up at scale, the next several years of generative-modeling research could
+      look very different. Two-decade-old assumptions — that iterative inference is unavoidable for
+      high-quality generation, that adversarial training is the only fast generator option, that mode
+      collapse requires architectural defenses — all get reopened. Whether or not Drifting Models
+      themselves dominate, the question they ask ("where should the iteration live?") is going to
+      generate a lot of papers.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2602.04770" target="_blank" rel="noopener">arXiv:2602.04770</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

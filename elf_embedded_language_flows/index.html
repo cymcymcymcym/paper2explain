@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ELF: Embedded Language Flows — an interactive explainer</title>
+  <meta name="description" content="A long, interactive, beginner-friendly explainer of ELF: how a continuous diffusion language model beats discrete and continuous baselines with fewer steps and less data."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>ELF: Embedded Language Flows</h1>
+    <p class="byline">
+      Hu, Qiu, Lu, Zhao, Li, Kim, Andreas, He &middot; MIT &middot; May 2026 &middot;
+      <a href="https://arxiv.org/abs/2605.10938" target="_blank" rel="noopener">arXiv&nbsp;2605.10938</a> &middot;
+      <a href="https://github.com/lillian039/ELF" target="_blank" rel="noopener">code</a>
+    </p>
+    <p class="lede">
+      Diffusion ate images. It ate video. It is starting to eat audio. But on language, the field has split:
+      almost every successful language diffusion model has gone <em>discrete</em>, treating diffusion as
+      probabilistic transitions between tokens. ELF goes the other way — it diffuses in <em>continuous</em>
+      embedding space, only ever leaves at the very last step, and beats every comparable discrete and
+      continuous baseline using <strong>10× less training data</strong> and <strong>fewer sampling
+      steps</strong>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#two-paths">Two paths for language diffusion</a></li>
+      <li><a href="#trick">The trick: stay continuous until the end</a></li>
+      <li><a href="#flow-matching">Flow matching, quickly</a></li>
+      <li><a href="#x-prediction">x-prediction and the shared backbone</a></li>
+      <li><a href="#final-step">The final step: from embedding to token</a></li>
+      <li><a href="#cfg">Classifier-free guidance, for free</a></li>
+      <li><a href="#results">Results: smaller, faster, lower PPL</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What this means for the continuous–discrete debate</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/conceptual_trajectories.png" alt="Conceptual figure showing ELF trajectories from noise to discrete tokens"/>
+      <figcaption>
+        ELF's central picture. Orange dots: clean embeddings of discrete tokens. Purple curves: denoising
+        trajectories. Almost the entire trajectory lives in continuous embedding space. Only at the very last
+        time step ($t=1$) does the model decide what discrete token each embedding becomes.
+      </figcaption>
+    </figure>
+
+    <p>
+      Pick any flashy generative model from the last two years that isn't an LLM. Stable Diffusion 3, FLUX,
+      Sora, Veo, Wan — they're all flow-based or diffusion models, all operating on <em>continuous</em>
+      pixels and continuous latents. They share an enormous, well-developed toolkit: rectified flows,
+      classifier-free guidance, distillation tricks, SDE samplers, the lot.
+    </p>
+    <p>
+      Now look at language diffusion. The leading methods — MDLM, Duo, LLaDA, SEDD — are all discrete. They
+      define probabilistic transitions over tokens, mask things out, unmask them. The continuous diffusion
+      toolkit doesn't immediately apply. Many of its techniques have to be reinvented from scratch, or fail
+      outright (CFG, for instance, is notoriously hard to make work on discrete diffusion).
+    </p>
+    <p>
+      This bifurcation isn't a coincidence. Words are discrete objects. There is no obvious way to "average"
+      between "cat" and "dog." Past attempts at continuous diffusion for language did exist (Diffusion-LM,
+      DiffuSeq, CDCD, LD4LG) but kept losing benchmark to their discrete cousins. By 2025, the field had
+      mostly given up on continuous DLMs.
+    </p>
+    <p>
+      ELF is the paper that revisits the question. The authors argue the performance gap was an
+      <em>artifact of design choices</em>, not a fundamental constraint. Five careful decisions — what
+      embeddings, what prediction target, what loss, what sampler, what guidance — and continuous diffusion
+      becomes competitive again, at much smaller scale, with much less compute.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="two-paths">
+    <h2>1. Two paths for language diffusion</h2>
+
+    <p>
+      To understand what ELF is doing, you need to see the two options it picked between.
+    </p>
+
+    <h3>Path A: discrete diffusion</h3>
+
+    <p>
+      Define a corruption process directly on tokens. The simplest case is <strong>masked diffusion</strong>
+      (MDLM, LLaDA): at noise level $t$, mask out a $t$ fraction of the tokens, replacing them with
+      <code>[MASK]</code>. Train a model to fill in the masks. To sample, start from all-<code>[MASK]</code>
+      and progressively unmask, conditioned on the partially-unmasked context.
+    </p>
+
+    <p>
+      Variants exist — uniform-state diffusion (Duo) sends tokens toward a random token instead of
+      <code>[MASK]</code>; block diffusion (E2D2) generates short spans autoregressively; D3PM defines a
+      whole family of token-transition kernels. But the common theme is: <em>the state is always a sequence
+      of discrete tokens</em>. Diffusion is over the categorical distribution at each position.
+    </p>
+
+    <h3>Path B: continuous diffusion</h3>
+
+    <p>
+      Embed each token into a continuous vector, do diffusion over those vectors, then somehow turn the
+      denoised vectors back into tokens at the end. This is what Diffusion-LM, CDCD, DiffuSeq, LD4LG, FLM,
+      and LangFlow do. The catch: there are many design knobs, and most prior work made suboptimal choices.
+    </p>
+
+    <p>
+      The recurring problem with Path B is that continuous embeddings drift toward the
+      <em>mean</em> of the embedding space — a blurry attractor. To prevent that, prior continuous DLMs
+      added per-step discretization losses (cross-entropy at every time step), or "rounding" losses, or
+      simplex constraints. All of these tether the continuous trajectory back to the discrete token grid,
+      defeating much of the point of going continuous in the first place.
+    </p>
+
+    <div class="widget-frame" id="path-comparison">
+      <p class="widget-title">Discrete vs continuous diffusion, side by side</p>
+      <p class="widget-sub">Press play and watch each approach generate "the cat sat on the mat." Notice
+        how discrete diffusion proceeds in token-space jumps, while continuous diffusion glides through an
+        embedding space and only commits to tokens at the end.</p>
+      <!-- widget injected here -->
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="trick">
+    <h2>2. The trick: stay continuous until the end</h2>
+
+    <p>
+      ELF's defining move is what it <em>doesn't</em> do. Through almost the entire denoising trajectory,
+      ELF performs no token-level discretization, no cross-entropy, no rounding. The trajectory lives
+      cleanly inside a continuous embedding space, evolving under a velocity field, exactly as you'd do
+      diffusion on an image.
+    </p>
+
+    <p>
+      At only one time step — $t = 1$, the last step — does ELF commit to a sequence of discrete tokens.
+      It does this with the <em>same network</em> that was just doing denoising, simply switched into a
+      different "mode" by flipping a binary input flag.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/training_inference_pipeline.png" alt="ELF training and inference pipeline"/>
+      <figcaption>
+        ELF training (left) and inference (right). One shared network plays two roles: it predicts clean
+        embeddings $\hat{x}$ during denoising, and it predicts discrete tokens at the final step. A binary
+        mode token tells it which mode it's in. (Figure 2.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Compare this to prior continuous DLMs:
+    </p>
+    <ul>
+      <li><strong>Embedding-space methods (Diffusion-LM, CDCD):</strong> add cross-entropy loss at <em>every</em>
+        time step to keep trajectories aligned with the token grid.</li>
+      <li><strong>Latent diffusion (LD4LG):</strong> train a <em>separate</em> decoder model that converts
+        final embeddings to tokens. Inference uses both networks sequentially.</li>
+      <li><strong>Simplex methods (TESS, SSD-LM):</strong> diffuse over the probability simplex of tokens,
+        permanently tethered to the discrete grid.</li>
+    </ul>
+    <p>
+      ELF declines all three. No per-step discretization, no extra decoder, no simplex constraint. The
+      continuous embedding space is left maximally free to host an arbitrary smooth flow. Discretization
+      happens exactly once, at the moment we want a token out.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="flow-matching">
+    <h2>3. Flow matching, quickly</h2>
+
+    <p>
+      ELF uses <strong>flow matching</strong> as its continuous-time generative framework. If you've
+      heard the phrase but never had to use it, here's the working summary in 30 seconds.
+    </p>
+
+    <p>
+      You have a data distribution $p_\text{data}(x)$ — in our case, the distribution over clean token
+      embeddings. You have a noise distribution $p_\text{noise} = \mathcal{N}(0, I)$. You want a
+      <em>vector field</em> $v(z_t, t)$ such that, if you start from a noise sample $z_0 \sim p_\text{noise}$
+      and follow the ODE
+    </p>
+    <p class="eq">
+      $$ \frac{dz_t}{dt} = v(z_t, t) $$
+    </p>
+    <p>
+      then $z_1$ is distributed as $p_\text{data}$.
+    </p>
+    <p>
+      "Rectified flows" (Liu et al., 2022; Lipman et al., 2022) give you the simplest such field by
+      <strong>linearly interpolating</strong> between a paired noise sample $e$ and data sample $x$:
+    </p>
+    <p class="eq">
+      $$ z_t = t \cdot x + (1 - t) \cdot e \quad \text{for } t \in [0, 1] $$
+    </p>
+    <p>
+      At $t = 0$ you're pure noise. At $t = 1$ you're pure data. In between you're a linear blend. The
+      velocity along this straight-line trajectory is just the time derivative:
+    </p>
+    <p class="eq">
+      $$ v = \frac{dz_t}{dt} = x - e $$
+    </p>
+    <p>
+      So if you knew the pairing $(e \to x)$, the optimal velocity is just "data minus noise." Of course at
+      inference you only know $z_t$, not $e$ or $x$ individually. So we train a network to <em>predict</em>
+      that velocity (or, equivalently, predict $x$ or $e$ from $z_t$).
+    </p>
+
+    <div class="widget-frame" id="flow-viz">
+      <p class="widget-title">Flow matching in 2D</p>
+      <p class="widget-sub">Drag the slider to advance time. Particles start as Gaussian noise and flow
+        toward "embedding anchors" (orange) along the velocity field. This is what ELF is doing in 768-D
+        embedding space, projected here to 2-D for visualization.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <p>
+      Once the network is trained, generation is just <strong>numerical ODE integration</strong>: take a
+      noise sample, take small Euler steps in the direction of the predicted velocity, and arrive at
+      something distributed like clean data.
+    </p>
+    <p>
+      Flow matching has eaten the image-diffusion world in the last two years (SiT, Flux, Wan, MMDiT) for
+      three reasons. Trajectories are <em>straight</em>, so fewer steps are needed. Training is
+      <em>stable</em> — just MSE on the velocity. And the framework <em>generalizes</em>: classifier-free
+      guidance, latent variants, distillation tricks all transfer naturally. ELF wants all of that, for
+      language.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="x-prediction">
+    <h2>4. x-prediction and the shared backbone</h2>
+
+    <p>
+      You have a choice in flow matching: train the network to predict $v$ directly, or train it to
+      predict $x$ (the clean data) and recover velocity via the identity $v = (x - z_t)/(1 - t)$. These
+      are mathematically equivalent. The choice is not trivial.
+    </p>
+
+    <p>ELF chooses <strong>x-prediction</strong> for two reasons:</p>
+
+    <ol>
+      <li>
+        <strong>It scales to high-dimensional embeddings.</strong> Recent work (Li et al., 2025) showed
+        that for high-dimensional flow matching, predicting $x$ is much more numerically stable than
+        predicting $v$ — the latter blows up as $t \to 1$ because of the $1/(1-t)$ factor. ELF's
+        embeddings are 512-d per token, much higher than image pixel dimension at any single position.
+      </li>
+      <li>
+        <strong>It enables a single shared network for denoising AND decoding.</strong> This is the
+        critical engineering point. The decoding step at $t = 1$ also takes a clean-ish embedding as
+        input and produces a clean embedding as output (which then goes through a linear "unembedding"
+        layer to yield token logits). If both modes predict $x$, the same backbone can do both, with a
+        binary "mode" token telling it which job it's on. v-prediction would force two different
+        objective shapes and break the weight sharing.
+      </li>
+    </ol>
+
+    <p>
+      The training objective during denoising is just MSE on the velocity (equivalent to MSE on $x$ via
+      the identity above):
+    </p>
+    <p class="eq">
+      $$ \mathcal{L}_\text{MSE} = \mathbb{E}_{t, x, e} \left\| v_\theta(z_t, t) - v \right\|^2
+      = \mathbb{E}_{t, x, e} \frac{1}{(1-t)^2} \left\| x_\theta(z_t, t) - x \right\|^2 $$
+    </p>
+    <p>
+      Standard flow matching, applied as-is to language embeddings. The novelty is in what gets coupled
+      to it at $t = 1$.
+    </p>
+
+    <aside class="callout">
+      <strong>What embeddings?</strong> ELF maps tokens to 512-d vectors using a <em>frozen pretrained
+      T5-small encoder</em>. Yes — the encoder of a 2019 Google model from a different paradigm entirely.
+      The authors compare against learnable embeddings (which underperform), Gaussian random embeddings
+      (also worse), and T5 encoders trained from scratch (slightly worse). Pretrained contextual
+      embeddings turn out to be the best language-side analog to "VAE latents" in latent image diffusion.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="final-step">
+    <h2>5. The final step: from embedding to token</h2>
+
+    <p>
+      Here is the most distinctive piece of ELF. At every step except the last, the network is in
+      <code>"denoise"</code> mode: input $z_t$, output a predicted clean embedding $\hat{x}$. At the last
+      step, $t = 1$, the network is switched to <code>"decode"</code> mode: input a (corrupted) clean
+      embedding, output a clean embedding that goes through an "unembedding" matrix $W$ to produce token
+      logits, which are then argmax'd to discrete tokens.
+    </p>
+
+    <p>
+      But wait — if $t = 1$ means $z_t = x$ exactly, then there's no denoising to do at the final step, and
+      the network's input is trivial. The paper handles this with a small training trick: at the final
+      step, apply a separate <strong>token-level corruption</strong> $\tilde{z}$ (a noised version of $x$ at
+      the token granularity, rather than full Gaussian noise) and train the model to recover from
+      <em>that</em>. Specifically, the model learns to map slightly-corrupted clean embeddings back to
+      their original token identities via cross-entropy:
+    </p>
+    <p class="eq">
+      $$ \mathcal{L}_\text{CE} = \mathbb{E}_{\tilde{z}} \left[ \text{CrossEnt}(W \cdot x_\theta(\tilde{z}), s) \right] $$
+    </p>
+
+    <p>
+      So you have one network, two loss branches, mixed in each training batch:
+    </p>
+    <ul>
+      <li><strong>80% of samples</strong>: denoising branch. Random $t \in (0, 1)$, MSE on velocity.
+        Mode token = denoise.</li>
+      <li><strong>20% of samples</strong>: decoding branch. $t = 1$, cross-entropy on tokens after
+        unembedding. Mode token = decode.</li>
+    </ul>
+
+    <div class="widget-frame" id="snap">
+      <p class="widget-title">The final snap</p>
+      <p class="widget-sub">An embedding sits in continuous space. As $t \to 1$, the model squeezes it
+        toward the nearest token's embedding. Hover the dots to see how the unembedding matrix would assign
+        a token to each.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <p>
+      The training-time pseudocode (from Alg. 1 in the paper) is short enough to drop in verbatim:
+    </p>
+
+    <pre class="code"><code># s: a sequence of discrete tokens
+x = encode(s)                              # T5 encoder
+if uniform(0, 1) &lt; 0.8:
+    # denoising branch
+    t = sample_t()
+    e = randn_like(x)
+    z = t * x + (1 - t) * e
+    v = x - e
+    x_pred = net(z, t, mode="denoise")
+    v_pred = (x_pred - z) / (1 - t)
+    loss = mse_loss(v_pred, v)
+else:
+    # decoding branch (t = 1)
+    z = corrupt(x)                         # token-level corruption
+    x_pred = net(z, t=1, mode="decode")
+    s_pred = unembed(x_pred)               # W @ x_pred = logits
+    loss = ce_loss(s_pred, s)</code></pre>
+
+    <p>
+      And inference is, again, almost identical to image-diffusion inference, plus one decoding step:
+    </p>
+
+    <pre class="code"><code>z = randn(shape)
+for i in range(len(ts) - 1):
+    t = ts[i]
+    dt = ts[i + 1] - ts[i]
+    x_pred = net(z, t, mode="denoise")
+    v = (x_pred - z) / (1 - t)
+    z = z + dt * v                         # Euler step
+
+# final step: decode
+h = net(z, t=1, mode="decode")
+tokens = argmax(unembed(h))</code></pre>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="cfg">
+    <h2>6. Classifier-free guidance, for free</h2>
+
+    <p>
+      Classifier-free guidance (CFG) is one of the most useful tricks in image diffusion. It steers
+      generation toward higher-quality, lower-diversity outputs by combining a conditional and an
+      unconditional prediction:
+    </p>
+    <p class="eq">
+      $$ v_\text{cfg}(z_t \mid c) = \omega \cdot v(z_t \mid c) + (1 - \omega) \cdot v(z_t \mid \varnothing) $$
+    </p>
+    <p>
+      with guidance scale $\omega$. Larger $\omega$ → higher quality, lower diversity.
+    </p>
+
+    <p>
+      CFG has been tried for discrete diffusion language models and works poorly. The reason is that the
+      "extrapolation" formula above operates on continuous quantities — score functions, velocity fields —
+      that don't have clean analogs in token-categorical space. ELF gets CFG essentially for free because
+      it's already continuous.
+    </p>
+
+    <p>
+      A wrinkle: ELF does unconditional generation, so there's no class label to condition on. The authors
+      use <strong>self-conditioning</strong> as a stand-in: do a forward pass to get an intermediate
+      prediction $\hat{x}'$, then condition the next pass on it. With probability 50% during training,
+      condition on a null embedding instead. At inference, the unconditional pass and conditional pass
+      are combined per the CFG formula. (And to save compute, they use training-time CFG techniques that
+      collapse this into a single forward pass per step.)
+    </p>
+
+    <div class="widget-frame" id="cfg-slider">
+      <p class="widget-title">CFG: the quality–diversity dial</p>
+      <p class="widget-sub">Slide the guidance scale. Watch generative perplexity (lower = higher
+        quality) and entropy (higher = more diverse) move along the trade-off curve.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/cfg_perplexity_entropy_tradeoff.png" alt="CFG perplexity-entropy tradeoff"/>
+      <figcaption>
+        The CFG sweep from the paper. Each point is 1,000 generated samples at a different guidance scale.
+        Top-left is bad (high PPL, low entropy); bottom-right is the sweet spot. (Figure 4.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. Results: smaller, faster, lower PPL</h2>
+
+    <p>
+      ELF's experimental contribution is benchmarking ELF-B (105M params) against the leading discrete and
+      continuous DLMs at ~170M params, all trained on OpenWebText. Three plots tell the story:
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/system_level_comparison.png" alt="System-level comparison plot"/>
+      <figcaption>
+        Three axes of comparison. (a) Against same-setting baselines: ELF-B beats MDLM, Duo, FLM,
+        LangFlow across all sampling-step budgets. (b) Against <em>distilled</em> few-step variants of
+        those baselines: ELF still wins in the few-step regime, without distillation. (c) Training tokens:
+        ELF uses 45B, baselines use 500B+. ELF wins by ~10×. (Figure 5.)
+      </figcaption>
+    </figure>
+
+    <h3>Key numbers</h3>
+
+    <table class="results">
+      <thead>
+        <tr><th>Setting</th><th>Metric</th><th>ELF-B (105M)</th><th>Best Baseline</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="2" class="cat">Unconditional<br/>(OpenWebText)</td>
+          <td>Gen. PPL @ 32 steps (↓)</td>
+          <td class="win"><strong>24</strong></td>
+          <td>~30 <em>(distilled baselines)</em></td>
+        </tr>
+        <tr>
+          <td>Training tokens used</td>
+          <td class="win"><strong>45B</strong></td>
+          <td>500B+ <em>(MDLM, Duo, FLM)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="1" class="cat">Machine translation</td>
+          <td>WMT14 De→En BLEU (↑)</td>
+          <td class="win"><strong>26.4</strong></td>
+          <td>~25 <em>(MDLM, Duo)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="3" class="cat">Summarization</td>
+          <td>XSum ROUGE-1 (↑)</td>
+          <td class="win"><strong>best</strong></td>
+          <td>— <em>(below ELF on all variants)</em></td>
+        </tr>
+        <tr>
+          <td>XSum ROUGE-2 (↑)</td>
+          <td class="win"><strong>best</strong></td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>XSum ROUGE-L (↑)</td>
+          <td class="win"><strong>best</strong></td>
+          <td>—</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">From Figure 5 (unconditional) and Table 1 (conditional) in the paper.</p>
+
+    <h3>Scaling</h3>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/model_scaling.png" alt="ELF model scaling"/>
+      <img src="assets/figures/key_design.png" alt="ELF key design ablations"/>
+      <figcaption>
+        Left: scaling from ELF-B (105M) → ELF-M (342M) → ELF-L (652M) consistently pushes the PPL–entropy
+        frontier outward. Right: ablations on embedding type (pretrained T5 wins), decoding strategy
+        (shared-weight wins), and sampler (SDE wins in low-step regime). (Figures 6 and 3.)
+      </figcaption>
+    </figure>
+
+    <h3>SDE > ODE in low-step regime</h3>
+
+    <p>
+      A pretty result worth flagging: when you sample with very few steps (8–16), the stochastic
+      <em>SDE</em> sampler beats the deterministic <em>ODE</em> sampler by a wide margin. The intuition
+      is that small Euler steps accumulate error in deterministic integration, but stochastic noise
+      injection at each step provides a regularizing reset that reduces error compounding. At many steps
+      (64+) the two converge.
+    </p>
+
+    <div class="widget-frame" id="step-quality">
+      <p class="widget-title">Sampling steps: how many do you need?</p>
+      <p class="widget-sub">Adjust the number of sampling steps and the sampler. See how generation
+        quality changes. The data here mirrors Figure 3c of the paper.</p>
+      <!-- widget injected here -->
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="manim-anim">
+    <h2>8. The flow, animated</h2>
+
+    <p>
+      To make the central picture concrete: this animation shows particles in a 2-D projection of
+      embedding space. They start as Gaussian noise (blue), follow the rectified-flow velocity field
+      toward orange "token anchors," and finally snap to discrete tokens at $t = 1$. The real ELF does
+      this in 512-D per token, on sequences of 1024 tokens, but the dynamics are identical.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/elf_flow.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      Noise → continuous flow → discrete tokens. Almost the entire trajectory is continuous; only the
+      final instant is discrete.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>9. Why this works</h2>
+
+    <p>
+      ELF isn't doing anything that the literature didn't have on the table already. Flow matching is
+      from 2022. T5 embeddings are from 2019. Classifier-free guidance is from 2021. Latent diffusion is
+      from 2022. What's new is the specific combination, and a careful argument about which knobs to
+      avoid turning.
+    </p>
+
+    <h3>Don't tether the trajectory</h3>
+    <p>
+      The biggest single change from prior continuous DLMs is removing per-step token supervision. Older
+      methods added cross-entropy at every $t$ to keep continuous trajectories from drifting into the
+      semantic void. ELF instead trusts the velocity field, lets the trajectory go wherever the data
+      manifold wants it to go, and only intervenes at $t = 1$ to discretize. The denoising part of the
+      network is purely doing continuous regression, just like in image diffusion.
+    </p>
+
+    <h3>Don't add another network</h3>
+    <p>
+      Latent diffusion methods (LD4LG, follow-ups) trained a separate decoder model to convert
+      embeddings to tokens. This adds parameters, complicates training, and introduces a second source
+      of error. ELF reuses the same network with a mode flag — strictly simpler, and the shared-weight
+      ablation shows it's also strictly better.
+    </p>
+
+    <h3>Predict clean data, not velocity</h3>
+    <p>
+      x-prediction is becoming the consensus best parameterization for high-dimensional flow matching
+      across modalities. ELF is part of that trend, and reaps the benefits: numerical stability, easy
+      unification with the decoding objective.
+    </p>
+
+    <h3>Use a pretrained encoder</h3>
+    <p>
+      T5-small was trained on a span-corruption objective at scale on the same kind of web text. Its
+      embeddings already cluster semantically related tokens. ELF's flow doesn't have to learn the
+      embedding structure — it inherits a usable one. Compare to discrete diffusion, which has to learn
+      everything jointly from token-level signal.
+    </p>
+
+    <h3>SDE injection breaks error compounding</h3>
+    <p>
+      ELF's SDE sampler injects small Gaussian noise at each step, then numerically "shifts" $t$ to
+      compensate. At low step counts, this is a substantial win over deterministic Euler — exactly the
+      regime where you care most about inference cost.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>10. What this means for the continuous–discrete debate</h2>
+
+    <p>
+      For about two years, the diffusion-language-model community has been moving toward discrete
+      models. The argument went: language is discrete, so the right diffusion process is discrete; the
+      empirical wins back that up; let's stop fighting the modality.
+    </p>
+
+    <p>
+      ELF flips that argument. Continuous diffusion can be competitive — at the same or smaller
+      parameter count, with 10× less training data, with fewer sampling steps, and with CFG working
+      naturally. The reason it didn't look that way before was that nobody had assembled all the right
+      design choices in one model.
+    </p>
+
+    <p>This matters beyond benchmarks for a few reasons.</p>
+
+    <h3>The toolkit transfer</h3>
+    <p>
+      Every advance in continuous diffusion modeling — better samplers, flow matching variants,
+      distillation, classifier-free guidance, latent compression — can now be ported to language with
+      minimal effort. The huge community that has been refining continuous diffusion for images can
+      contribute to language without retooling.
+    </p>
+
+    <h3>Unification with multimodal models</h3>
+    <p>
+      Models like MMDiT, SiT, and Wan all use flow matching on multimodal latents. If ELF works, then
+      language can join that party using the same machinery. A unified flow-matching backbone over
+      mixed text/image/video latents starts to look feasible.
+    </p>
+
+    <h3>Open problems the paper doesn't solve</h3>
+    <ul>
+      <li><strong>Scaling to LLM size.</strong> ELF is 105M–652M parameters. Modern LLMs are billions.
+        Whether the trick survives at scale is unanswered.</li>
+      <li><strong>Long contexts.</strong> ELF works at sequence length 1024. Continuous diffusion at
+        32k or 128k context is unproven.</li>
+      <li><strong>Likelihood evaluation.</strong> Flow models are awkward to evaluate as language
+        models on standard likelihood benchmarks — ELF reports <em>generative</em> PPL (PPL of GPT-2
+        Large on ELF samples), not the model's own likelihood. That's a slightly different quantity and
+        the comparison to autoregressive LLMs remains loose.</li>
+      <li><strong>The encoder is frozen.</strong> ELF can't update its embedding space during training.
+        Joint training underperformed in their ablations, but a better recipe might exist.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      If ELF is right, the next chapter of diffusion language models will look more like image diffusion
+      than the last chapter did. Continuous embedding space, flow matching, CFG, distillation tricks —
+      all the familiar furniture. The discrete-diffusion line of work will continue (and may still win
+      for some applications), but it no longer has the field to itself.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2605.10938" target="_blank" rel="noopener">arXiv:2605.10938</a>
+      &nbsp;·&nbsp;
+      Code: <a href="https://github.com/lillian039/ELF" target="_blank" rel="noopener">github.com/lillian039/ELF</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

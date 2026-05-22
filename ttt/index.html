@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Learning to (Learn at Test Time) — an interactive explainer</title>
+  <meta name="description" content="An interactive explainer of Sun, Li, Dalal et al.'s Test-Time Training paper: an RNN layer whose hidden state is a neural network, updated by self-supervised gradient descent as it reads. Linear-time, and it keeps improving past 16k tokens where Mamba plateaus."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Learning to (Learn at Test Time)</h1>
+    <p class="byline">
+      Sun, Li, Dalal, Xu, Vikram, Zhang, Dubois, Chen, Wang, Koyejo, Hashimoto, Guestrin
+      &middot; Stanford &middot; UC San Diego &middot; UC Berkeley &middot; Meta AI &middot; July 2024 &middot;
+      <a href="https://arxiv.org/abs/2407.04620" target="_blank" rel="noopener">arXiv 2407.04620</a>
+    </p>
+    <p class="lede">
+      Recurrent networks promise what Transformers cannot: linear-time sequence modelling, a fixed-size
+      memory, constant cost per token. They have never delivered in long context — a fixed-size hidden
+      state is too blunt an instrument to compress thousands of tokens well. This paper's move: make the
+      hidden state itself a <em>machine learning model</em>, and make the update rule a step of
+      <em>self-supervised gradient descent</em>. Reading a sequence becomes training a model. Because the
+      training happens even on test sequences, the layers are called <strong>Test-Time Training</strong>
+      layers — and they let an RNN keep getting better with more context, the way only attention used to.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#intro">A third option for memory</a></li>
+      <li><a href="#layers">Every sequence layer is a hidden state</a></li>
+      <li><a href="#model-state">Make the hidden state a model</a></li>
+      <li><a href="#task">A self-supervised task worth learning</a></li>
+      <li><a href="#loops">Inner loop, outer loop</a></li>
+      <li><a href="#fast">Making it run fast</a></li>
+      <li><a href="#framework">One framework, many layers</a></li>
+      <li><a href="#manim">Watching a hidden state learn</a></li>
+      <li><a href="#results">Does it actually work?</a></li>
+      <li><a href="#meaning">Why it works, and what it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="intro">
+    <figure class="teaser">
+      <img src="assets/figures/simple_teaser.png" alt="TTT layer overview"/>
+      <figcaption>
+        Figure 1 (paper). Every sequence modelling layer is a hidden state that transitions by an update
+        rule. The idea here: make the hidden state itself a model $f$ with weights $W$, and make the
+        update rule a gradient step on a self-supervised loss $\ell$. Updating the hidden state on a test
+        sequence is then literally training $f$ at test time.
+      </figcaption>
+    </figure>
+
+    <h2>1. A third option for memory</h2>
+
+    <p>
+      For the better part of a decade, sequence modelling has been a contest between two ways of
+      remembering. Attention keeps every token it has ever seen and re-reads them all to predict the next
+      one — precise, but its cost per token grows with the length of the context. Recurrence crushes all
+      of history into a single fixed-size hidden state that it overwrites step by step — cheap and
+      constant-cost, but lossy.
+    </p>
+
+    <p>
+      In 2020, the OpenAI scaling-law paper found that LSTMs could not scale like Transformers and could
+      not really exploit long context. Four years later this paper re-runs that test with a modern RNN,
+      Mamba — and finds genuine progress, but also the same old wall. Tokens late in a sequence ought to
+      be easier to predict, because they have more context to lean on. For a Transformer, perplexity
+      keeps falling token after token, all the way through a 32k window. For Mamba, the same curve
+      <strong>flattens out after about 16k tokens</strong>. The extra context arrives, and the RNN cannot
+      use it.
+    </p>
+
+    <p>
+      This is an awkward bind. The whole point of an RNN is linear-time cost, an advantage that only
+      matters once context is long. But once context <em>is</em> long, the fixed-size hidden state runs
+      out of room. Compressing thousands — eventually millions — of tokens into a state of fixed size
+      demands a genuinely good compression heuristic: something that can find the structure and the
+      connections buried in all that history.
+    </p>
+
+    <p>
+      The paper's starting observation is that we already have such a heuristic, and use it every day.
+      Self-supervised learning compresses an enormous training set into the weights of a model — an LLM
+      is exactly that, the internet squeezed into a few billion parameters, with enough understanding of
+      the connections between facts to reason about new ones. So why not use the same trick <em>inside</em>
+      a sequence layer: make the hidden state a model, and compress the context into it by training.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="layers">
+    <h2>2. Every sequence layer is a hidden state</h2>
+
+    <p>
+      To see where the new layer fits, it helps to put the existing ones in a single frame. Every
+      sequence modelling layer — every autoregressive map from one sequence to another — can be described
+      by three pieces: an <strong>initial state</strong>, an <strong>update rule</strong> that folds the
+      next token into the state, and an <strong>output rule</strong> that reads an output token off the
+      state.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Layer</th><th>Hidden state</th><th>Update rule</th><th>Output rule</th><th>Cost / token</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">RNN</td>
+          <td>a fixed-size vector $s_t$</td>
+          <td>$s_t = \sigma(\theta_{ss} s_{t-1} + \theta_{sx} x_t)$</td>
+          <td>$z_t = \theta_{zs} s_t + \theta_{zx} x_t$</td>
+          <td class="win">$O(1)$</td>
+        </tr>
+        <tr>
+          <td class="cat">Self-attention</td>
+          <td>a growing list (the KV cache)</td>
+          <td>append $(k_t, v_t)$ to the list</td>
+          <td>$z_t = V_t\,\texttt{softmax}(K_t^\top q_t)$</td>
+          <td>$O(t)$</td>
+        </tr>
+        <tr>
+          <td class="cat">TTT</td>
+          <td>weights $W_t$ of a model $f$</td>
+          <td>$W_t = W_{t-1} - \eta\,\nabla\ell(W_{t-1}; x_t)$</td>
+          <td>$z_t = f(x_t; W_t)$</td>
+          <td class="win">$O(1)$</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Read down the table and the trade-off is stark. An RNN's hidden state is fixed in size, so its
+      update and output both take constant time — but that same fixed size caps how much it can really
+      remember. Self-attention's hidden state is the Key-Value cache, a list that grows with every token;
+      it stores the past with no compression at all, which is why it is so expressive and why scanning it
+      costs more with every token.
+    </p>
+
+    <p>
+      The TTT layer sits in the same fixed-size, constant-cost column as the RNN. The difference is what
+      lives in that fixed-size slot. An RNN stores a vector. A TTT layer stores the <em>weights of a
+      model</em> — and a model is a far richer container for structure than a vector of the same size.
+    </p>
+
+    <div class="widget-frame" id="paradigms-widget">
+      <p class="widget-title">Three ways to remember a sequence</p>
+      <p class="widget-sub">
+        Slide the token counter and switch paradigms. Watch the hidden state and the cost-per-token bar:
+        attention's state and cost grow without bound; the RNN and TTT both stay flat — but TTT's flat
+        box is a model, not a vector.
+      </p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="model-state">
+    <h2>3. Make the hidden state a model</h2>
+
+    <p>
+      Here is the central move, stated plainly. The hidden state $s_t$ is redefined to be $W_t$, the
+      weights of a small model $f$ — a linear map, a little MLP, anything differentiable. The two rules
+      follow directly. The <strong>output rule</strong> is just the model's prediction on the current
+      token:
+    </p>
+
+    <p class="eq">$$ z_t = f(x_t;\, W_t). $$</p>
+
+    <p>
+      And the <strong>update rule</strong> is one step of gradient descent on a self-supervised loss
+      $\ell$, with learning rate $\eta$:
+    </p>
+
+    <p class="eq">$$ W_t = W_{t-1} - \eta\,\nabla\ell(W_{t-1};\, x_t). $$</p>
+
+    <p>
+      That is the whole layer. Every incoming token is a tiny training example; every step nudges the
+      model's weights to fit it a little better. From the compression point of view, any memory has to
+      decide what to keep and what to drop — and this one keeps whatever produces a large gradient.
+      Intuitively: the tokens the model still has the most to learn from leave the deepest mark.
+    </p>
+
+    <pre class="code"><code>class TTT_Layer:
+    def forward(self, in_seq):
+        W = self.f.init_params()        # the hidden state IS the weights
+        out = []
+        for x in in_seq:
+            grad = grad_of(loss, W, x)  # self-supervised loss on this token
+            W    = W - eta * grad       # update rule  = one training step
+            out.append(self.f(x, W))    # output rule  = a prediction
+        return out</code></pre>
+
+    <p>
+      What should $\ell$ be? A natural choice is reconstruction: hand $f$ a corrupted version
+      $\tilde{x}_t$ of the token and ask it to rebuild the original, $\ell = \|f(\tilde{x}_t; W) -
+      x_t\|^2$. Like a denoising autoencoder, $f$ then has to discover how the token's dimensions relate
+      in order to fill in what was hidden. We will sharpen this loss in the next section — but the shape
+      is already right.
+    </p>
+
+    <p>
+      Does a single gradient step per token actually accomplish anything? It does. The figure below
+      tracks the self-supervised loss inside a trained 125M-parameter network. For every token, one
+      gradient step measurably lowers the loss, from $\ell(W_{t-1}; x_t)$ to $\ell(W_t; x_t)$. And as the
+      sequence runs on, the gap between an untrained state $\ell(W_0; x_t)$ and the running state
+      $\ell(W_t; x_t)$ keeps <em>widening</em> — the hidden state is genuinely accumulating knowledge of
+      the sequence as it reads.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/inner_loss.png" alt="TTT self-supervised loss decreasing along the sequence"/>
+      <figcaption>
+        Figure 4 (paper). The self-supervised TTT loss for the first three layers of a 125M network. One
+        gradient step always lowers the loss ($\ell(W_{t-1};x_t) \to \ell(W_t;x_t)$), and the advantage
+        over the untrained state $\ell(W_0;x_t)$ grows as the sequence gets longer — the layer is
+        learning the sequence as it goes.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="task">
+    <h2>4. A self-supervised task worth learning</h2>
+
+    <p>
+      The self-supervised task is arguably the most important design choice in the whole method, because
+      it dictates what kind of features the weights $W$ will pick up from the sequence. The naive
+      reconstruction loss left one thing unspecified: <em>how</em> the token gets corrupted. Rather than
+      hand-design that corruption from human intuition, the paper does something more end-to-end — it
+      <strong>learns the task itself</strong>.
+    </p>
+
+    <p>
+      The trick is to make the corruption a low-rank projection with learnable parameters. The corrupted,
+      reconstruct-from input becomes a <em>training view</em> $\theta_K x_t$. The thing $f$ has to
+      reproduce need not be the whole token either — perhaps not all of $x_t$ is worth remembering — so
+      the target becomes a <em>label view</em> $\theta_V x_t$. The self-supervised loss is then:
+    </p>
+
+    <p class="eq">$$ \ell(W;\, x_t) = \big\| f(\theta_K x_t;\, W) - \theta_V x_t \big\|^2. $$</p>
+
+    <p>
+      Because the training view has fewer dimensions than the token, the output rule needs its own
+      projection too — a <em>test view</em> $\theta_Q x_t$ — giving $z_t = f(\theta_Q x_t; W_t)$. If the
+      subscripts $K$, $V$, $Q$ look familiar, that is deliberate: they play exactly the roles of the Key,
+      Value and Query projections in attention, and we will see in Section&nbsp;7 that this is no
+      coincidence.
+    </p>
+
+    <p>
+      Every choice of $\theta_K, \theta_Q, \theta_V$ defines a different reconstruction task. Together
+      they form a whole <em>family</em> of self-supervised tasks, and training the outer network amounts
+      to picking the most useful one — the task whose features turn out to help with next-token
+      prediction. The model is not handed a self-supervised objective; it discovers which objective is
+      worth running gradient descent on.
+    </p>
+
+    <div class="widget-frame" id="innerloop-widget">
+      <p class="widget-title">The hidden state trains itself</p>
+      <p class="widget-sub">
+        Step a sequence through a TTT layer. Each token triggers one real gradient step on the weight
+        grid $W$; the loss curve to the right is computed live. Watch one step lower the loss, and the
+        running state pull away from the untrained one.
+      </p>
+    </div>
+
+    <p>
+      This widget runs the genuine arithmetic: a small linear model, a reconstruction loss, one gradient
+      step per token. The loss really does fall, and the grid really does drift toward something that
+      fits the sequence. Stepping through it is the fastest way to feel what "the hidden state is a
+      model being trained" actually means.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="loops">
+    <h2>5. Inner loop, outer loop</h2>
+
+    <p>
+      There are now two learning problems, nested. The <strong>inner loop</strong> trains $W$, the
+      weights inside a TTT layer, on the reconstruction loss — this happens token by token, on every
+      sequence, including at test time. The <strong>outer loop</strong> is ordinary network training: it
+      optimises everything else by next-token prediction — the projections $\theta_K, \theta_Q,
+      \theta_V$, the rest of the network $\theta_\text{rest}$, and a couple of extras we will meet in a
+      moment.
+    </p>
+
+    <p>
+      The two loops optimise different things with different objectives. Note that $\theta_K, \theta_Q,
+      \theta_V$ never appear as arguments of the inner loss being minimised — to the inner loop they are
+      fixed hyper-parameters; only $W$ moves. The outer loop adjusts them between sequences. And because
+      the inner update is itself made of differentiable operations, training the outer loop means
+      differentiating <em>through</em> the gradient step — taking gradients of gradients, the standard
+      machinery of meta-learning.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th></th><th>Inner loop</th><th>Outer loop</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">A piece of data</td><td>one token $x_t$</td><td>one sequence $x_1,\dots,x_T$</td></tr>
+        <tr><td class="cat">The training set</td><td>one sequence $x_1,\dots,x_T$</td><td>a dataset of sequences (e.g. Books)</td></tr>
+        <tr><td class="cat">The objective</td><td>reconstruction loss $\ell$</td><td>next-token prediction</td></tr>
+        <tr><td class="cat">What is trained</td><td>$W$, the weights of $f$</td><td>$\theta_K,\theta_Q,\theta_V,\;\theta_\text{init},\;\theta_\text{lr},\;\theta_\text{rest}$</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      This is "learning to learn" — but with a twist that makes it practical. In classic meta-learning,
+      the inner loop learns from a whole dataset, so the outer loop needs a <em>collection of datasets</em>
+      to learn across. Collecting millions of datasets is hard, and that outer loop sits "one level
+      above" ordinary training. Here it is the reverse. Each sequence is itself a dataset, so the inner
+      loop is "one level <em>below</em>" ordinary training — and the outer loop collapses back into the
+      perfectly ordinary problem of supervised learning. Same data, same recipe, same next-token loss.
+      That is exactly why it scales.
+    </p>
+
+    <aside class="callout">
+      <strong>TTT and Titans.</strong> If you have read our <a href="../titans/index.html">Titans
+      explainer</a>, this inner-loop / outer-loop split is the same skeleton. Titans (Dec 2024) builds
+      directly on this paper (Jul 2024): it adds momentum and a forgetting gate to the inner update, and
+      lets the inner model be deeper. Titans' "chunk-and-freeze" parallelisation <em>is</em> the
+      mini-batch TTT of the next section. TTT is the framework; Titans is one richly-equipped point
+      inside it.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="fast">
+    <h2>6. Making it run fast</h2>
+
+    <p>
+      A gradient step per token is cheap in raw arithmetic but disastrous for a GPU. The update
+      $W_t = W_{t-1} - \eta\,\nabla\ell(W_{t-1};x_t)$ is strictly sequential: $W_t$ depends on $W_{t-1}$
+      both outside the gradient and inside it. Run naively, it is a chain of thousands of tiny steps, and
+      the chip sits mostly idle. Two ideas fix this.
+    </p>
+
+    <h3>Mini-batch TTT</h3>
+
+    <p>
+      Write gradient descent in its general form, $W_t = W_0 - \eta\sum_{s\le t} G_s$, where $G_s$ is the
+      descent direction. Once all the $G_s$ are known, the running $W_t$ values follow from a single
+      cumulative sum. So the real question is how each $G_t$ is computed:
+    </p>
+
+    <ul>
+      <li><strong>Online GD</strong> — $G_t = \nabla\ell(W_{t-1}; x_t)$. Each gradient is taken at the
+        very latest weights. Fully sequential, but every $W_t$ is $t$ genuine steps deep.</li>
+      <li><strong>Batch GD</strong> — $G_t = \nabla\ell(W_0; x_t)$. Every gradient is taken at the same
+        starting weights $W_0$, so all of them compute in parallel. But now $W_t$ is effectively only
+        <em>one</em> step away from $W_0$ — a much smaller search space, and it hurts language modelling.</li>
+      <li><strong>Mini-batch GD</strong> — the compromise the paper adopts. Split the sequence into
+        chunks of size $b$; inside a chunk, take every gradient at $W_{t'}$, the weights from the
+        <em>end of the previous chunk</em>. The $b$ gradients in a chunk share a starting point, so they
+        parallelise; across chunks the steps still accumulate. The paper uses $b = 16$.</li>
+    </ul>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/inner-batch.png" alt="Mini-batch TTT computation graph"/>
+      <figcaption>
+        Figure 6 (paper). Computation graph of one TTT mini-batch. The gradients $G_1,\dots,G_b$ share an
+        input ($W$ from the previous mini-batch) and do not depend on one another, so they can be
+        computed in parallel — the white intermediate nodes never even need to be materialised.
+      </figcaption>
+    </figure>
+
+    <h3>The dual form</h3>
+
+    <p>
+      Parallelism alone is not enough. Accelerators are built for matrix–matrix multiplies, and even a
+      mini-batched TTT layer, written naively, has very few of them — each gradient is an outer product
+      $G_t = 2(W_0 x_t - x_t)x_t^\top$, a $d\times d$ object that is heavy to store and move. The fix is
+      an observation: we never actually need the individual $G_t$. We only need the weights at the end of
+      the chunk, $W_b$, and the output tokens. Stacking the chunk into a matrix $X$, those collapse into
+      clean matmuls:
+    </p>
+
+    <p class="eq">$$ W_b = W_0 - 2\eta\,(W_0 X - X)\,X^\top. $$</p>
+
+    <p>
+      The outputs $Z$ follow from a second matmul against an attention-style triangular mask. The paper
+      calls this the <strong>dual form</strong> (the token-by-token version is the <em>primal</em>
+      form); the two give identical outputs, but the dual form trades a little asymptotic complexity for
+      a great deal of hardware utilisation, and runs <strong>more than 5× faster</strong> on the
+      authors' TPUs. The same derivation extends, with heavier notation, to a deep MLP inner model.
+    </p>
+
+    <div class="widget-frame" id="minibatch-widget">
+      <p class="widget-title">Parallelising test-time training</p>
+      <p class="widget-sub">
+        Slide the TTT mini-batch size $b$ from online GD ($b=1$) to batch GD ($b=T$). Watch the
+        dependency chains, the number of real gradient steps, and the speed/quality trade-off the paper
+        navigates by picking $b=16$.
+      </p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="framework">
+    <h2>7. One framework, many layers</h2>
+
+    <p>
+      Once a layer is "a model plus an optimiser run on the sequence," a lot of familiar architectures
+      turn out to be special cases. Choose the inner model and the inner update rule, and you have
+      specified a TTT layer. Some of those choices reproduce layers we already know.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/local.png" alt="The space of TTT layers: model times optimizer"/>
+      <figcaption>
+        Figure 8 (paper). A learner is a model plus an optimiser, and each learner induces a TTT layer.
+        TTT-Linear and TTT-MLP are two points in this space; a linear model with batch GD lands exactly
+        on linear attention.
+      </figcaption>
+    </figure>
+
+    <p>
+      <strong>Linear attention is a TTT layer.</strong> Take the inner model to be linear, $f(x)=Wx$,
+      use batch GD with $\eta=1/2$ and start from $W_0=0$. Then the gradient is $\nabla\ell(W_0;x_t) =
+      -2(\theta_V x_t)(\theta_K x_t)^\top$, the weights become $W_t = \sum_{s\le t}(\theta_V x_s)
+      (\theta_K x_s)^\top$, and the output rule gives $z_t = \sum_{s\le t}(\theta_V x_s)(\theta_K
+      x_s)^\top(\theta_Q x_t)$ — which is the definition of linear attention. (DeltaNet, in the same
+      spirit, is TTT-Linear with mini-batch size 1.)
+    </p>
+
+    <p>
+      <strong>Self-attention is also a TTT layer.</strong> Allow the inner learner to be
+      <em>nonparametric</em> — one that keeps the training points around instead of compressing them into
+      weights. With the Nadaraya–Watson kernel estimator as that learner, the induced TTT layer is
+      exactly softmax self-attention. So the framework spans the whole spectrum: parametric learners give
+      fixed-size RNN layers, the nonparametric extreme gives attention, and TTT-Linear and TTT-MLP are
+      simply two well-chosen points in between.
+    </p>
+
+    <div class="widget-frame" id="learner-widget">
+      <p class="widget-title">Every learner is a layer</p>
+      <p class="widget-sub">
+        Pick an inner model and an update rule. The card names the sequence layer that combination
+        induces — linear attention, self-attention, DeltaNet, or the paper's own TTT-Linear and TTT-MLP.
+      </p>
+    </div>
+
+    <p>
+      This is not just a tidy diagram. The paper builds TTT-Linear by starting from the linear-attention
+      configuration and switching on its components one at a time — a Layer Norm and residual connection
+      inside $f$, mini-batch TTT, a learnable learning rate. Each switch is an idea that the framework
+      makes obvious and that would be hard to even phrase without it. We will see the resulting ladder of
+      numbers in the results.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="manim">
+    <h2>8. Watching a hidden state learn</h2>
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/hidden_state.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The whole idea in one scene. A regular RNN keeps a fixed-size vector. Replace that vector with the
+      weight grid of a small model $f$, and the update rule — once just "overwrite the state" — becomes a
+      gradient step on a self-supervised loss. Each token that arrives is a training example; the loss
+      drops; the weights shift. The RNN is training itself, at test time.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>9. Does it actually work?</h2>
+
+    <p>
+      The paper evaluates two instantiations — <strong>TTT-Linear</strong> (the inner model $f$ is
+      linear) and <strong>TTT-MLP</strong> (a two-layer MLP) — against a strong Transformer and against
+      Mamba, at sizes from 125M to 1.3B parameters, following the Mamba paper's evaluation recipe.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/teaser_2025.png" alt="Scaling on the Pile"/>
+      <img src="assets/figures/token_full.png" alt="Perplexity by token index"/>
+      <figcaption>
+        Figure 2 (paper). Left: scaling on the Pile at 8k context — TTT-Linear and TTT-MLP track a strong
+        Transformer. Right: average perplexity at each token position. TTT-Linear and TTT-MLP keep
+        improving deep into the context, like the Transformer; Mamba flattens after roughly 16k.
+      </figcaption>
+    </figure>
+
+    <p>
+      That right-hand panel is the headline. On the Pile at 2k context, TTT-Linear, Mamba and the
+      Transformer are roughly indistinguishable. Push the context to 8k and both TTT variants pull
+      clearly ahead of Mamba. Extend it further, on the long-context Books data out to 32k, and the
+      pattern holds and sharpens: <em>the longer the context, the wider the gap between TTT layers and
+      Mamba.</em> TTT layers do what a Transformer does and a fixed-vector RNN cannot — they keep
+      converting extra context into lower perplexity.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/pile.png" alt="Pile evaluations at 2k and 8k context"/>
+      <figcaption>
+        Figure 10 (paper). Evaluations on the Pile at 2k and 8k context, across 125M–1.3B parameters. At
+        2k the methods overlap; at 8k both TTT variants pull clearly ahead of Mamba — the long-context
+        advantage that widens with length.
+      </figcaption>
+    </figure>
+
+    <h3>The ablation ladder</h3>
+
+    <p>
+      The cleanest evidence for the framework is the path from linear attention to TTT-Linear, built one
+      component at a time on 125M-parameter models:
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Configuration</th><th>Perplexity</th><th>Change</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">Linear attention</td><td>15.91</td><td>—</td></tr>
+        <tr><td class="cat">Linear attention, improved</td><td>15.23</td><td>−0.68</td></tr>
+        <tr><td class="cat">TTT equivalence</td><td>15.23</td><td>0</td></tr>
+        <tr><td class="cat">+ learnable $W_0$</td><td>15.27</td><td>+0.04</td></tr>
+        <tr><td class="cat">+ LayerNorm &amp; residual in $f$</td><td>14.05</td><td>−1.22</td></tr>
+        <tr><td class="cat">+ mini-batch TTT</td><td>12.35</td><td class="win">−1.70</td></tr>
+        <tr><td class="cat">+ learnable $\eta$</td><td>11.99</td><td>−0.36</td></tr>
+        <tr><td class="cat">+ Mamba backbone <strong>(= TTT-Linear)</strong></td><td class="win">11.09</td><td>−0.90</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      The single biggest jump comes from switching batch GD to mini-batch TTT — the parallelisation
+      trick is not only a speed fix, it is a genuine quality fix, because it restores the deeper search
+      space that batch GD threw away. The second biggest comes from giving the inner model a Layer Norm
+      and a residual connection: standard deep-learning hygiene, transferred from the outer loop to the
+      inner one. Both moves are hard to even think of without the conceptual frame of "the hidden state
+      is a model being trained."
+    </p>
+
+    <h3>Wall-clock time</h3>
+
+    <p>
+      Because the dual form turns the forward pass into matmuls, TTT-Linear is not just efficient in
+      theory. On a TPU pod it already runs a touch faster per training step than the Transformer baseline
+      at 2k context, with no systems optimisation at all. And its latency per token stays flat as context
+      grows, where the Transformer's climbs linearly.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/latency_full.png" alt="Inference latency vs context length"/>
+      <figcaption>
+        Figure 12 (paper). Inference latency on an A100. Per-token time grows linearly for the Transformer
+        as context lengthens, but stays roughly constant for Mamba and for TTT-Linear. TTT-MLP is the
+        honest caveat — more expressive, and more effective in long context, but its extra structure
+        costs real wall-clock time.
+      </figcaption>
+    </figure>
+
+    <p>
+      TTT-MLP is the more interesting and more unfinished story. Its more expressive hidden state pays
+      off most in long context, where there is genuinely more structure to capture — but the MLP's extra
+      work shows up sharply in memory I/O and wall-clock time. The paper is candid that this remains a
+      limitation, not a solved problem.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="meaning">
+    <h2>10. Why it works, and what it means</h2>
+
+    <h3>Self-supervised learning is the right compression heuristic</h3>
+    <p>
+      An RNN's update rule is, in the end, a compression heuristic — a rule for deciding what of the past
+      to keep. Most RNNs hand-design that rule. TTT instead borrows the one heuristic we know compresses
+      messy real-world data extraordinarily well: train a model on it with self-supervision. The hidden
+      state inherits, inside a single layer, the property that makes LLMs work — weights that hold not
+      just facts but the relationships between them.
+    </p>
+
+    <h3>The outer loop only learns the task</h3>
+    <p>
+      A subtle but important point: the outer loop never tells the inner loop <em>what</em> to remember.
+      It only shapes the self-supervised task — the projections $\theta_K,\theta_Q,\theta_V$, the
+      learning rate, the initialisation. Given that task, the inner loop does the remembering on its own,
+      by gradient descent, freshly for every sequence including ones never seen in training. The labels
+      it trains on are manufactured from the data itself, so there is always a learning signal, even at
+      test time.
+    </p>
+
+    <h3>A framework, not a single architecture</h3>
+    <p>
+      The lasting contribution is the frame. "A sequence layer is a learner run on the sequence" turns
+      architecture design into a search over models and optimisers — and that search space is enormous
+      and barely explored. TTT-Linear and TTT-MLP are deliberately the simplest interesting points in
+      it. The lineage since makes the case: DeltaNet, Mamba&nbsp;2, Gated DeltaNet and Titans all live in
+      or right beside this space, each a different model-and-optimiser choice. Titans, in particular,
+      takes the mini-batch TTT layer and equips its inner optimiser with momentum and forgetting and its
+      inner model with depth.
+    </p>
+
+    <h3>The bottom line</h3>
+    <p>
+      For a decade the trade-off looked fixed: pay quadratic cost for attention's expressive memory, or
+      accept a linear-time RNN whose fixed state cannot keep up in long context. TTT dissolves the second
+      half of that trade-off. By making the hidden state a model and the update rule a training step, it
+      builds an RNN that keeps getting better the more it reads — linear-time, parallelisable into
+      matmuls, and, the authors argue, a little closer to how we actually learn: not from a shuffled pile
+      of i.i.d. examples with a clean train/test split, but from one long stream where every moment is
+      both something to predict and something to learn from.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      An interactive explainer of <em>Learning to (Learn at Test Time): RNNs with Expressive Hidden
+      States</em> by Sun, Li, Dalal, Xu, Vikram, Zhang, Dubois, Chen, Wang, Koyejo, Hashimoto &amp;
+      Guestrin, 2024. <a href="https://arxiv.org/abs/2407.04620" target="_blank" rel="noopener">arXiv
+      2407.04620</a>. Code released by the authors in
+      <a href="https://github.com/test-time-training/ttt-lm-jax" target="_blank" rel="noopener">JAX</a>
+      and
+      <a href="https://github.com/test-time-training/ttt-lm-pytorch" target="_blank" rel="noopener">PyTorch</a>.
+    </p>
+    <p class="tiny">
+      Figures are reproduced from the paper for educational purposes; all rights remain with the authors.
+      The widgets and the animation are original, and were built as a companion to the
+      <a href="../titans/index.html">Titans explainer</a>.
+    </p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

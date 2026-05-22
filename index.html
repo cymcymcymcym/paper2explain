@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interactive paper explainers</title>
+  <style>
+    :root {
+      --bg: #fafaf7;
+      --bg-elev: #ffffff;
+      --bg-card: #f1f0eb;
+      --fg: #1b1b1f;
+      --fg-mute: #5a5a64;
+      --accent: #c64f24;
+      --accent-soft: #f4dccd;
+      --rule: #e6e4dd;
+      --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.04);
+      --shadow-hover: 0 4px 8px rgba(0,0,0,0.06), 0 16px 32px rgba(0,0,0,0.08);
+      --serif: 'Source Serif Pro', 'Georgia', 'Iowan Old Style', serif;
+      --sans: -apple-system, 'Inter', 'Helvetica Neue', system-ui, sans-serif;
+    }
+    html[data-theme="dark"] {
+      --bg: #14151a;
+      --bg-elev: #1a1c22;
+      --bg-card: #1f2128;
+      --fg: #e8e8ee;
+      --fg-mute: #999aa3;
+      --accent: #ff9b6a;
+      --accent-soft: #4a2a1c;
+      --rule: #2c2e36;
+      --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 4px 16px rgba(0,0,0,0.3);
+      --shadow-hover: 0 4px 10px rgba(0,0,0,0.5), 0 20px 40px rgba(0,0,0,0.4);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--serif);
+      font-size: 18px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 80px 28px 100px;
+    }
+
+    .theme-toggle {
+      position: fixed;
+      top: 18px;
+      right: 18px;
+      background: var(--bg-elev);
+      border: 1px solid var(--rule);
+      color: var(--fg);
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 18px;
+      box-shadow: var(--shadow);
+      z-index: 100;
+    }
+    .theme-toggle:hover { background: var(--accent-soft); }
+
+    header { margin-bottom: 36px; }
+    .eyebrow {
+      font-family: var(--sans);
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      font-size: 12px;
+      color: var(--fg-mute);
+      margin: 0 0 14px;
+      font-weight: 600;
+    }
+    h1 {
+      font-family: var(--sans);
+      font-size: 46px;
+      line-height: 1.1;
+      font-weight: 800;
+      margin: 0 0 18px;
+      letter-spacing: -0.02em;
+    }
+    .intro {
+      font-family: var(--serif);
+      font-size: 19px;
+      line-height: 1.6;
+      color: var(--fg);
+      max-width: 640px;
+    }
+    .intro em { color: var(--accent); font-style: italic; }
+
+    /* search + filter */
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 24px;
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--rule);
+    }
+    .search-wrap {
+      position: relative;
+      flex: 1 1 260px;
+      min-width: 220px;
+    }
+    .search-wrap::before {
+      content: "⌕";
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--fg-mute);
+      font-size: 16px;
+      pointer-events: none;
+    }
+    #search {
+      width: 100%;
+      padding: 10px 14px 10px 34px;
+      border: 1px solid var(--rule);
+      border-radius: 8px;
+      background: var(--bg-elev);
+      color: var(--fg);
+      font-family: var(--sans);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    #search:focus { border-color: var(--accent); }
+    .count {
+      font-family: var(--sans);
+      font-size: 12px;
+      color: var(--fg-mute);
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 26px;
+    }
+    .tag-chip {
+      font-family: var(--sans);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      padding: 5px 12px;
+      border-radius: 999px;
+      background: var(--bg-elev);
+      border: 1px solid var(--rule);
+      color: var(--fg-mute);
+      cursor: pointer;
+      transition: all 0.15s;
+      user-select: none;
+    }
+    .tag-chip:hover { border-color: var(--accent); color: var(--fg); }
+    .tag-chip.active {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+    html[data-theme="dark"] .tag-chip.active { color: var(--bg); }
+
+    .cards {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 22px;
+    }
+
+    a.card {
+      display: block;
+      background: var(--bg-elev);
+      border: 1px solid var(--rule);
+      border-radius: 12px;
+      padding: 26px 28px 28px;
+      text-decoration: none;
+      color: var(--fg);
+      transition: transform 0.15s, box-shadow 0.2s, border-color 0.2s;
+      box-shadow: var(--shadow);
+    }
+    a.card:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-hover);
+      border-color: var(--accent);
+    }
+
+    .card-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 6px;
+    }
+    .card-num {
+      font-family: var(--sans);
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .card-tag {
+      font-family: var(--sans);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      color: var(--fg-mute);
+      text-transform: uppercase;
+    }
+    .card h2 {
+      font-family: var(--sans);
+      font-size: 26px;
+      line-height: 1.2;
+      font-weight: 700;
+      margin: 0 0 8px;
+      letter-spacing: -0.01em;
+    }
+    .card .meta {
+      font-family: var(--sans);
+      font-size: 13px;
+      color: var(--fg-mute);
+      margin: 0 0 14px;
+    }
+    .card .meta em { font-style: italic; }
+    .card .blurb {
+      font-family: var(--serif);
+      font-size: 16px;
+      line-height: 1.55;
+      color: var(--fg);
+      margin: 0 0 14px;
+    }
+    .card .hl {
+      font-family: var(--mono, 'JetBrains Mono', monospace);
+      font-size: 12px;
+      color: var(--accent);
+      background: var(--accent-soft);
+      padding: 4px 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .arrow {
+      float: right;
+      font-family: var(--sans);
+      font-size: 14px;
+      color: var(--accent);
+      margin-top: 4px;
+    }
+
+    .empty {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--fg-mute);
+      font-family: var(--sans);
+      font-size: 14px;
+    }
+    .empty.hidden { display: none; }
+
+    footer {
+      margin-top: 72px;
+      padding-top: 28px;
+      border-top: 1px solid var(--rule);
+      font-family: var(--sans);
+      font-size: 13px;
+      color: var(--fg-mute);
+    }
+    footer code {
+      font-family: var(--mono, 'JetBrains Mono', monospace);
+      background: var(--bg-card);
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 12px;
+    }
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    footer a:hover { text-decoration: underline; }
+
+    @media (max-width: 600px) {
+      .container { padding: 48px 18px 60px; }
+      h1 { font-size: 34px; }
+      .card { padding: 20px 22px; }
+      .card h2 { font-size: 22px; }
+      .arrow { display: none; }
+    }
+  </style>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<div class="container">
+  <header>
+    <p class="eyebrow">paper2explain · interactive blogs</p>
+    <h1>Interactive paper explainers</h1>
+    <p class="intro">
+      Long, beginner-friendly walk-throughs of recent ML papers, with
+      <em>interactive widgets you can drag</em>, animations rendered in manim, and
+      the real paper figures inline. Each one takes about 20–30 minutes to read
+      end-to-end.
+    </p>
+  </header>
+
+  <div class="controls">
+    <div class="search-wrap">
+      <input id="search" type="search" placeholder="search titles, authors, blurbs…" autocomplete="off" />
+    </div>
+    <span class="count" id="count"></span>
+  </div>
+
+  <div class="tags" id="tags"></div>
+
+  <div class="cards" id="cards"></div>
+  <div class="empty hidden" id="empty">No blogs match your filter.</div>
+
+  <footer>
+    <p>
+      Each blog is a single-file HTML document with vanilla JS / Canvas widgets, KaTeX for math, and
+      embedded MP4 from manim. No build step, no dependencies, works offline.
+    </p>
+    <p>
+      Source on <a href="https://github.com/cymcymcymcym/paper2explain">GitHub</a> · add a new blog
+      by appending one entry to <code>blogs.js</code>.
+    </p>
+  </footer>
+</div>
+
+<script src="blogs.js"></script>
+<script>
+  // ----- theme toggle (shared key with the individual blogs) -----
+  (function () {
+    const toggle = document.getElementById('themeToggle');
+    const saved = localStorage.getItem('vb-theme');
+    if (saved) document.documentElement.setAttribute('data-theme', saved);
+    const setLabel = () => {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+      toggle.textContent = dark ? '☀' : '☾';
+    };
+    setLabel();
+    toggle.addEventListener('click', () => {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+      if (dark) {
+        document.documentElement.removeAttribute('data-theme');
+        localStorage.setItem('vb-theme', 'light');
+      } else {
+        document.documentElement.setAttribute('data-theme', 'dark');
+        localStorage.setItem('vb-theme', 'dark');
+      }
+      setLabel();
+    });
+  })();
+
+  // ----- render -----
+  const state = { query: '', tag: null };
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+
+  function renderTags() {
+    const tags = [...new Set(BLOGS.map(b => b.tag))].sort();
+    const host = document.getElementById('tags');
+    host.innerHTML = '';
+    const mkChip = (label, value) => {
+      const el = document.createElement('span');
+      el.className = 'tag-chip' + (state.tag === value ? ' active' : '');
+      el.textContent = label;
+      el.addEventListener('click', () => {
+        state.tag = state.tag === value ? null : value;
+        renderTags();
+        renderCards();
+      });
+      return el;
+    };
+    host.appendChild(mkChip('all', null));
+    tags.forEach(t => host.appendChild(mkChip(t, t)));
+  }
+
+  function matches(blog) {
+    if (state.tag && blog.tag !== state.tag) return false;
+    if (!state.query) return true;
+    const q = state.query.toLowerCase();
+    const hay = [blog.title, blog.tag, blog.authors, blog.venue, blog.date, blog.paper, blog.blurb]
+      .join(' ').toLowerCase();
+    return hay.includes(q);
+  }
+
+  function renderCards() {
+    const host = document.getElementById('cards');
+    const empty = document.getElementById('empty');
+    const count = document.getElementById('count');
+    host.innerHTML = '';
+
+    const visible = BLOGS.filter(matches);
+    count.textContent = visible.length === BLOGS.length
+      ? `${BLOGS.length} blog${BLOGS.length === 1 ? '' : 's'}`
+      : `${visible.length} of ${BLOGS.length}`;
+
+    if (!visible.length) { empty.classList.remove('hidden'); return; }
+    empty.classList.add('hidden');
+
+    visible.forEach((b, i) => {
+      const a = document.createElement('a');
+      a.className = 'card';
+      a.href = `${b.slug}/index.html`;
+      a.innerHTML = `
+        <div class="card-head">
+          <span class="card-num">${pad(i + 1)}</span>
+          <span class="card-tag">${b.tag}</span>
+        </div>
+        <h2>${b.title} <span class="arrow">read →</span></h2>
+        <p class="meta">${b.authors} · ${b.venue} · ${b.date} · <em>${b.paper}</em></p>
+        <p class="blurb">${b.blurb}</p>
+        <span class="hl">${b.highlights}</span>
+      `;
+      host.appendChild(a);
+    });
+  }
+
+  document.getElementById('search').addEventListener('input', (e) => {
+    state.query = e.target.value.trim();
+    renderCards();
+  });
+
+  // keyboard shortcut: "/" focuses search
+  document.addEventListener('keydown', (e) => {
+    if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+      e.preventDefault();
+      document.getElementById('search').focus();
+    }
+    if (e.key === 'Escape' && document.activeElement.id === 'search') {
+      document.activeElement.blur();
+      document.getElementById('search').value = '';
+      state.query = '';
+      renderCards();
+    }
+  });
+
+  renderTags();
+  renderCards();
+</script>
+</body>
+</html>

@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Why Diffusion Models Don't Memorize — an interactive explainer</title>
+  <meta name="description" content="An interactive walkthrough of Bonnaire et al.'s paper showing that diffusion models avoid memorization through implicit dynamical regularization — a generalization window that opens linearly with dataset size."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}], macros:{'\\vx':'{\\mathbf{x}}','\\vs':'{\\mathbf{s}}','\\vA':'{\\mathbf{A}}','\\vB':'{\\mathbf{B}}','\\vU':'{\\mathbf{U}}','\\vW':'{\\mathbf{W}}','\\vxi':'{\\boldsymbol{\\xi}}','\\vtheta':'{\\boldsymbol{\\theta}}','\\vSigma':'{\\boldsymbol{\\Sigma}}'}, throwOnError:false});"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Why diffusion models don't memorize</h1>
+    <p class="byline">
+      Bonnaire, Urfin, Biroli, Mézard &middot; ENS Paris &amp; Bocconi &middot; May 2025 &middot;
+      <a href="https://arxiv.org/abs/2505.17638" target="_blank" rel="noopener">arXiv 2505.17638</a>
+      &middot; <a href="https://github.com/tbonnair/Why-Diffusion-Models-Don-t-Memorize" target="_blank" rel="noopener">code</a>
+    </p>
+    <p class="lede">
+      Diffusion models are <em>supposed</em> to memorize. Their loss function has a global minimum that perfectly reproduces every training image. Yet trained DDPMs generate new faces, new landscapes, new everything. Bonnaire and coauthors give the cleanest explanation yet: training has two distinct timescales — one for learning to generalize, one for starting to memorize — and the gap between them <strong>grows linearly with the size of the training set</strong>. Stop early in that window and you get a generalizing model, for free, with no architectural trick and no explicit regularizer.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The puzzle</a></li>
+      <li><a href="#setup">The memorization disaster</a></li>
+      <li><a href="#discovery">Two timescales</a></li>
+      <li><a href="#widget-window">The expanding window</a></li>
+      <li><a href="#mechanism">What the score looks like during training</a></li>
+      <li><a href="#scaling">Why it scales with $n$</a></li>
+      <li><a href="#theory">The theory: random features</a></li>
+      <li><a href="#phase">The full phase diagram</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#bottom-line">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/summary_tau_mem.png" alt="Diagram of three training regimes: short training gives noise; intermediate training is the generalization window; long training produces memorized samples."/>
+      <figcaption>Figure 1 of the paper. A diffusion model trained for time $\tau$ traverses three regimes: at short $\tau$ the score is uninformative and samples are noise (left); in an intermediate window $[\tau_\mathrm{gen}, \tau_\mathrm{mem}]$ the model generalizes — the orange score (top, learned) closely tracks the dashed black <em>population</em> score; for $\tau > \tau_\mathrm{mem}$ the learned score collapses onto the gray <em>empirical</em> score with sharp peaks at each training sample, and generated images become near-duplicates of the training set. The width of the green window grows linearly with $n$.</figcaption>
+    </figure>
+
+    <p>Here is a puzzle that should bother anyone who trains diffusion models. The standard score-matching loss has a unique, perfectly-defined global minimum: the so-called <em>empirical score</em>, which is the gradient of a sum of Gaussians centered on each training point. A model that reaches that minimum is mathematically guaranteed to reproduce its training data when you sample from it. There is no escape — the minimum is the minimum. So when you train a U-Net to convergence on 1,024 faces, the math says you should get 1,024 faces back, with some Gaussian wiggle.</p>
+
+    <p>But that is emphatically <em>not</em> what happens. State-of-the-art image diffusion models trained on millions of images generate novel images that nobody has ever seen. Even a small U-Net trained on just 1,024 CelebA faces, stopped at the right moment, will hand you brand-new faces — faces that don't appear anywhere in its training set. Why? The optimization landscape says "memorize"; the trained model says "generalize." What gives?</p>
+
+    <p>This paper's answer is so clean it is almost embarrassing that it took until 2025 to write down: <em>training never reaches the minimum.</em> Score matching's global minimum is at the bottom of a very narrow basin, and gradient descent — even after millions of steps, even with no regularization, even with vastly more parameters than data points — sits in a wide shallow plateau above it that happens to be the population score. The plateau gets wider as you add data. There is an entire phase of training, identified by two precise timescales, where the model generalizes simply because it has not yet had time to find the memorizing solution.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="setup">
+    <h2>1. The memorization disaster</h2>
+
+    <p>Diffusion models work in two halves. A <em>forward</em> process gradually corrupts a data sample $\vx_0$ into pure Gaussian noise by integrating the Ornstein–Uhlenbeck SDE</p>
+
+    <p class="eq">$$ d\vx = -\vx(t)\,dt + d\vB(t), $$</p>
+
+    <p>so that at time $t$ the marginal is $\vx_t = e^{-t}\vx_0 + \sqrt{\Delta_t}\,\vxi$ with $\Delta_t = 1 - e^{-2t}$. The <em>reverse</em> process undoes this by running</p>
+
+    <p class="eq">$$ -d\vx = \big[\vx(t) + 2\,\vs(\vx, t)\big]\,dt + d\vB(t) $$</p>
+
+    <p>where $\vs(\vx, t) = \nabla_\vx \log P_t(\vx)$ is the <strong>score</strong>: a vector field that, at every noise level, points toward higher data density. Sample Gaussian noise, follow the reverse SDE, and out comes a sample from $P_0$ — provided you know the right score. Score matching gives a recipe for estimating it from data: minimize</p>
+
+    <p class="eq">$$ \mathcal{L}_t(\vtheta) = \frac{1}{n}\sum_{\nu=1}^n \mathbb{E}_\vxi \Big[\big\lVert \sqrt{\Delta_t}\,\vs_\vtheta(\vx_t^\nu(\vxi), t) + \vxi \big\rVert^2\Big] $$</p>
+
+    <p>over a parametric class — typically a U-Net. So far so good. Now here is the catch. This loss has an exact global minimizer in closed form, the <em>empirical score</em></p>
+
+    <p class="eq">$$ \vs_\mathrm{emp}(\vx, t) = \nabla_\vx \log P_t^\mathrm{emp}(\vx), \quad P_t^\mathrm{emp}(\vx) = \frac{1}{n (2\pi\Delta_t)^{d/2}}\sum_{\nu=1}^n e^{-\lVert \vx - \vx^\nu e^{-t}\rVert^2 / (2\Delta_t)}. $$</p>
+
+    <p>This is a Gaussian-blurred mixture peaked on the noised training samples. The score it produces points, at the end of the reverse process, directly back at one of the original $\vx^\nu$. Sample from this empirical score and you get back training images, period. As Biroli and coauthors have shown, this memorization is unavoidable for any score model expressive enough to represent $\vs_\mathrm{emp}$, unless $n$ grows <em>exponentially</em> with the data dimension $d$. For CelebA at $32 \times 32$, $d = 1024$, so the threshold is unreachable.</p>
+
+    <p>So either (a) modern diffusion models are not expressive enough to fit the empirical score — which is hard to believe for a U-Net with 16M parameters trained on 1,024 images — or (b) training simply doesn't reach the empirical score. Previous work pointed at architectural inductive biases <a href="https://arxiv.org/abs/2410.02916" target="_blank" rel="noopener">(Kamb &amp; Ganguli)</a>, finite learning rate <a href="https://arxiv.org/abs/2502.16470" target="_blank" rel="noopener">(Wu et al.)</a>, and limited capacity. Bonnaire and coauthors show that even after stripping all of those out, there is a fourth force at work — pure training dynamics — and it dominates everything else.</p>
+
+    <aside class="callout">
+      <strong>Why the empirical score is a disaster.</strong> Imagine 8 training points in 1D. The empirical density $P_t^\mathrm{emp}$ is 8 Gaussians sitting on top of those points. As $t \to 0$, those Gaussians shrink to spikes. The score $\nabla \log P_t^\mathrm{emp}$ then points sharply toward the nearest training point from wherever you are — like a vector field with 8 attractors. Roll a noisy ball downhill in this field and it will land squarely on one of the 8 training points. That is the memorization regime.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="discovery">
+    <h2>2. Two timescales</h2>
+
+    <p>The empirical observation that organizes the entire paper is this: when you train a U-Net on $n$ CelebA faces and watch what comes out at different points during training, the dynamics break into two cleanly separated phases.</p>
+
+    <p>At a time the authors call $\tau_\mathrm{gen}$, the model goes from outputting noise to outputting <em>good, novel faces</em>. The FID drops sharply and then plateaus. The generated samples do not match any training image. The model has clearly learned <em>something</em> about the structure of human faces.</p>
+
+    <p>Then nothing happens for a long while. The FID stays flat. The generated samples stay novel.</p>
+
+    <p>Eventually, at a much later time $\tau_\mathrm{mem}$, the trap snaps shut. Generated samples become near-duplicates of training images. The memorization fraction $f_\mathrm{mem}$ — the share of generated samples whose nearest training neighbor is at least three times closer than their second-nearest — rises from 0% toward a substantial fraction. Crucially:</p>
+
+    <ul>
+      <li><strong>$\tau_\mathrm{gen}$ does not depend on $n$.</strong> Whether you train on 128 faces or 32,768 faces, the FID hits its minimum at around the same number of SGD steps.</li>
+      <li><strong>$\tau_\mathrm{mem}$ scales linearly with $n$.</strong> Double the dataset size, you need to train roughly twice as long before memorization kicks in.</li>
+    </ul>
+
+    <p>This is the whole story compressed into one observation. The generalization window $[\tau_\mathrm{gen}, \tau_\mathrm{mem}]$ widens linearly with $n$. If you stop training in that window, you have a model that produces good samples and does not memorize, full stop. Below is the actual experiment.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/fmem_celeba.png" alt="Plot showing FID and memorization fraction versus training time τ for n = 256 to 32768 on CelebA. Each FID curve drops at around τ ≈ 100K regardless of n. Each memorization curve rises later, at a time that grows with n. The inset shows all memorization curves collapsing when plotted against τ/n."/>
+      <figcaption>Figure 2 (left) of the paper. FID (solid, left axis) and memorization fraction (dashed, right axis) on CelebA $32 \times 32$ for varying $n$, U-Net base width $W = 32$. All FID curves bottom out at $\tau_\mathrm{gen} \approx 10^5$ steps, independent of $n$. The memorization fraction stays at zero, then climbs at a time $\tau_\mathrm{mem}$ that depends on $n$. The inset rescales the $x$-axis by $\tau/n$ — all curves collapse, confirming $\tau_\mathrm{mem} \propto n$.</figcaption>
+    </figure>
+
+    <p>Look at the inset. Plotted against $\tau / n$, every memorization curve, for $n$ spanning two and a half orders of magnitude, lands on top of the others. That is what a clean linear scaling looks like. It is not a fit; it is a collapse.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="widget-window">
+    <h2>3. The expanding window</h2>
+
+    <p>The animation below shows the central claim. Two curves: blue is generation quality (smaller is better), red is memorization fraction. The green stripe is the generalization window $[\tau_\mathrm{gen}, \tau_\mathrm{mem}]$ — the interval where the model is both good <em>and</em> novel. Once the first sweep is done, $n$ doubles; the right edge of the window slides over, the window opens wider.</p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/expanding_window.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">As $n$ grows, the window expands rightward. $\tau_\mathrm{gen}$ stays put because the generalization regime depends only on the population density — and that density is what the model sees in expectation regardless of how many concrete samples are drawn from it. $\tau_\mathrm{mem}$ recedes because finding the empirical score requires resolving sample-specific features, and there are linearly more samples to resolve.</p>
+
+    <p>The widget below lets you play with both axes interactively. Drag the dataset size $n$ to see how far $\tau_\mathrm{mem}$ slides; drag the training time $\tau$ to see which phase the model is currently in.</p>
+
+    <div class="widget-frame" id="window-explorer">
+      <p class="widget-title">The generalization window</p>
+      <p class="widget-sub">Watch how dataset size $n$ controls when memorization starts — but not when generalization begins.</p>
+    </div>
+
+    <p>Pick any $n \geq 4$ on the slider. The green window is wide. Stop your training anywhere inside it and you get a generalizing model. The exact stopping point doesn't matter — you have an enormous margin. This is what the paper calls <em>implicit dynamical regularization</em>: training itself, by being slow enough to find the empirical score, gives you a long plateau at a good solution.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="mechanism">
+    <h2>4. What the score looks like during training</h2>
+
+    <p>To build the right intuition, drop into one dimension. Suppose your true data distribution is a Gaussian mixture with eight modes, and you draw $n$ samples from it. There are now two candidate score functions floating around:</p>
+
+    <ul>
+      <li>The <strong>population score</strong> $\vs_\mathrm{pop}(x, t) = \nabla \log P_t(x)$, derived from the true mixture. This is smooth, has eight wide attractors corresponding to the modes, and depends only on the underlying distribution — not on which particular samples you drew.</li>
+      <li>The <strong>empirical score</strong> $\vs_\mathrm{emp}(x, t) = \nabla \log P_t^\mathrm{emp}(x)$, derived from the $n$ samples. This is jagged at low noise: it has $n$ sharp attractors sitting precisely on the training points. As $t \to 0$ each attractor's pull becomes brutally local.</li>
+    </ul>
+
+    <p>What does training do? It begins from random initialization and walks toward the empirical score (because that's the global minimum of the loss). But it does not walk in a straight line — it walks along the gradient of the loss, and that loss landscape is smoother in the directions corresponding to large-eigenvalue modes of the score-matching Gram matrix. <em>Smooth, low-frequency features get learned first.</em></p>
+
+    <p>The smooth, low-frequency content of the empirical score is, by construction, very close to the population score (you can think of $\vs_\mathrm{emp}$ as $\vs_\mathrm{pop}$ plus a high-frequency perturbation that depends on which particular samples you drew). So the model spends a long time approximating the population score while only slowly resolving the sample-specific bumps. This is the well-known <em>spectral bias</em> of neural networks <a href="https://arxiv.org/abs/1806.08734" target="_blank" rel="noopener">(Rahaman et al.)</a>, surfacing in a new and consequential setting.</p>
+
+    <div class="widget-frame" id="score-morph">
+      <p class="widget-title">Score function morphing</p>
+      <p class="widget-sub">Eight modes, $n$ samples, and a learned score function that morphs from the population score (smooth) to the empirical score (peaky) as you slide $\tau$.</p>
+    </div>
+
+    <p>Drag $\tau$ from left to right and watch the orange curve change shape. Early on it tracks the smooth gray dashed line (the population score). Late, it snaps onto the red dashed line (the empirical score) with sharp swings at every training point. The middle of the slider — the dynamical regularization regime — is where the model is closest to the truth, even though it is far from the loss minimum. This is the paper's mechanism in one picture.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="scaling">
+    <h2>5. Why it scales with $n$</h2>
+
+    <p>The linear scaling $\tau_\mathrm{mem} \propto n$ is not obvious. A first guess might be: with $n$ samples and batch size $B$, each sample is seen on average $\tau B / n$ times, so you need $n$ times as many steps to expose each sample the same number of times. That guess is <strong>wrong</strong>. The authors verify this directly by running with full-batch updates ($B = n$) — every sample is seen exactly once per step, so all $n$ values have the same per-sample exposure count at fixed $\tau$. The scaling persists.</p>
+
+    <p>The real reason has to do with the geometry of the loss landscape. Adding training samples does not just add gradient signal; it <em>reshapes</em> the loss landscape so that the high-frequency, sample-specific minimum becomes harder to reach. In the random-features model studied in Section 3 of the paper, this shows up cleanly: the eigenvalues of the score-matching Gram matrix split into two well-separated bulks, and the smallest eigenvalue of the larger bulk — which controls the memorization timescale — scales as $1/n$. We'll get to that.</p>
+
+    <p>The same scaling holds with full-batch updates, with Adam (much faster timescales but identical ratio), with classifier-free guidance, and on synthetic Gaussian mixtures. It is robust. It is not an artifact of optimizer, batch, or dataset.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/losses_train_test.png" alt="Training and test loss versus training time for various n. Initially the curves are on top of each other, then they separate at a time that grows with n. Inset rescales x by τ/n and they collapse."/>
+      <figcaption>Figure 2 (middle) of the paper. The training loss (solid) and held-out test loss (dashed) at fixed diffusion time $t = 0.01$. Initially the curves coincide — the learned score doesn't depend on the specific training set. They separate at a critical time that grows with $n$; the inset against $\tau / n$ collapses the separation onto one curve. For $n = 32{,}768$ (the largest), the test loss has not started to rise even after 11 million SGD steps.</figcaption>
+    </figure>
+
+    <p>The middle panel is the cleanest piece of evidence. For small $\tau$, the learned score is the same on training and held-out images — the model has not yet started to specialize. For large $\tau$, the training loss continues to fall while the test loss climbs, which is the textbook fingerprint of overfitting. The crossover time scales with $n$.</p>
+
+    <h3>What about the model size?</h3>
+
+    <p>Holding $n$ fixed, increasing the U-Net width $W$ shrinks both timescales. The paper finds the clean scalings</p>
+
+    <p class="eq">$$ \tau_\mathrm{gen} \propto W^{-1}, \qquad \tau_\mathrm{mem} \propto n\,W^{-1}. $$</p>
+
+    <p>Bigger models reach the generalization plateau faster — they have more parameters to use for low-frequency modes — but they also fall into memorization faster. The <em>ratio</em> $\tau_\mathrm{mem}/\tau_\mathrm{gen}$ is approximately $n / \mathrm{const}$, independent of $W$ for moderately overparametrized models. So you can always early-stop into the safe window, regardless of how big your model is.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/fid_fmem_W.png" alt="Panels A/B/C/D showing FID and memorization fraction for several widths W on CelebA. After rescaling time by W, all curves collapse."/>
+      <img src="assets/figures/phase_diagram.png" alt="Phase diagram in (n, p) plane on CelebA with three boundary curves for τ = τ_gen, 3τ_gen, 8τ_gen, separating memorization (below) from generalization (above)."/>
+      <figcaption>Figure 3 of the paper. <em>Left:</em> FID (top) and memorization fraction (bottom) on CelebA for $W \in \{8, 16, 32, 48, 64\}$. Panels B and D rescale the $x$-axis by $W \tau$ and the curves collapse — confirming $\tau_\mathrm{gen} \propto 1/W$ and $\tau_\mathrm{mem} \propto n/W$. <em>Right:</em> the $(n, p)$ phase diagram. Each curve is the smallest $n$ that yields zero memorization at a given $\tau$. As $\tau \to \infty$ the curve approaches the architectural threshold $n^\star(p)$ from below. For any finite $\tau$, a much larger region of $(n, p)$ space is safe.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="theory">
+    <h2>6. The theory: random features</h2>
+
+    <p>The numerical story is convincing on its own, but it leaves the question: <em>why two timescales?</em> Why does the loss landscape split into a fast generalization mode and a slow memorization mode, separated by a long plateau?</p>
+
+    <p>The paper answers this in a tractable model: replace the U-Net by a Random Features Neural Network</p>
+
+    <p class="eq">$$ \vs_\vA(\vx) = \frac{\vA}{\sqrt{p}}\,\sigma\!\left(\frac{\vW \vx}{\sqrt{d}}\right), $$</p>
+
+    <p>where $\vW \in \mathbb{R}^{p \times d}$ is a Gaussian random projection that is <em>frozen</em>, and only the output layer $\vA \in \mathbb{R}^{d \times p}$ is trained. The score-matching loss is then quadratic in $\vA$, gradient descent has a closed-form solution, and the timescales of the dynamics are governed by the inverse eigenvalues of a $p \times p$ matrix $\Delta_t \vU / \psi_p$ where $\psi_p = p/d$ and $\psi_n = n/d$.</p>
+
+    <p>In the high-dimensional limit $d, p, n \to \infty$ with $\psi_p$ and $\psi_n$ fixed, the authors compute the eigenvalue density of $\vU$ using the replica method. In the overparametrized regime $\psi_p > \psi_n \gg 1$:</p>
+
+    <p class="eq">$$ \rho(\lambda) = \Big(1 - \tfrac{1 + \psi_n}{\psi_p}\Big)\delta(\lambda - s_t^2) + \tfrac{\psi_n}{\psi_p}\,\rho_1(\lambda) + \tfrac{1}{\psi_p}\,\rho_2(\lambda). $$</p>
+
+    <p>Three pieces: a delta peak at $s_t^2$ (whose eigenvectors don't affect either loss and can be ignored), a bulk $\rho_1$ supported on $\big[s_t^2 + v_t^2(1 - \sqrt{\psi_p/\psi_n})^2,\; s_t^2 + v_t^2(1 + \sqrt{\psi_p/\psi_n})^2\big]$, and a bulk $\rho_2$ on scale $\psi_p$.</p>
+
+    <p>The two bulks $\rho_1$ and $\rho_2$ are on different scales: $\rho_1$ on scale $\psi_p / \psi_n$, $\rho_2$ on scale $\psi_p$. They are <em>cleanly separated</em>, which means the dynamics have two cleanly separated timescales.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/rfnn_sketch.png" alt="Sketch of a random-features neural network with frozen first layer and trainable second layer."/>
+      <img src="assets/figures/rf_spectrum.png" alt="Spectrum of U in the overparametrized regime, showing two well-separated bulks ρ1 and ρ2."/>
+      <figcaption>Figure 4 of the paper. <em>Left:</em> the random-features architecture used in the analysis. <em>Right:</em> the eigenvalue density $\rho(\lambda)$ of the Gram matrix $\vU$ at $\psi_p = 64$, $\psi_n = 8$, $t = 0.01$. The bulk $\rho_1$ near $\lambda \approx 10$–$45$ (inset, blue) is the slow mode — its smallest eigenvalue sets $\tau_\mathrm{mem}$. The bulk $\rho_2$ at large $\lambda$ is the fast mode that sets $\tau_\mathrm{gen}$.</figcaption>
+    </figure>
+
+    <p>Each eigenvalue $\lambda$ corresponds to a relaxation time $\tau = \psi_p / (\Delta_t \lambda)$ in the gradient flow. Large $\lambda$ relaxes quickly; small $\lambda$ relaxes slowly. So the two bulks translate directly into:</p>
+
+    <ul>
+      <li><strong>$\tau_\mathrm{gen} \sim 1/\Delta_t$</strong>, set by the large eigenvalues in $\rho_2$. This is the fast mode that learns the smooth, population-score part of the target. It depends on $\vSigma$ (the population covariance) but <em>not</em> on which specific samples you drew, which is why $\tau_\mathrm{gen}$ is independent of $n$.</li>
+      <li><strong>$\tau_\mathrm{mem} \sim \psi_n / \Delta_t = n/(d\Delta_t)$</strong>, set by the smallest eigenvalue in $\rho_1$. This is the slow mode that resolves the sample-specific fine structure of the empirical score — and it gets linearly slower as $n$ grows, because the bulk $\rho_1$ has support on scale $\psi_p/\psi_n = pd/n$, so its left edge $\lambda_\min$ scales as $1/\psi_n$.</li>
+    </ul>
+
+    <p>The linear scaling $\tau_\mathrm{mem} \propto n$ comes out of the algebra of the spectrum, in the simplest possible model where it could appear at all. The U-Net experiments confirm that the same scaling persists in the full nonlinear setting, but the random-features model tells you <em>why</em>: it is a generic feature of overparametrized score learning, not an artifact of any architecture.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/rf_error_score.png" alt="Score error against training time for random features model with different ψn values. The error drops to a plateau at τ_gen, stays flat, then drops further at τ_mem. The inset shows the second drop happens at τ ∝ ψ_n."/>
+      <figcaption>Figure 5A of the paper. Distance to the true score $\mathcal{E}_\mathrm{score}$ as a function of $\tau$ for the RFNN, at four values of $\psi_n = n/d$. Two-stage descent is clearly visible: a fast drop to the generalization plateau at $\tau_\mathrm{gen}$, and a much slower descent (or rise, in the overfitting regime) at $\tau_\mathrm{mem}$. The inset rescales $\tau$ by $\tau_\mathrm{mem} = \psi_p / (\Delta_t \lambda_\min)$ and the late-time behavior collapses.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="phase">
+    <h2>7. The full phase diagram</h2>
+
+    <p>Putting the pieces together, the paper organizes everything into a phase diagram in the $(n, p)$ plane (size of training set, number of model parameters). At any chosen training time $\tau$, you can ask: for what combinations of $n$ and $p$ does the model generalize, and for what combinations does it memorize?</p>
+
+    <p>There are three regimes:</p>
+
+    <ul>
+      <li><strong>Memorization</strong> ($n$ small relative to $p$, and $\tau$ large): the model has enough capacity to memorize, and you've trained long enough to find the empirical score. Samples are copies of training data.</li>
+      <li><strong>Dynamical regularization</strong> (intermediate $n$, any $p$, $\tau \in [\tau_\mathrm{gen}, \tau_\mathrm{mem}]$): the model could memorize given infinite training, but you've stopped early. This is where the paper lives.</li>
+      <li><strong>Architectural regularization</strong> ($n > n^\star(p)$, any $\tau$): the model is not expressive enough to memorize the $n$ samples even at $\tau \to \infty$. The score it learns is a smooth interpolant that doesn't depend on the particular samples.</li>
+    </ul>
+
+    <p>The widget below lets you click anywhere in the $(n, p)$ plane and see which regime applies. Move the $\tau$ slider to watch the dynamical-regularization region grow at the expense of memorization: at $\tau = \tau_\mathrm{gen}$ the safe zone is huge; at $\tau \to \infty$ it shrinks back to just the architectural-regularization region.</p>
+
+    <div class="widget-frame" id="phase-explorer">
+      <p class="widget-title">Phase diagram explorer</p>
+      <p class="widget-sub">Click anywhere in $(n, p)$ to see the regime. Drag $\tau$ to shift the boundary.</p>
+    </div>
+
+    <p>The takeaway is that the safe early-stopping zone is much larger than the architectural-regularization zone. Practically: you do not need to crank the dataset size up to the architectural threshold $n^\star(p)$ to get a non-memorizing model — early stopping puts you in the safe zone with vastly less data.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why this works</h2>
+
+    <p>It is worth pausing to make the intuition concrete. Three forces are at play.</p>
+
+    <h3>Spectral bias</h3>
+
+    <p>Neural networks trained by gradient descent learn low-frequency components of a target function before high-frequency ones. This is well documented for supervised learning, and the paper shows it operates identically for score learning. The population score, being a gradient of a smooth density, is dominated by low frequencies; the empirical score adds high-frequency bumps at each training point. Spectral bias is what pulls the model toward the population score first.</p>
+
+    <h3>The empirical score is &ldquo;population + perturbation&rdquo;</h3>
+
+    <p>Mathematically, you can write</p>
+
+    <p class="eq">$$ \vs_\mathrm{emp}(\vx, t) = \vs_\mathrm{pop}(\vx, t) + \delta\vs(\vx, t; \{\vx^\nu\}) $$</p>
+
+    <p>where $\delta\vs$ is the dataset-dependent perturbation. The perturbation has support on length scales much smaller than the modes of $P_t$, and crucially its <em>amplitude</em> shrinks with $n$ (more samples average out to a smoother empirical density). So the gap that the model has to traverse from "matches the population score" to "matches the empirical score" gets <em>longer</em> as $n$ grows. That is the linear scaling.</p>
+
+    <h3>The plateau is wide</h3>
+
+    <p>It is not just that the generalization point is hit first — it is that the model <em>sits</em> there for a long time. This is because the high-frequency modes of the score-matching Gram matrix have small eigenvalues, so the corresponding directions are flat in the loss landscape. Gradient descent makes essentially no progress along them until very late. Bonnaire and coauthors compute this directly for the random-features model: $\lambda_\min$ of the second bulk scales as $1/n$, giving relaxation time proportional to $n$.</p>
+
+    <p>You can think of training as a search through a landscape with two valleys at very different depths and very different widths: a wide shallow valley (population score) reached quickly, and a narrow deep valley (empirical score) reached much later. Adding training data deepens and narrows the deep valley while leaving the shallow one alone.</p>
+
+    <div class="widget-frame" id="memdetector">
+      <p class="widget-title">Memorization detector</p>
+      <p class="widget-sub">Drag a generated point around the training set. See its nearest-neighbor distance ratio and whether it crosses the $k = 1/3$ memorization threshold.</p>
+    </div>
+
+    <p>The nearest-neighbor ratio above is the paper's concrete definition: a generated sample $\vx_\tau$ counts as memorized if its distance to the nearest training point is less than $k = 1/3$ times its distance to the second nearest. The threshold is loose enough to ignore noisy reconstructions and tight enough to flag near-duplicates. Drag the generated point inside the cluster around any training image; the ratio drops below $1/3$ and the indicator flips to <strong>memorized</strong>.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>9. Results at a glance</h2>
+
+    <p>Most of the headline numbers are scalings, not benchmarks, but a few concrete results are worth pinning down.</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Setting</th><th>Quantity</th><th>Value</th><th>Source</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="3" class="cat">CelebA, U-Net $W = 32$, $p = 4 \times 10^6$</td>
+          <td>$\tau_\mathrm{gen}$ (SGD steps)</td>
+          <td class="win"><strong>$\approx 10^5$</strong>, independent of $n$</td>
+          <td>Fig. 2 (left)</td>
+        </tr>
+        <tr>
+          <td>$\tau_\mathrm{mem}$ scaling</td>
+          <td class="win"><strong>$\tau_\mathrm{mem} \propto n$</strong>, all curves collapse against $\tau/n$</td>
+          <td>Fig. 2 (left, inset)</td>
+        </tr>
+        <tr>
+          <td>$n = 1024$ at $\tau = 190$K vs $\tau = 1.62$M</td>
+          <td class="win"><strong>FID 35.1, $f_\mathrm{mem} = 0\%$</strong> early; FID 35.7, $f_\mathrm{mem} = 47.2\%$ late</td>
+          <td>App. A.1</td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">CelebA, varying width $W$</td>
+          <td>$\tau_\mathrm{gen}$ scaling with $W$</td>
+          <td class="win"><strong>$\tau_\mathrm{gen} \propto W^{-1}$</strong></td>
+          <td>Fig. 3 panel B</td>
+        </tr>
+        <tr>
+          <td>$\tau_\mathrm{mem}$ scaling with $W$</td>
+          <td class="win"><strong>$\tau_\mathrm{mem} \propto n W^{-1}$</strong></td>
+          <td>Fig. 3 panel D</td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Robustness checks</td>
+          <td>Full-batch updates ($B = n$)</td>
+          <td class="win"><strong>$\tau_\mathrm{mem} \propto n$ still holds</strong> — not from sample repetition</td>
+          <td>App. A.2</td>
+        </tr>
+        <tr>
+          <td>Adam optimizer</td>
+          <td class="win"><strong>Same two-phase dynamics</strong>, much fewer steps</td>
+          <td>App. A.3</td>
+        </tr>
+        <tr>
+          <td class="cat">RFNN theory</td>
+          <td>$\tau_\mathrm{mem}$ from spectrum</td>
+          <td class="win"><strong>$\tau_\mathrm{mem} = \psi_p / (\Delta_t \lambda_\min) \sim \psi_n / \Delta_t$</strong></td>
+          <td>Thm. 3.2</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Memorization fraction $f_\mathrm{mem}$ defined by the nearest-neighbor ratio with $k = 1/3$, as in Yoon et al. and Gu et al. FID computed against 10K held-out test samples with 10K generated samples, averaged over 5 disjoint test splits.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/celeba_samples.png" alt="Three blocks of CelebA images. Left: training samples. Middle: samples generated at τ=100K with their nearest training neighbors — visibly different. Right: samples generated at τ=1.62M with their nearest neighbors — visibly identical."/>
+      <figcaption>Figure 2 (right) of the paper. Generated samples from a model trained on $n = 1024$ CelebA faces with $W = 32$. <em>Middle block:</em> at $\tau = 100$K (inside the generalization window), each generated face is recognizably different from its nearest training neighbor. <em>Right block:</em> at $\tau = 1.62$M (past $\tau_\mathrm{mem}$), the generated faces are near-pixel-perfect copies of their nearest training neighbor. Same architecture, same data, same loss — only $\tau$ has changed.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottom-line">
+    <h2>10. What it means</h2>
+
+    <p>This paper shifts the story about why diffusion models work. The dominant narrative used to be a mixture of <em>architectural inductive bias</em> (U-Nets favor smooth functions), <em>capacity limits</em> (you can't memorize what you can't represent), and <em>noise from SGD</em> (finite learning rate adds regularization). All of these are real and all of them matter, but they are not enough by themselves to explain why a 16M-parameter U-Net trained on 1,024 images for two million steps doesn't memorize. None of them produce a linear-in-$n$ scaling.</p>
+
+    <p>What Bonnaire and coauthors add is a fourth force, and arguably the dominant one: the optimization landscape of score matching has a wide plateau corresponding to the population score, and the descent into the empirical-score minimum is slow enough that you never reach it in practice when $n$ is moderately large. Early stopping in the right window — a window that opens linearly with dataset size — gives you a generalizing model essentially for free.</p>
+
+    <h3>What this means for practitioners</h3>
+
+    <ul>
+      <li><strong>Early stopping is not optional.</strong> For small-to-moderate datasets, training to convergence on score matching is the worst thing you can do. There is a sweet spot, and the further past it you go, the more memorization you accumulate.</li>
+      <li><strong>The sweet spot is wider than you think.</strong> $\tau_\mathrm{gen}$ and $\tau_\mathrm{mem}$ are easy to detect: $\tau_\mathrm{gen}$ from FID plateau, $\tau_\mathrm{mem}$ from nearest-neighbor ratio. The gap between them is roughly $n / n_0$ where $n_0$ is the dataset size at which they coincide.</li>
+      <li><strong>Adam buys you speed, not safety.</strong> The two-phase structure is the same; only the absolute timescales shrink. The scaling $\tau_\mathrm{mem} \propto n$ is invariant.</li>
+      <li><strong>Larger models help too, but symmetrically.</strong> Both $\tau_\mathrm{gen}$ and $\tau_\mathrm{mem}$ scale as $1/W$, so larger U-Nets reach the safe window faster but also fall through it faster. The shape is preserved.</li>
+    </ul>
+
+    <h3>Open problems</h3>
+
+    <ul>
+      <li><strong>How do absolute timescales depend on the conditioning variable?</strong> The paper shows the scaling holds with classifier-free guidance, but it would be valuable to know whether different conditioning classes can enter generalization or memorization at different times.</li>
+      <li><strong>Where does the picture break for very high-dimensional natural data?</strong> All experiments cap at $32 \times 32$ grayscale; the scaling laws should extend, but the constants almost certainly don't.</li>
+      <li><strong>What's the analogous picture for flow matching?</strong> The mechanism — slow descent toward a sharp empirical minimum — should generalize to any score-based or flow-matching generator. Confirming this would unify a lot of generative-model regularization theory.</li>
+      <li><strong>Can you predict $\tau_\mathrm{gen}$ and $\tau_\mathrm{mem}$ ahead of time?</strong> If the random-features prediction $\tau_\mathrm{mem} \sim n / (d \Delta_t)$ holds for U-Nets up to a constant, you could compute the safe stopping window before running training.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+
+    <p>Diffusion models don't memorize because they don't have time to. The empirical-score minimum is at the bottom of a deep narrow valley; gradient descent spends most of training on a wide shallow plateau corresponding to the population score, and that plateau gets wider — linearly — as you add data. Implicit dynamical regularization is now the simplest plausible explanation for why your DDPM produces novel faces instead of perfect reproductions of its training set. The training loss says "memorize." The training <em>dynamics</em> says "generalize." The dynamics wins, by a margin that scales with $n$.</p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2505.17638" target="_blank" rel="noopener">arXiv:2505.17638</a>
+      &nbsp;·&nbsp; Code: <a href="https://github.com/tbonnair/Why-Diffusion-Models-Don-t-Memorize" target="_blank" rel="noopener">tbonnair/Why-Diffusion-Models-Don-t-Memorize</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

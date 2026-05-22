@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Titans: Learning to Memorize at Test Time — an interactive explainer</title>
+  <meta name="description" content="An interactive explainer of Behrouz, Zhong &amp; Mirrokni's Titans paper: a neural long-term memory that learns by running gradient descent on its own weights at inference time. Scales to 2M+ tokens, beats GPT-4 on BABILong."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Titans: Learning to Memorize at Test Time</h1>
+    <p class="byline">
+      Behrouz, Zhong, Mirrokni &middot; Google Research &middot; December 2024 &middot;
+      <a href="https://arxiv.org/abs/2501.00663" target="_blank" rel="noopener">arXiv 2501.00663</a>
+    </p>
+    <p class="lede">
+      Transformers attend; recurrent models compress. Titans propose a third way: a long-term memory that
+      is itself a neural network, whose weights get updated by gradient descent <em>at inference time</em>.
+      Every token you read leaves a trace. Surprising tokens leave bigger traces. The memory has momentum,
+      so a single shock keeps writing for a while; it has weight decay, so old facts can be released. The
+      whole thing parallelises into matmuls, scales to <strong>2M+ token contexts</strong>, and lets a
+      760M-parameter model beat GPT-4 on the BABILong long-context reasoning benchmark.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">A third memory paradigm</a></li>
+      <li><a href="#memory-view">Attention vs RNNs: a memory-systems view</a></li>
+      <li><a href="#neural-memory">Memory as a neural network</a></li>
+      <li><a href="#surprise">Surprise, momentum, and forgetting</a></li>
+      <li><a href="#parallel">Parallelising gradient descent into matmuls</a></li>
+      <li><a href="#architectures">Three Titans: MAC, MAG, MAL</a></li>
+      <li><a href="#persistent">Persistent memory</a></li>
+      <li><a href="#results">Results on long context</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/loop-arch.png" alt="Titans MAC architecture overview"/>
+      <figcaption>
+        Figure 1 (paper). Memory as a Context. The architecture has three branches: a <em>core</em> module
+        (sliding-window attention), a <em>long-term memory</em> module $\mathcal{M}$ (a small MLP whose
+        weights are updated at test time), and a <em>persistent memory</em> of learnable but
+        data-independent task knowledge.
+      </figcaption>
+    </figure>
+
+    <p>
+      For the last seven years, sequence modelling has been a fight between two memory systems. On one
+      side, attention: keep every token around, re-read them all every time you predict the next one. On
+      the other side, recurrence: squash all of history into a single fixed-size vector or matrix that the
+      network updates step by step. Attention is precise but quadratic. Recurrence is linear but lossy.
+      Mamba, RWKV, Gated DeltaNet, and TTT have spent two years iterating on the recurrence side without
+      catching the Transformer at scale.
+    </p>
+    <p>
+      Titans, from Google Research, propose something stranger. Instead of compressing history into a
+      vector, they compress it into the <em>weights</em> of a small neural network that lives inside the
+      larger model. As the larger model reads a long sequence at inference time, the inner network
+      <strong>literally trains on the (key, value) pairs it sees</strong>. Each token generates a gradient
+      step. After a few thousand tokens, the inner network's weights encode the sequence's content. When
+      you want to retrieve something, you do a forward pass on the inner network with a query. There is no
+      KV cache, no fixed-size hidden state in the usual sense — just a small model whose parameters carry
+      the past.
+    </p>
+    <p>
+      The result is the first architecture that combines attention's accuracy on the recent context with a
+      truly persistent long-term store, in a way that runs in linear time and parallelises to matmuls.
+      Titans scale past 2M tokens and outperform much larger Transformers on long-context reasoning. A
+      760M-parameter Titan fine-tuned on BABILong beats GPT-4, Llama3.1-70B with RAG, and Qwen2.5-72B.
+      They get there by treating "training" and "inference" as the same thing.
+    </p>
+    <p>
+      The whole thing is also conceptually clean. Once you accept that the memory module is a neural
+      network being trained on the fly, every other choice in the paper — momentum, weight decay,
+      parallelisation tricks, where to put the memory in the bigger architecture — falls out of standard
+      deep-learning intuitions. That's what this explainer walks through.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="memory-view">
+    <h2>1. Attention vs RNNs: a memory-systems view</h2>
+
+    <p>
+      To see what Titans add, it helps to put existing architectures into a common frame. The paper's
+      framing is that <em>every</em> sequence model has a memory state, an update rule, and a retrieval
+      rule. The differences are about what each of those three things looks like.
+    </p>
+
+    <p>
+      <strong>Transformers</strong> have growing memory and no compression. The "memory state" at position
+      $t$ is just the list of all past keys and values $\{(k_i, v_i)\}_{i \le t}$. The update rule is
+      append. The retrieval rule is softmax attention. This is precise — every past token can be looked
+      up individually — but the memory grows linearly with sequence length and retrieval is quadratic in
+      it.
+    </p>
+
+    <p>
+      <strong>Linear Transformers and linear RNNs</strong> (Mamba2, GLA, RetNet, Gated DeltaNet) have
+      fixed memory and compress aggressively. The memory state is a single matrix $W \in \mathbb{R}^{d
+      \times d}$. The update rule writes the next key-value pair into $W$ with some kernel. The retrieval
+      rule is a single matrix-vector product, $y = W q$. This is cheap — constant memory, linear time —
+      but information collides. Past tokens overwrite each other in $W$, and there is no way to "look up"
+      a specific old token if its address has been clobbered.
+    </p>
+
+    <p>
+      <strong>Titans</strong> sit in between. The memory is neither a list of vectors nor a single matrix.
+      It is a small MLP $\mathcal{M}$ with two or more layers and learnable weights. The update rule is
+      <em>one step of stochastic gradient descent</em> on a memorisation loss. The retrieval rule is one
+      forward pass through $\mathcal{M}$. This buys two things that linear RNNs don't have: (a) the
+      memory's expressive capacity is set by network depth, not by the dimension of a vector; (b) the
+      memory is a non-linear function of its inputs, so collisions are not literal additive overwrites.
+    </p>
+
+    <aside class="callout">
+      <strong>Sidebar.</strong> This is closely related to <em>test-time training</em> (TTT, Sun et al.
+      2024) and to associative memory networks (Hopfield, modern Hopfield). Titans' specific contributions
+      on top of TTT are momentum, weight decay, deeper memory ($L_\mathcal{M} \ge 2$), and the
+      architectural variants that mix the long-term memory with attention.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="neural-memory">
+    <h2>2. Memory as a neural network</h2>
+
+    <p>
+      Here is the core move. The long-term memory module $\mathcal{M}$ is a small MLP. Its weights
+      $\theta_\mathcal{M}$ are not frozen at the end of pre-training; they keep updating as the larger
+      model reads input at test time.
+    </p>
+
+    <p>
+      To make this concrete, define an <strong>associative-memory loss</strong>. For an incoming token
+      $x_t$, project it through learnable matrices $W_K, W_V$ to get a key $k_t = x_t W_K$ and a value
+      $v_t = x_t W_V$, just like attention does. Now define the memory's loss at time $t$ as:
+    </p>
+
+    <p class="eq">$$ \ell(\mathcal{M}_{t-1}; x_t) \;=\; \big\| \mathcal{M}_{t-1}(k_t) - v_t \big\|_2^2. $$</p>
+
+    <p>
+      Read this as: "if the memory $\mathcal{M}_{t-1}$ already knew this token, calling it with the key
+      $k_t$ would produce the value $v_t$." A high loss means the memory <em>doesn't</em> know about this
+      key. So a high gradient $\nabla_\theta \ell$ tells the memory it should update its weights.
+    </p>
+
+    <p>
+      The simplest possible update rule, then, is one gradient descent step:
+    </p>
+
+    <p class="eq">$$ \mathcal{M}_t \;=\; \mathcal{M}_{t-1} \;-\; \theta_t \cdot \underbrace{\nabla_\theta \ell(\mathcal{M}_{t-1}; x_t)}_{\text{surprise}}. $$</p>
+
+    <p>
+      The gradient acts as a "surprise" signal. If the memory predicts $v_t$ accurately, the gradient is
+      near zero and the weights barely move — there's nothing to learn. If the memory is wrong, the
+      gradient is big, and the weights shift a lot in that direction. This is exactly the human memory
+      intuition the authors invoke: <em>events that violate your expectations are more memorable.</em>
+    </p>
+
+    <p>
+      The widget below shows this happening token by token. The grid represents $\mathcal{M}$'s weights.
+      Each incoming token has a surprise level you can pick. Surprising tokens stamp the memory harder.
+    </p>
+
+    <div class="widget-frame" id="surprise-widget">
+      <p class="widget-title">A streaming memory under gradient updates</p>
+      <p class="widget-sub">
+        Watch tokens arrive one at a time. Drag the surprise dial before each step to see how a big
+        gradient changes more of $\mathcal{M}$'s weights than a small one.
+      </p>
+    </div>
+
+    <h3>Two parameter sets, two learning rates</h3>
+
+    <p>
+      Take a careful look at the symbols introduced so far. The update rule for $\mathcal{M}$ uses
+      $W_K$, $W_V$ to build $k_t$ and $v_t$, and starts from some initial weights $\mathcal{M}_0$. None
+      of those things appear in the loss as something to be optimised by the inner step — only
+      $\mathcal{M}$'s parameters $\theta_\mathcal{M}$ do. That's deliberate. Titans has <strong>two
+      parameter sets that learn on different timescales</strong>:
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Set</th><th>What's in it</th><th>When it updates</th><th>How</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Slow / outer</strong></td>
+          <td>$W_K$, $W_V$, $W_Q$, the projections, the attention block, $\mathcal{M}$'s <em>initialisation</em> $\theta_\mathcal{M}^{(0)}$, momentum and forgetting gates, persistent-memory tokens</td>
+          <td>Pre-training, regular SGD across batches</td>
+          <td>Standard backprop on the next-token prediction loss</td>
+        </tr>
+        <tr>
+          <td><strong>Fast / inner</strong></td>
+          <td>$\theta_\mathcal{M}$ — the memory MLP's weights</td>
+          <td>Every token, including at test time</td>
+          <td>One gradient step on $\ell(\mathcal{M}_{t-1}; x_t)$</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      At the start of every sequence, the fast set is <em>reset</em> back to the slow set's learned
+      $\theta_\mathcal{M}^{(0)}$. Then the inner-loop SGD runs token by token, writing memories into the
+      MLP as the sequence streams in. At the end of the sequence the fast set is thrown away.
+    </p>
+
+    <p>
+      This split is the source of all confusion about the setup, so it's worth being concrete. During
+      pre-training of the whole model:
+    </p>
+
+    <ol>
+      <li>Pick a training sequence of $T$ tokens.</li>
+      <li>Initialise $\theta_\mathcal{M} \leftarrow \theta_\mathcal{M}^{(0)}$ (the current slow init).</li>
+      <li>For $t = 1, \dots, T$: form $k_t, v_t$ using the current $W_K, W_V$; run one inner-loop
+        gradient step on $\ell(\mathcal{M}_{t-1}; x_t)$ to obtain $\theta_\mathcal{M}^{(t)}$; let the
+        rest of the model consume $\mathcal{M}_t$'s outputs to predict $x_{t+1}$.</li>
+      <li>Accumulate the next-token loss across all $T$ predictions. This is the <strong>outer
+        loss</strong>.</li>
+      <li>Backpropagate the outer loss <em>through the entire unrolled inner loop</em> into the slow
+        parameters: $W_K, W_V, W_Q$, the attention block, and $\theta_\mathcal{M}^{(0)}$.</li>
+      <li>Take one outer SGD step on the slow parameters.</li>
+    </ol>
+
+    <p>
+      Step 5 is the heart of the matter. The outer gradient flows through every inner update — what
+      computer-science people call <em>differentiating through the optimiser</em>. The slow parameters
+      receive a learning signal that says: "your job is to be such that, when this inner loop runs at
+      test time, the memory it produces is useful for prediction." This is exactly meta-learning, in the
+      precise sense of MAML and learned optimisers: an outer loop that adjusts <em>how the inner loop
+      learns</em>.
+    </p>
+
+    <h3>Why this isn't a plug-in for existing LLMs</h3>
+
+    <p>
+      An obvious question: could you take a pre-trained transformer, freeze it, and bolt the memory
+      module on the side? No. Without the meta-training step, $W_K$, $W_V$ and $\theta_\mathcal{M}^{(0)}$
+      have never been taught what's useful to write into the memory. A randomly-initialised key projection
+      paired with a randomly-initialised MLP, run for one gradient step per token, produces noise. The
+      rest of the network has no reason to consume that noise, and gets no signal to learn how to use it.
+    </p>
+
+    <p>
+      Two realistic deployment options are available:
+    </p>
+
+    <ul>
+      <li><strong>Train from scratch</strong> as one of the Titans variants (MAC / MAG / MAL — covered
+        below). The paper does this.</li>
+      <li><strong>Warm-start the attention block</strong> from a pre-trained transformer's weights, then
+        run a substantial continued-pre-training phase where the memory module learns to cooperate with
+        the rest of the model. Subsequent papers in the meta-learned-memory family take this route.</li>
+    </ul>
+
+    <p>
+      The architectural footprint <em>at inference</em> is small — one extra MLP per layer, plus the
+      inner-loop optimiser state. But the training cost is real, because pre-training has to unroll the
+      inner loop to differentiate through it. Unrolling a 4K-token sequence means 4K inner-update steps
+      per outer backprop pass.
+    </p>
+
+    <h3>Why the trivial solution doesn't win</h3>
+
+    <p>
+      Here is a worry that should have occurred to you. The inner loss $\ell(\mathcal{M}; x_t) = \|
+      \mathcal{M}(k_t) - v_t \|^2$ has a trivial zero. Set $W_V = 0$, set $\mathcal{M} \equiv 0$, and the
+      loss is zero forever. Why doesn't the system collapse to this?
+    </p>
+
+    <p>
+      Because the inner loss is not the training objective. The outer loss is — and the outer loss is
+      the next-token prediction loss for the whole language model, which only sees $\mathcal{M}$ through
+      its <em>outputs</em>. If $\mathcal{M} \equiv 0$, the memory contributes nothing useful to
+      predictions, the outer next-token loss is bad, and the meta-gradient pushes $W_K$, $W_V$, and
+      $\theta_\mathcal{M}^{(0)}$ <em>away</em> from the trivial fixed point. The inner loss is just a
+      mechanism for updating $\theta_\mathcal{M}$; it has no preferred minimum the outer loop cares
+      about, except inasmuch as the resulting $\mathcal{M}$ is good for next-token prediction.
+    </p>
+
+    <p>
+      In other words: the outer loop is pickier than the inner loop. The inner loop will happily settle
+      for any $\theta_\mathcal{M}$ that fits the current $(k_t, v_t)$ pair. The outer loop demands that
+      the $\theta_\mathcal{M}$ produced by running the inner loop be informative downstream. Those two
+      pressures together rule out the degenerate solution.
+    </p>
+
+    <p>
+      Where does the memory function — i.e. the ability to retrieve $x_t$ later from a related query —
+      come from? From the fact that $W_K$ and $W_V$ are <em>frozen</em> at test time. They define a fixed
+      addressing scheme. When the model writes "value of token $x_t$ at key $x_t W_K$" and then later
+      sees a similar token $x_{t'}$, the query $x_{t'} W_K \approx x_t W_K$, so calling
+      $\mathcal{M}(x_{t'} W_K)$ returns something close to $v_t = x_t W_V$. The meta-trained $W_K$, $W_V$
+      are responsible for making "similar" mean something useful — that is, for putting the right tokens
+      near each other in key space. The MLP $\mathcal{M}$ is just a lookup table built on top of that
+      scheme, fast-updated as new associations stream in.
+    </p>
+
+    <aside class="callout">
+      <strong>The same pattern shows up elsewhere.</strong> Meta-learning the slow parameters so that a
+      fast inner loop produces something useful is the recipe behind MAML (few-shot learning), DeepMind's
+      learned optimisers, and the Test-Time Training family. Titans applies it to long-context language
+      modelling. The novelty isn't the meta-learning machinery — it's the choice of inner loss
+      (associative memory) and the architectural integration with attention.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="surprise">
+    <h2>3. Surprise, momentum, and forgetting</h2>
+
+    <p>
+      The naive single-gradient-step rule has two failure modes. First, after a really surprising token,
+      the memory has moved to a place where the gradient is small — and now <em>subsequent</em>
+      surprising-but-related tokens look uninteresting and get under-written. The memory has "exhausted
+      its reaction" too quickly. Second, when the topic of the sequence shifts (say, the document moves
+      from chapter 1 to chapter 2), old memorised facts can no longer be useful, and continuing to write
+      them just wastes capacity.
+    </p>
+
+    <p>
+      Both problems have known fixes from optimisation. The first is fixed by <strong>momentum</strong>:
+      keep a running average $S_t$ of recent gradients, and update the memory using that instead of the
+      instantaneous gradient. A single surprise then keeps writing for several steps. The second is fixed
+      by <strong>weight decay</strong>: at each step, shrink $\mathcal{M}_{t-1}$ toward zero before adding
+      the new surprise term, so old memorised content can be released.
+    </p>
+
+    <p>
+      Put both together and the update rule becomes:
+    </p>
+
+    <p class="eq">$$ \mathcal{M}_t \;=\; (1 - \alpha_t)\,\mathcal{M}_{t-1} \;+\; S_t, $$</p>
+    <p class="eq">$$ S_t \;=\; \eta_t\,S_{t-1} \;-\; \theta_t\,\nabla_\theta \ell(\mathcal{M}_{t-1}; x_t). $$</p>
+
+    <p>
+      Three data-dependent gates control everything:
+    </p>
+
+    <ul>
+      <li><strong>$\theta_t$</strong> is the learning rate — how strongly the current surprise is mixed in.</li>
+      <li><strong>$\eta_t$</strong> is the momentum coefficient — how much of past surprise persists. Setting
+        $\eta_t \to 0$ lets the memory "forget the last surprise" (e.g., at topic boundaries). Setting
+        $\eta_t \to 1$ lets it ride.</li>
+      <li><strong>$\alpha_t$</strong> is the forget gate. With $\alpha_t \to 0$, the past memory is
+        preserved verbatim. With $\alpha_t \to 1$, the memory is wiped before the new step is applied.</li>
+    </ul>
+
+    <p>
+      All three are produced from the current token by learnable projections, so they adapt in context.
+      You can think of them as a tiny controller that decides, for each token, "how surprising is this
+      really, does it ride the prior surprise, and should I clear room first?"
+    </p>
+
+    <div class="widget-frame" id="update-rule-widget">
+      <p class="widget-title">Build the Titans update rule</p>
+      <p class="widget-sub">
+        Click through to add momentum and weight decay to vanilla SGD. Each step shows what the rule looks
+        like and what behaviour it enables.
+      </p>
+    </div>
+
+    <p>
+      The authors point out that this exact rule is mathematically equivalent to the gating mechanisms in
+      modern recurrent models. Mamba2, Gated DeltaNet, and friends can all be re-derived as special cases
+      where the "memory" is a vector or matrix and the "loss" is a particular quadratic. Titans
+      generalises the picture: when the memory is allowed to be a deeper non-linear network, the same
+      gradient-descent recipe gives you something strictly more expressive.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="parallel">
+    <h2>4. Parallelising gradient descent into matmuls</h2>
+
+    <p>
+      So far the memory updates itself <strong>one token at a time</strong>: read a token, take a gradient
+      step, read the next token, take another step. That is a fine description of <em>what</em> should
+      happen. It is a terrible description of <em>how to run it</em> on a modern chip. This section is the
+      engineering trick that bridges the gap — and it is the part of the paper most worth slowing down for.
+    </p>
+
+    <h3>Why one step per token is painfully slow</h3>
+
+    <p>
+      Look at the update rule once more. $\mathcal{M}_t$ is built out of $\mathcal{M}_{t-1}$, which was
+      built out of $\mathcal{M}_{t-2}$, and so on all the way back to the start. Every memory state needs
+      the one right before it to exist first. It is a row of dominoes: domino number 5,000 cannot fall
+      until domino 4,999 has already fallen.
+    </p>
+
+    <p>
+      A GPU is the wrong shape for dominoes. These chips carry tens of thousands of little arithmetic
+      units, and they are happiest when you hand them <em>one giant multiplication of two big grids of
+      numbers</em> — a <strong>matrix multiply</strong>, or "matmul" for short — which they can spread
+      across all those units in the same instant. Hand them instead a chain of 100,000 tiny steps, each
+      one forced to wait for the previous, and almost the entire chip sits idle. Trained this way, a Titan
+      would crawl along at the speed of an old recurrent network — exactly the slowness it was built to
+      escape.
+    </p>
+
+    <p>
+      So this section is really a translation problem. The computation has to stay the same. The
+      <em>form</em> it is written in has to change: from a long chain of tiny steps into a short stack of
+      big matmuls.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/parallelization.png" alt="Parallelization of inner-loop gradient descent"/>
+      <figcaption>
+        Figure 2 (paper). The inner-loop gradient descent is reformulated so that, within a chunk of size
+        $b$, each step's update is a function of the chunk's input matrix $X$ and a few small accumulators
+        ($\Theta_b, \mathbf{B}_b$). The result is dominated by matmuls, which run efficiently on GPUs/TPUs.
+      </figcaption>
+    </figure>
+
+    <h3>The fix: work in chunks, and tell one small white lie</h3>
+
+    <p>
+      Start by cutting the sequence into <strong>chunks</strong> of a fixed size $b$ — picture 100 tokens
+      per chunk. We will still walk through the chunks in order, but a sequence of $N$ tokens is now only
+      $N/b$ chunks. If we can make all the work <em>inside</em> a chunk happen at once, we have shortened
+      the domino chain from $N$ steps to just $N/b$ steps.
+    </p>
+
+    <p>
+      The obstacle has not vanished, though. Inside a chunk, token 2's gradient is still <em>supposed</em>
+      to be measured against the memory <em>after</em> token 1 has updated it. Drawing boxes around groups
+      of dominoes does not stop them from falling in order.
+    </p>
+
+    <p>
+      Here is the white lie that breaks the deadlock. <strong>Within a single chunk, pretend the memory
+      does not change at all.</strong> Every token in the chunk measures its gradient against the very
+      same snapshot of the memory — the snapshot taken at the <em>start</em> of the chunk, which we will
+      call $W_0$. The memory is genuinely updated only once per chunk, at the boundary, using all $b$
+      gradients together.
+    </p>
+
+    <p>
+      Why are we allowed to lie like that? Because over a short span — 100 tokens, not 100,000 — the
+      memory drifts only a little, so the start-of-chunk snapshot is a good-enough stand-in for every
+      token in the chunk. In optimisation language, we have swapped <em>fully online</em> updates
+      (re-measure after every single token) for <em>mini-batch</em> updates (measure a batch of $b$
+      against one fixed point, then take a single combined step). It is exactly how a teacher grades a
+      stack of 100 exams: strictly speaking they learn something from exam 1, but they mark all 100
+      against the same answer key and revise the key once, at the end — not after every paper. This
+      chunk-and-freeze idea is borrowed from the Test-Time Training line of work; Titans' own additions
+      are the momentum, forgetting, and data-dependent dials layered on top of it.
+    </p>
+
+    <p>
+      And this small lie buys everything. The moment all $b$ tokens are measured against the <em>same</em>
+      fixed $W_0$, their gradients <strong>stop depending on one another</strong>. Nothing inside the
+      chunk has to wait for anything else inside the chunk. They can all be computed together — which is
+      precisely the door into matmul land.
+    </p>
+
+    <h3>Step one: the gradients become a single multiply</h3>
+
+    <p>
+      Take the simplest possible memory first — a plain matrix $\mathcal{M} = W$. One token's gradient
+      turns out to be an <strong>outer product</strong>: take how wrong the memory was on that token, and
+      multiply it against the token's key. Written out:
+    </p>
+
+    <p class="eq">$$ \nabla \ell(W_0; x_t) \;=\; (W_0\,k_t - v_t)\;k_t^\top. $$</p>
+
+    <p>
+      The piece $W_0 k_t - v_t$ is just "what the memory guessed, minus what it should have guessed" — the
+      <em>miss</em>, or residual.
+    </p>
+
+    <p>
+      Now do all $b$ tokens of the chunk at once. <strong>Stack them side by side</strong> into one grid:
+      a matrix $X$ whose columns are the chunk's tokens (the keys and values are formed from it). Watch
+      the loop dissolve:
+    </p>
+
+    <ul>
+      <li>$W_0 X$ — one matmul — produces the memory's guess for <em>every</em> token in the chunk at once.</li>
+      <li>$W_0 X - X$ — one subtraction — is <em>every</em> miss at once.</li>
+      <li>$(W_0 X - X)\,X^\top$ — one more matmul — adds up all $b$ outer-product gradients into a single
+        correction for the memory.</li>
+    </ul>
+
+    <p>
+      What had been a 100-step loop is now two matmuls and a subtraction. The chip is busy.
+    </p>
+
+    <h3>Step two: the per-token dials become a diagonal</h3>
+
+    <p>
+      One detail is still missing. In the previous section, every token carried its own dials: a learning
+      rate $\theta_t$, and — through the forget gate $\alpha_t$ — its own decay. A token's gradient should
+      not be added in raw; it should be weighted by those dials. So we cannot simply sum the gradients
+      evenly.
+    </p>
+
+    <p>
+      The forgetting also compounds. Write $\beta_i = (1-\alpha_1)(1-\alpha_2)\cdots(1-\alpha_i)$ — the
+      fraction of an early gradient that is <em>still alive</em> after the chunk has applied its forget
+      gate over and over. A token near the start of the chunk has been decayed many times; a token near
+      the end, barely at all. The ratio $\beta_b / \beta_i$ is exactly how much token $i$'s contribution
+      should be shrunk by the time we reach the end of the chunk.
+    </p>
+
+    <p>
+      Here is the trick: a list of per-token numbers can be carried as a <strong>diagonal matrix</strong>
+      — the numbers laid along the diagonal, zeros everywhere else. Multiplying by such a matrix simply
+      rescales each token's slice, one number per token. Collect the learning rates into a diagonal
+      matrix $\Theta_b$ and the decay ratios into a diagonal matrix $\mathbf{B}_b$, and the entire
+      weighted sum of gradients for the chunk becomes:
+    </p>
+
+    <p class="eq">$$ \sum_{i=1}^{b} \theta_i \,\frac{\beta_b}{\beta_i}\, \nabla \ell(W_0; x_i) \;=\; \Theta_b\,\mathbf{B}_b\,(W_0 X - X)\,X^\top. $$</p>
+
+    <p>
+      Every symbol on the right is either a matmul or a cheap diagonal rescale. The per-token learning
+      rate and the per-token forgetting — both fully data-dependent — have been folded in without
+      bringing back a single loop.
+    </p>
+
+    <h3>Step three: the last chain — momentum — gets a pairing trick</h3>
+
+    <p>
+      One genuine chain survives. Momentum is a running total: $S_t = \eta_t\,S_{t-1} - \theta_t\,u_t$,
+      where $u_t$ is the gradient we just learned to compute in parallel. Each $S_t$ still folds in the
+      $S_{t-1}$ before it — the domino problem all over again.
+    </p>
+
+    <p>
+      But this particular chain has a friendly shape: every step just multiplies the running total by a
+      number and adds a new number. And there is a classic move for exactly that. To add up a list of 100
+      numbers you do <em>not</em> have to go strictly left to right. Add them in pairs (50 sums at once),
+      then add those results in pairs (25 at once), and so on — the whole total is done in about 7 rounds
+      instead of 100. This pairing move is called a <strong>parallel scan</strong>, and it works for any
+      running total of the "multiply, then add" form — including momentum. So the last chain collapses
+      too: not into a single matmul, but into roughly $\log b$ quick rounds instead of $b$ slow ones.
+    </p>
+
+    <h3>The whole recipe — and the one knob you turn</h3>
+
+    <p>
+      Putting the three steps together, here is what happens for each chunk, in order:
+    </p>
+
+    <ol>
+      <li>Stack the chunk's $b$ tokens side by side into the grid $X$.</li>
+      <li>Compute all $b$ gradients in two matmuls, measured against the frozen snapshot $W_0$ (Step one).</li>
+      <li>Rescale them with the diagonal dials $\Theta_b$ and $\mathbf{B}_b$ (Step two).</li>
+      <li>Run the parallel scan to fold in momentum (Step three).</li>
+      <li>Apply the one combined update — plus the $(1-\alpha_t)$ weight decay — to get the memory at the
+        end of the chunk.</li>
+      <li>Hand that memory to the next chunk as <em>its</em> frozen snapshot $W_0$, and repeat.</li>
+    </ol>
+
+    <p>
+      The chunk size $b$ is a knob you get to set, and it trades off two things:
+    </p>
+
+    <ul>
+      <li><strong>Small $b$ (down to $b = 1$)</strong> — the frozen snapshot is refreshed constantly, so
+        the white lie is barely a lie at all and the maths is almost exact. But there is little to do in
+        parallel, so it is slow.</li>
+      <li><strong>Large $b$</strong> — lots of work batched into each matmul, so it is fast; but every
+        token in the chunk leans on an increasingly stale snapshot, so the approximation gets cruder.</li>
+      <li><strong>In between</strong> — the practical choice: $b$ big enough to keep the chip fed, small
+        enough that the memory has not drifted much within a chunk.</li>
+    </ul>
+
+    <h3>Why this makes Titans fast</h3>
+
+    <p>
+      The trick does not abolish sequential work — it <em>quarantines</em> it into two cheap places and
+      hands everything else to the matmul units:
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Part of the computation</th><th>How sequential is it?</th><th>What it runs as</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Chunk after chunk</td>
+          <td>$N/b$ steps, in order</td>
+          <td>one matmul-heavy block each</td>
+        </tr>
+        <tr>
+          <td>Momentum, inside a chunk</td>
+          <td>about $\log b$ rounds</td>
+          <td>parallel scan</td>
+        </tr>
+        <tr>
+          <td>Gradients and rescaling</td>
+          <td>not sequential at all</td>
+          <td>plain matmuls</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      A naive run is $N$ tiny steps in a row. After the rewrite it is $N/b$ chunky steps in a row — with
+      $b$ in the hundreds, that is a hundred-fold cut in the length of the chain, and each remaining step
+      is the dense-multiply work the hardware was built for. Add it all up and the total cost grows
+      <strong>linearly</strong> with sequence length, $\mathcal{O}(N)$ — which is what lets a Titan
+      stretch to 2M+ token contexts without the cost exploding.
+    </p>
+
+    <p>
+      Two honest footnotes. First, everything above used the simplest memory, a single matrix $W$. For a
+      <em>deep</em> memory — the MLP that gives Titans its edge — the very same chunk-and-freeze recipe
+      applies, just with a few more matmuls per chunk (one set per layer of the MLP). More work per
+      token, same linear scaling. Second, that extra work is real: in wall-clock throughput Titans lands
+      close to Mamba2 and Gated DeltaNet, a touch slower, because a non-linear memory genuinely computes
+      more per token than their linear ones. The headline holds anyway — "trained at inference time"
+      sounds expensive, but it runs in the same complexity class as the fastest linear-time models.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="architectures">
+    <h2>5. Three Titans: MAC, MAG, MAL</h2>
+
+    <p>
+      Now that we have a neural memory module, the next question is how to wire it into a bigger
+      architecture. Titans gives three answers. They share three branches — <em>core</em> (attention),
+      <em>long-term memory</em> ($\mathcal{M}$), and <em>persistent memory</em> (learnable prefix tokens)
+      — but they connect them differently.
+    </p>
+
+    <div class="widget-frame" id="variants-widget">
+      <p class="widget-title">Three Titans, side by side</p>
+      <p class="widget-sub">
+        Switch between MAC, MAG, and MAL. The diagram shows the data flow; the attention mask shows what
+        each variant lets each token "see."
+      </p>
+    </div>
+
+    <p>
+      <strong>MAC — Memory as Context.</strong> The sequence is chunked. For each chunk, the memory
+      $\mathcal{M}_{t-1}$ is queried with the chunk to retrieve a context vector $h_t$ summarising
+      relevant past content. Then $h_t$ is concatenated with the chunk's tokens and the persistent memory
+      tokens, and the whole thing is passed through full attention within that chunk. Finally, the chunk's
+      output is used to update $\mathcal{M}$.
+    </p>
+
+    <p>
+      MAC is the strongest variant in the paper's experiments. Attention has a chance to inspect both the
+      current chunk and the retrieved long-term context, so it can decide whether to lean on memory at all.
+      And $\mathcal{M}$ only gets updated with attention-filtered information, so it doesn't have to
+      memorise every junk token.
+    </p>
+
+    <p>
+      <strong>MAG — Memory as Gate.</strong> The sequence runs through two parallel branches: a sliding-
+      window attention (precise but local) and the long-term memory $\mathcal{M}$ applied to the whole
+      sequence (lossy but global). The two outputs are combined by a learnable gating function. No
+      chunking; both branches see the same input.
+    </p>
+
+    <p>
+      <strong>MAL — Memory as Layer.</strong> The most conventional. Stack the long-term memory as a
+      layer below the attention. The memory layer compresses past context; attention runs on top of that.
+      This is the style of most hybrid recurrent+attention models in the literature (Mamba/Samba/Gated
+      DeltaNet-H2). The paper finds it works <em>less well</em> than MAC and MAG, because the memory's
+      output is a fixed compression that attention can no longer un-do.
+    </p>
+
+    <figure class="paper-figure three-up">
+      <img src="assets/figures/mac.png" alt="MAC attention mask"/>
+      <img src="assets/figures/mag.png" alt="MAG attention mask"/>
+      <img src="assets/figures/mal.png" alt="MAL attention mask"/>
+      <figcaption>
+        Attention masks for the three Titans variants. Left: MAC has chunked full attention with prepended
+        persistent + retrieved long-term tokens. Middle: MAG has a sliding-window mask plus persistent
+        memory prefix; the long-term branch is parallel. Right: MAL has sliding-window attention applied
+        on top of the memory's output.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="persistent">
+    <h2>6. Persistent memory</h2>
+
+    <p>
+      All three Titans variants prepend a fixed-length sequence of learnable parameters $p_1, \ldots,
+      p_{N_p}$ to every input. These weights are learned in the outer loop (regular SGD across batches)
+      and stay constant at inference time. They are <em>not</em> attention sinks; they are not just there
+      to stabilise softmax. They are the third memory system in the architecture, the one for
+      <em>task knowledge.</em>
+    </p>
+
+    <p>
+      The intuition comes from an old observation: the FFN layer that follows attention in a Transformer
+      is mathematically equivalent to attention with learnable key/value matrices and softmax replacing
+      ReLU. That is, the FFN is "attention over a stored, data-independent dictionary." Titans makes that
+      stored dictionary explicit, gives it a position at the front of the sequence, and lets the model
+      pull task-level instructions out of it at will.
+    </p>
+
+    <p>
+      Operationally, this is a small constant cost (32 to a few hundred extra tokens per sequence) and
+      removes the burden of task knowledge from $\mathcal{M}$, which can then focus on the actual content
+      of the sequence.
+    </p>
+
+    <aside class="callout">
+      <strong>The three memories.</strong> Putting it together: <em>persistent memory</em> stores
+      task-level know-how (learned offline); <em>long-term memory $\mathcal{M}$</em> stores sequence-level
+      content (learned online at test time); <em>attention</em> handles the recent context (no learning
+      between tokens). Three systems, three timescales, all in one architecture.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. Results on long context</h2>
+
+    <p>
+      The interesting numbers in this paper are not perplexity — Titans roughly tie or modestly beat the
+      best linear RNNs there — but long-context tasks where the memory advantage matters.
+    </p>
+
+    <h3>Needle in a haystack (S-NIAH, RULER)</h3>
+    <p>
+      Hide a single short fact in a long block of distractor text; ask the model to recall it. Titans hold
+      their accuracy as the haystack grows from 2K to 16K tokens, while Mamba2 and Gated DeltaNet drop
+      sharply.
+    </p>
+
+    <div class="widget-frame" id="niah-widget">
+      <p class="widget-title">Needle-in-a-haystack accuracy by sequence length</p>
+      <p class="widget-sub">
+        Toggle models. Watch the accuracy of fixed-state recurrent baselines crater past 8K while Titans
+        stay near ceiling.
+      </p>
+    </div>
+
+    <h3>BABILong: multi-fact reasoning across documents</h3>
+    <p>
+      Harder than NIAH. The model has to combine multiple facts scattered across a long document. The
+      few-shot result has a 760M Titan (MAC) beating GPT-4o-mini, Llama-3.1-8B, and RecurrentGemma-9B, and
+      pulling close to GPT-4. The fine-tuned result has a small Titan beating Llama-3.1-8B + RAG by a
+      large margin — that is, the Titan's on-the-fly memory outperforms a much larger Transformer that
+      gets to retrieve relevant chunks via a vector database.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/babilong-fewshot.png" alt="BABILong few-shot results"/>
+      <img src="assets/figures/babilong-ft.png" alt="BABILong fine-tuned results"/>
+      <figcaption>
+        BABILong benchmark. Left: few-shot — Titans (MAC) outperform all baselines including GPT-4o-mini
+        and RecurrentGemma-9B with about 10× fewer parameters. Right: fine-tuned — a small Titan (MAC)
+        beats Llama-3.1-8B + RAG by ~30 absolute points.
+      </figcaption>
+    </figure>
+
+    <h3>Memory depth matters</h3>
+    <p>
+      The paper sweeps $L_\mathcal{M} \in \{1, 2, 3, 4\}$. A single-layer memory is exactly the linear
+      RNN case ($\mathcal{M} = W x$). Adding layers gives strictly more expressive memorisation, with
+      perplexity improving monotonically as depth goes up. Throughput drops linearly with depth, which
+      gives a clean tradeoff curve.
+    </p>
+
+    <div class="widget-frame" id="depth-widget">
+      <p class="widget-title">Memory depth: capacity vs throughput</p>
+      <p class="widget-sub">
+        Slide $L_\mathcal{M}$ from 1 to 4. Deeper memory always lowers perplexity; the price is roughly
+        linear in tokens per second.
+      </p>
+    </div>
+
+    <h3>Beyond language</h3>
+    <p>
+      Titans evaluate on time-series forecasting (ETT, ECL, Traffic, Weather), where the neural memory
+      module replacing Mamba in the Simba framework gives the best numbers across all four benchmarks; and
+      on DNA sequence modelling (GenomicsBenchmarks), where it's competitive with state-of-the-art
+      domain-specific architectures.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="manim">
+    <h2>8. Watching the memory learn</h2>
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/memory.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The whole paper in twenty seconds. The grid is $\mathcal{M}$, a small MLP. Tokens arrive one at a
+      time as $(k_t, v_t)$ pairs; each one produces a gradient step on $\mathcal{M}$'s weights. A big
+      gradient (a "surprising" token) changes more of the grid. After processing the sequence, a query
+      $q$ produces an output $y = \mathcal{M}^*(q)$ — the retrieved memory.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>9. Why this works</h2>
+
+    <h3>The memory's expressiveness is set by depth, not by dimension</h3>
+    <p>
+      In a linear RNN, the memory state is a vector or matrix, and its capacity is bounded by its
+      dimension. Cram too much in and tokens collide. Titans' memory is a multi-layer non-linear network;
+      its capacity scales with parameter count and depth, the way it does for any deep model. That's why
+      a deep memory ($L_\mathcal{M} = 4$) consistently outperforms a linear one in the paper's
+      experiments.
+    </p>
+
+    <h3>The associative-memory loss is a natural pre-training objective for memorisation</h3>
+    <p>
+      If you want a network to memorise key-value pairs, the most direct way is to train it on the
+      objective $\|\mathcal{M}(k) - v\|^2$. The clever part is that this same objective makes sense at
+      test time — the model is training itself to know things it has just seen. The objective ports
+      cleanly from pre-training to inference.
+    </p>
+
+    <h3>Momentum and weight decay are the right inductive biases</h3>
+    <p>
+      Gradient descent without momentum reacts to one token at a time. With momentum, a surprising event
+      can keep "writing" the memory for several tokens of relevant follow-up. Weight decay lets the
+      memory eventually release old facts when the document moves on. Both are standard tricks borrowed
+      from outer-loop optimisation; both pull their weight here as data-dependent gates.
+    </p>
+
+    <h3>Attention and memory are complementary</h3>
+    <p>
+      MAC's empirical edge over MAL says something important: long-term memory and attention should sit
+      <em>side by side</em>, both consumed by the same readout, not stacked into a pipeline. Attention is
+      great for precise lookups in the recent window. The memory is great for blurry long-range
+      retrieval. Compressing first and attending afterwards (MAL) throws away exactly the lookups
+      attention is good at.
+    </p>
+
+    <h3>The TC$^0$ result</h3>
+    <p>
+      The paper proves a theorem: Transformers, diagonal linear recurrent models, and DeltaNet all live in
+      complexity class TC$^0$ (constant-depth threshold circuits with polynomial weights). Titans escape
+      that class. Concretely: there are state-tracking problems Titans can solve that no Transformer of
+      any depth can. The proof leans on the non-linearity of the inner memory update — exactly the part
+      that linear RNNs are missing.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>10. What it means</h2>
+
+    <p>
+      For the last few years, "long context" has meant one of two things: keep enlarging the KV cache, or
+      compress more aggressively into a fixed RNN state. Both are running into walls. KV-cache approaches
+      get expensive past 100K tokens; fixed-state RNNs lose accuracy past a few thousand. Titans show that
+      neither limit is fundamental. You can have linear-time inference <em>and</em> non-lossy long-range
+      recall, if you let the memory be a small network and treat inference as a continuation of training.
+    </p>
+
+    <p>
+      The architectural footprint is also surprisingly small. The Titans paper is a fairly contained
+      addition: one extra MLP per layer (the long-term memory), one extra prefix (persistent memory), one
+      modified inner-loop optimiser. Everything else is standard. That means the recipe is plausibly
+      composable with most current LLM stacks.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li>
+        <strong>Scale.</strong> The paper trains up to 760M parameters and ~30B tokens. The headline
+        result against GPT-4 is at small parameter counts on a specific benchmark. Whether the gap
+        survives at 70B-parameter scale is the obvious next question. Subsequent reports suggest the
+        approach holds up, but published evidence at frontier scale is still thin.
+      </li>
+      <li>
+        <strong>Memory of memories.</strong> If $\mathcal{M}$ is a network being trained on the fly, why
+        not train it with a more sophisticated optimiser than SGD-with-momentum? Adam, Lion, Sophia,
+        AdaFactor — each implies a different update rule for the memory, and so a different
+        architecture. The optimiser-as-architecture design space is wide open.
+      </li>
+      <li>
+        <strong>Reset semantics.</strong> The memory resets between sequences. For tasks that need
+        persistence across documents (multi-turn conversation with infinite history, agent state across
+        sessions), how should the memory carry over? Checkpointing $\mathcal{M}$'s weights? Distilling it
+        back into the outer model?
+      </li>
+      <li>
+        <strong>Theory of when this beats attention.</strong> The TC$^0$ result is a separation, not a
+        comparison at finite scale. What sequence lengths and what kinds of dependency structures
+        benefit most from $\mathcal{M}$ over a long-window Transformer? The empirical answer is
+        "long-context retrieval-style reasoning," but the theory is still forming.
+      </li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      The boundary between "training" and "inference" has been the load-bearing assumption in deep
+      learning for a decade: train once, freeze weights, deploy. Titans show that for the long-context
+      problem specifically, that boundary is artificial and unhelpful. The model that reads your document
+      should be allowed to learn from your document while it reads it. The memory shouldn't be a vector,
+      shouldn't be a cache — it should be a small neural network that the larger model trains on the fly.
+      That's the lesson. The rest is engineering.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2501.00663" target="_blank" rel="noopener">arXiv:2501.00663</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

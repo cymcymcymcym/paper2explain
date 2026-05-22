@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Every Normalization Layer Is the Same Layer — an interactive explainer</title>
+  <meta name="description" content="A from-scratch, interactive explainer of normalization layers: BatchNorm, LayerNorm, InstanceNorm, GroupNorm, RMSNorm, WeightNorm, conditional norms (FiLM, AdaIN, adaLN), pre- vs post-norm, QK-norm, and the normalization-free frontier. One unifying idea: pick which axes to average over."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer · fundamentals</p>
+    <h1>Every Normalization Layer Is the Same Layer</h1>
+    <p class="byline">
+      A from-scratch tour of normalization &middot; BatchNorm (2015) → DynamicTanh (2025) &middot;
+      12 sections &middot; 5 widgets &middot; 1 animation &middot; ~25&nbsp;min read
+    </p>
+    <p class="lede">
+      Open the source of any modern neural network — a ResNet, a GPT, Stable Diffusion — and you find
+      normalization layers threaded through every block. Delete them and training stalls or diverges
+      outright. Yet they are usually taught as a <em>zoo</em> of unrelated recipes: BatchNorm for
+      convnets, LayerNorm for Transformers, GroupNorm when the batch is small, RMSNorm because the big
+      labs use it. This explainer takes the opposite view. Every one of these is the <em>same layer</em>
+      with one knob turned differently: <strong>which numbers do you average over?</strong> See the knob,
+      and the zoo collapses into a single picture — and the practical advice falls out of it.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#recipe">The universal recipe</a></li>
+      <li><a href="#axes">The one knob: which axes?</a></li>
+      <li><a href="#batchnorm">BatchNorm</a></li>
+      <li><a href="#layernorm">LayerNorm</a></li>
+      <li><a href="#instancenorm">InstanceNorm</a></li>
+      <li><a href="#groupnorm">GroupNorm</a></li>
+      <li><a href="#manim">Watching the cube</a></li>
+      <li><a href="#rmsnorm">RMSNorm</a></li>
+      <li><a href="#weightnorm">WeightNorm</a></li>
+      <li><a href="#conditional">Conditional normalization</a></li>
+      <li><a href="#placement">Where the norm goes</a></li>
+      <li><a href="#frontier">Do we even need it?</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/norm-axes-groupnorm.png" alt="Normalization methods as different groupings of a feature tensor"/>
+      <figcaption>
+        The picture this whole explainer is built on (Wu &amp; He, 2018). A batch of activations is a
+        tensor with a batch axis $N$, a channel axis $C$, and spatial axes $(H, W)$. Each normalization
+        method — Batch, Layer, Instance, Group — is just a different choice of <em>which blue cells get
+        pooled into one mean and one variance.</em> Nothing else differs.
+      </figcaption>
+    </figure>
+
+    <p>
+      Normalization is the most quietly load-bearing idea in deep learning. BatchNorm, introduced in
+      2015, is one of the most cited papers in the field; it made it routine to train networks dozens of
+      layers deep, and the ImageNet-era explosion of computer vision rode on it. Today a transformer with
+      its LayerNorms removed will not train at all past a handful of layers. The layers cost almost
+      nothing — a mean, a variance, a multiply — and yet they decide whether a billion-parameter model
+      converges or diverges.
+    </p>
+    <p>
+      And almost everyone learns them as folklore. You memorize that vision people use BatchNorm,
+      sequence people use LayerNorm, that GroupNorm is the thing you reach for when your GPU only fits a
+      batch of two, that the latest large language models quietly switched to something called RMSNorm.
+      You learn a table of which-norm-goes-where, and the table works, but it doesn't <em>explain</em>
+      anything. It hides the fact that these are not five inventions. They are five settings of one dial.
+    </p>
+    <p>
+      Here is the whole idea in one sentence. A normalization layer takes a pile of numbers, computes
+      their mean and standard deviation, subtracts the mean and divides by the deviation so the pile is
+      recentered and rescaled, and then applies a small learnable correction. The <em>only</em> thing
+      that separates BatchNorm from LayerNorm from InstanceNorm from GroupNorm is the answer to one
+      question: <strong>which numbers go in the pile?</strong> Get that, and you can derive the entire
+      family yourself, predict how each one behaves, and know exactly which one your situation calls for.
+    </p>
+    <p>
+      We will build it in that order. First the universal recipe and the one knob. Then each member of
+      the family, in the order it was invented and for the reason it was invented. Then the layers that
+      bend the recipe — RMSNorm, which drops a step; conditional norms like adaLN, which make the
+      learnable correction depend on context; the question of <em>where</em> in a block the norm should
+      sit. And finally the frontier: recent results suggesting you might not need normalization layers at
+      all. Five interactive widgets and one animation along the way. No prior exposure assumed beyond
+      knowing what a neural network layer is.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="recipe">
+    <h2>1. The universal recipe</h2>
+
+    <p>
+      Start with the part that never changes. Take any vector or tensor of numbers $x$ flowing through
+      the network — call them <em>activations</em>. A normalization layer does exactly two things to
+      them.
+    </p>
+
+    <p><strong>Step one — standardize.</strong> Compute a mean $\mu$ and a variance $\sigma^2$ from the
+      activations, then recenter and rescale:</p>
+
+    <p class="eq">$$ \hat{x} \;=\; \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}}. $$</p>
+
+    <p>
+      After this step the numbers have mean zero and variance one. The tiny constant $\epsilon$ (something
+      like $10^{-5}$) is just insurance: if the activations happen to be nearly constant, $\sigma^2$ is
+      nearly zero, and dividing by it would blow up. Adding $\epsilon$ under the square root keeps the
+      operation finite. That is the entire role of $\epsilon$ — do not overthink it.
+    </p>
+
+    <p><strong>Step two — the learnable affine correction.</strong> Multiply by a learnable scale
+      $\gamma$ and add a learnable shift $\beta$:</p>
+
+    <p class="eq">$$ y \;=\; \gamma \,\hat{x} \;+\; \beta. $$</p>
+
+    <p>
+      Here $\gamma$ and $\beta$ are ordinary parameters, learned by gradient descent like any weight in
+      the network. And they raise an obvious question: we just went to the trouble of forcing the
+      activations to mean zero and variance one — why immediately hand the network a knob to <em>undo</em>
+      that?
+    </p>
+
+    <p>
+      Because forcing mean zero and variance one everywhere is too strong. The next layer might genuinely
+      work best with inputs whose typical scale is 5, or which are centered at $-2$. If we hard-pin every
+      activation to the standard normal shape, we have removed a degree of freedom the network might
+      need — and in the worst case the normalization is actively destructive. The affine step gives the
+      freedom back. Crucially, it gives it back <em>in a form that is easy to optimize.</em> Without
+      normalization, the scale of an activation is an emergent consequence of every weight upstream,
+      tangled and hard to move. With it, the scale is one clean parameter, $\gamma$, sitting right there.
+      The network can still choose any scale it likes — it just expresses that choice through a knob that
+      gradient descent can turn directly. Normalization does not remove freedom; it <em>re-coordinates</em>
+      it into parameters that are pleasant to train.
+    </p>
+
+    <p>
+      One consequence worth noting now: because $\gamma$ and $\beta$ exist, a normalization layer can in
+      principle represent the identity function (set $\gamma=\sqrt{\sigma^2+\epsilon}$, $\beta=\mu$). It
+      is never <em>forced</em> to change anything. That is reassuring — adding a norm layer cannot, in the
+      limit, make a network strictly less expressive.
+    </p>
+
+    <p>
+      That is the whole recipe: <strong>standardize, then affine-correct.</strong> Every layer in this
+      explainer is this recipe. BatchNorm is this recipe. LayerNorm is this recipe. RMSNorm is this recipe
+      with step one slightly shortened. adaLN is this recipe with step two made smarter. So if the recipe
+      is fixed, where does all the variety come from? From the four words we have so far left completely
+      undefined: <em>compute a mean.</em> A mean of <em>what?</em>
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="axes">
+    <h2>2. The one knob: which axes?</h2>
+
+    <p>
+      To compute a mean you need a set of numbers to average. The recipe never said which set. That
+      choice — and <em>only</em> that choice — is what splits the normalization family into its branches.
+    </p>
+
+    <p>
+      Picture the activations inside a convolutional network as a 4-dimensional block of numbers, the
+      tensor you saw in the figure at the top:
+    </p>
+
+    <ul>
+      <li><strong>$N$ — the batch axis.</strong> The network does not see one image at a time; it sees a
+        batch of, say, 32. $N$ indexes which example you are looking at.</li>
+      <li><strong>$C$ — the channel axis.</strong> At each layer every spatial location carries a vector
+        of features — edge detectors, color blobs, later on noses and wheels. $C$ indexes which feature.
+        (In a Transformer this is the only non-batch axis that matters: it is the model's hidden
+        dimension.)</li>
+      <li><strong>$H, W$ — the spatial axes.</strong> Height and width of the feature map. We will treat
+        them as one combined axis, "position," and write it $(H{\cdot}W)$.</li>
+    </ul>
+
+    <p>
+      Now the single question that generates the whole family: <strong>when you compute the mean and
+      variance for a given activation, which of those axes do you sweep over, and which do you keep
+      separate?</strong> Every answer is a normalization method:
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Method</th><th>Average over…</th><th>A separate mean/var for each…</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">BatchNorm</td><td>$N$, $H$, $W$</td><td>channel</td></tr>
+        <tr><td class="cat">LayerNorm</td><td>$C$, $H$, $W$</td><td>example</td></tr>
+        <tr><td class="cat">InstanceNorm</td><td>$H$, $W$</td><td>(example, channel) pair</td></tr>
+        <tr><td class="cat">GroupNorm</td><td>$H$, $W$, and a <em>group</em> of channels</td><td>(example, group) pair</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      That table is the entire taxonomy. BatchNorm asks "for this one channel, what is the typical value
+      across the whole batch and all positions?" LayerNorm asks "for this one example, what is the typical
+      value across all of its features?" They are the same operation pointed at perpendicular slices of
+      the same block. The widget below makes the slices concrete: pick a method and watch which cells get
+      swept into a single statistic.
+    </p>
+
+    <div class="widget-frame" id="cube-widget">
+      <p class="widget-title">Which axes do you average over?</p>
+      <p class="widget-sub">
+        Click a normalization scheme. The highlighted cells are pooled into <em>one</em> mean and
+        <em>one</em> variance. It is the same tensor every time — only the grouping changes.
+      </p>
+    </div>
+
+    <p>
+      Two things follow immediately, just from the geometry, before we have said a word about any specific
+      method. First: BatchNorm is the only one whose pile of numbers <em>crosses examples.</em> Its
+      statistics mix your image with the 31 other images that happened to share the batch. Every other
+      method computes its statistics inside a single example. Hold onto that — almost everything strange
+      about BatchNorm traces back to it. Second: the methods that stay inside one example behave
+      identically whether you are training on big batches, training on a batch of one, or running a single
+      input at inference. BatchNorm cannot make that promise. We will spend the next four sections cashing
+      out those two observations.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="batchnorm">
+    <h2>3. BatchNorm: the one that started it all</h2>
+
+    <p>
+      <strong>BatchNorm</strong> (Ioffe &amp; Szegedy, 2015) normalizes <em>per channel, across the
+      batch.</em> For channel $c$, it gathers every activation in that channel — across all $N$ examples
+      and all $H{\cdot}W$ spatial positions — into one pile, and computes one mean $\mu_c$ and one
+      variance $\sigma_c^2$ from it. A convolutional layer with 256 channels therefore produces 256
+      means and 256 variances, and a learnable $\gamma_c, \beta_c$ for each channel.
+    </p>
+
+    <h3>The original story, and why it is mostly wrong</h3>
+
+    <p>
+      The 2015 paper motivated BatchNorm with a phenomenon it named <em>internal covariate shift</em>. The
+      argument: as training updates the early layers, the distribution of inputs to the later layers keeps
+      shifting underfoot, so the later layers are forever chasing a moving target. Normalizing each
+      layer's inputs, the story went, pins that distribution down and lets training proceed.
+    </p>
+
+    <p>
+      It is a tidy story and it is, as far as anyone can tell, not the real reason. In 2018, Santurkar et
+      al. tested it directly. They took a BatchNorm network and <em>injected random noise after every
+      BatchNorm layer</em> — deliberately re-introducing a shifting, unstable distribution, exactly the
+      thing internal covariate shift says is harmful. If the story were right, this network should train
+      badly. It trained fine. They then measured covariate shift directly and found BatchNorm did not
+      particularly reduce it.
+    </p>
+
+    <p>
+      What BatchNorm <em>does</em> do, they showed, is make the optimization landscape dramatically
+      smoother. Concretely: with BatchNorm, the loss changes less violently as you move through parameter
+      space, and so do the gradients — the technical phrasing is that BatchNorm improves the
+      <em>Lipschitzness</em> of the loss and of its gradients. A smoother landscape means the gradient you
+      compute at your current point stays accurate over a longer step, which means you can safely use a
+      <em>larger learning rate</em>, which means faster training. That is the mechanism. "Reduces internal
+      covariate shift" is the marketing; "smooths the loss landscape" is the physics.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/loss-landscape.png" alt="BatchNorm narrows the variation in the loss"/>
+      <img src="assets/figures/gradient-landscape.png" alt="BatchNorm narrows the variation in the gradient"/>
+      <figcaption>
+        Santurkar et al. (2018). Across training, the loss (left) and the gradient (right) vary far more
+        gently with BatchNorm (blue) than without it (red) — the shaded band is the range seen when
+        probing along the update direction. The benefit is a smoother, more predictable landscape, which
+        permits higher learning rates; it is not the elimination of "internal covariate shift."
+      </figcaption>
+    </figure>
+
+    <h3>The split personality: training vs. inference</h3>
+
+    <p>
+      Because BatchNorm's statistics are computed <em>across the batch</em>, it has a problem no other
+      norm has. At training time the batch is right there, so the mean and variance are easy. At inference
+      time you may be classifying a single image — there is no batch to average over. And even if there
+      were, you do not want a prediction for one image to depend on which other images happened to be
+      submitted alongside it.
+    </p>
+
+    <p>
+      BatchNorm's fix is to lead a double life. During training it uses the current batch's statistics —
+      <em>and</em>, on the side, it keeps a running exponential moving average of the means and variances
+      it has seen. At inference it switches: it freezes, and uses those accumulated running statistics
+      instead of the (absent) batch's. So a BatchNorm layer literally computes a different function in
+      training mode and in evaluation mode.
+    </p>
+
+    <p>
+      This is the source of one of the most common silent bugs in all of deep learning. In PyTorch, if you
+      forget to call <code>model.eval()</code> before running inference, every BatchNorm layer keeps using
+      <em>batch</em> statistics. Your accuracy quietly drops, your predictions become dependent on batch
+      composition, and nothing crashes — there is no error message, just a worse model. (The same flag
+      governs Dropout, compounding the trap.)
+    </p>
+
+    <h3>The batch-size cliff</h3>
+
+    <p>
+      The deeper weakness: BatchNorm's statistics are only as good as the sample they are estimated from.
+      With a batch of 256, the mean and variance of a channel are estimated from a huge pile of numbers
+      and are stable. With a batch of 4, they are estimated from a tiny, noisy sample — and that noise is
+      injected straight into the forward pass of every example. Worse, the running averages collected
+      during training no longer match what any single small batch produces, so the training/inference gap
+      widens too.
+    </p>
+
+    <p>
+      The result is a sharp <em>cliff</em>: BatchNorm networks are excellent at large batch sizes and fall
+      apart at small ones. That matters in practice because memory-hungry tasks — high-resolution
+      detection, segmentation, video — often <em>cannot</em> fit a large batch on a GPU. The widget lets
+      you walk off the cliff yourself, and flip into the train/inference mismatch.
+    </p>
+
+    <div class="widget-frame" id="bn-stats-widget">
+      <p class="widget-title">BatchNorm's fragile statistics</p>
+      <p class="widget-sub">
+        Two ways batch statistics betray you. Shrink the batch and watch the estimate go noisy; or flip
+        between training and inference and watch the two distributions disagree.
+      </p>
+    </div>
+
+    <p>
+      So BatchNorm is a fantastic default in exactly the setting it was born in — convolutional networks,
+      image classification, comfortably large batches — and a liability outside it. Every other method in
+      this explainer can be read as a response to one of its weaknesses. The first response was to ask:
+      what if we never crossed the batch axis at all?
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="layernorm">
+    <h2>4. LayerNorm: normalize one example at a time</h2>
+
+    <p>
+      <strong>LayerNorm</strong> (Ba, Kiros &amp; Hinton, 2016) makes the opposite axis choice from
+      BatchNorm. For a single example, it pools <em>all</em> of that example's features into one pile,
+      computes one mean and one variance, and standardizes. The pile never reaches across to another
+      example. Each example is normalized entirely on its own.
+    </p>
+
+    <p>
+      That single change erases BatchNorm's whole catalogue of problems. There is no batch axis in the
+      computation, so there is no batch-size cliff: a batch of 1 works exactly as well as a batch of 1000.
+      There are no running statistics to maintain, because there is nothing batch-dependent to remember —
+      so LayerNorm computes <em>the identical function in training and in inference.</em> No
+      <code>eval()</code> bug. No dependence on which examples share a batch. What you give up is the mild
+      regularizing noise that BatchNorm's batch sampling provided for free, but that turns out to be a
+      cheap price.
+    </p>
+
+    <p>
+      LayerNorm was invented for recurrent networks, and the reason is instructive. A recurrent network
+      processes a sequence step by step, and the steps of a sequence are not a batch — different sequences
+      have different lengths, and timestep 50 sees different statistics than timestep 2. BatchNorm has no
+      coherent pile of numbers to average in that setting; it simply does not fit. LayerNorm, normalizing
+      each hidden state on its own, fits perfectly.
+    </p>
+
+    <p>
+      And that is exactly why LayerNorm became the default of the entire Transformer era. A Transformer
+      is a stack of operations on a sequence of token vectors, and it wants a normalization that treats
+      each token vector independently of the others and behaves the same at any sequence length and any
+      batch size. That is LayerNorm precisely. Every GPT, every BERT, every vision Transformer is built
+      with LayerNorm (or its descendant RMSNorm, in section 8) between the sublayers. When people say
+      "Transformers use LayerNorm," this independence is the whole reason.
+    </p>
+
+    <aside class="callout">
+      <strong>A subtlety worth naming.</strong> In a Transformer, a token's "features" are just its
+      hidden vector, so LayerNorm pools over the hidden dimension — clean. On a convolutional feature map,
+      "all the features of one example" means all channels <em>and</em> all spatial positions, $(C, H,
+      W)$. That is the LayerNorm panel in the figure at the top. It works, but lumping every channel
+      together is a blunt instrument for images — which is the gap the next two methods were built to
+      close.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="instancenorm">
+    <h2>5. InstanceNorm: one example, one channel</h2>
+
+    <p>
+      <strong>InstanceNorm</strong> (Ulyanov, Vedaldi &amp; Lempitsky, 2016) goes one notch finer than
+      LayerNorm. It still refuses to cross the batch axis — but it also refuses to mix channels together.
+      For each (example, channel) pair it pools only that channel's spatial positions, $(H{\cdot}W)$, into
+      its own mean and variance. Where BatchNorm normalizes a channel using the whole batch, InstanceNorm
+      normalizes a channel using just that one image.
+    </p>
+
+    <p>
+      This was discovered in the context of <em>style transfer</em> — the task of repainting a photograph
+      in the style of a painting. The key empirical fact: a great deal of what we perceive as the "style"
+      of an image lives in the per-channel mean and variance of its feature maps. The overall contrast,
+      the color cast, the intensity of a texture — those are largely captured by simple per-channel
+      statistics. So if you normalize each channel of each image to mean zero and variance one, you have
+      <em>washed the style out</em>, leaving the content behind.
+    </p>
+
+    <p>
+      That makes InstanceNorm a content/style separator, and it explains why it became standard in
+      generative image models long before it was common anywhere else. It also sets up something
+      important for section 10: if normalizing a channel <em>removes</em> style, then writing a chosen
+      mean and variance <em>back in</em> should <em>impose</em> a style. Hold that thought — it is the
+      seed of conditional normalization, and of how StyleGAN works.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="groupnorm">
+    <h2>6. GroupNorm: the dial between Layer and Instance</h2>
+
+    <p>
+      Look at the last three methods on one line. LayerNorm pools <em>all</em> channels of an example
+      together. InstanceNorm pools <em>each</em> channel separately. <strong>GroupNorm</strong> (Wu &amp;
+      He, 2018) is the obvious thing in between: partition the $C$ channels into $G$ groups, and pool each
+      group on its own (together with its spatial positions, for one example).
+    </p>
+
+    <p>
+      $G$ is a genuine dial. Set $G = 1$ and every channel is in one group — that is LayerNorm. Set
+      $G = C$ and every channel is its own group — that is InstanceNorm. Any value in between, and a
+      typical choice is $G = 32$, is a compromise: channels that detect related features get normalized
+      together, unrelated ones do not. LayerNorm, InstanceNorm and GroupNorm are not three methods. They
+      are one method at three settings of $G$.
+    </p>
+
+    <p>
+      The reason GroupNorm matters in practice is that it is the clean fix for BatchNorm's batch-size
+      cliff. It is batch-independent — same function in training and inference, no running statistics, a
+      batch of 2 is fine — but, unlike LayerNorm, it does not crush every channel into a single
+      statistic, which keeps it competitive with BatchNorm on vision tasks. The figure is the headline
+      result: on ImageNet, BatchNorm's error climbs steeply as the batch shrinks, while GroupNorm's stays
+      essentially flat.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/batchsize-error.png" alt="Error vs batch size: BatchNorm degrades, GroupNorm stays flat"/>
+      <figcaption>
+        Wu &amp; He (2018), ResNet-50 on ImageNet. As the batch size per GPU drops from 32 toward 2,
+        BatchNorm's error rises sharply — its statistics are estimated from too few samples — while
+        GroupNorm, which never touches the batch axis, holds steady.
+      </figcaption>
+    </figure>
+
+    <p>
+      That is why GroupNorm is the default in object detection and segmentation (Mask R-CNN and its
+      descendants), where high-resolution inputs force tiny batches, and why it is everywhere inside the
+      U-Nets of diffusion image models. Whenever you cannot afford a big batch, GroupNorm is the answer.
+      With Batch, Layer, Instance and Group on the table, we have covered every method that is purely a
+      choice of axes — the entire taxonomy from section 2. A good moment to watch the cube move.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="manim">
+    <h2>7. Watching the cube</h2>
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/norm_cube.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The four axis-based norms as one moving picture. The same $N \times C \times (H{\cdot}W)$ tensor of
+      activations stays on screen throughout; only the <em>pooling region</em> sweeps. BatchNorm pools a
+      channel slab across the batch; LayerNorm pools one example across all channels; InstanceNorm pools a
+      single (example, channel) fiber; GroupNorm pools a band of channels. Each region collapses to one
+      $(\mu, \sigma)$, standardizes, and the learnable $\gamma, \beta$ are applied — the recipe from
+      section 1, running underneath all four.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="rmsnorm">
+    <h2>8. RMSNorm: drop a step and see if anyone notices</h2>
+
+    <p>
+      So far every method has been a choice of <em>axes</em>. <strong>RMSNorm</strong> (Zhang &amp;
+      Sennrich, 2019) keeps LayerNorm's axes and instead changes the <em>recipe</em>. It asks a sharp
+      question: of standardization's two moves — subtract the mean, divide by the deviation — do we
+      actually need the first one?
+    </p>
+
+    <p>
+      RMSNorm's answer is no. It skips the mean entirely and rescales by the root-mean-square of the
+      activations:
+    </p>
+
+    <p class="eq">$$ y \;=\; \gamma \odot \frac{x}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2 + \epsilon}}. $$</p>
+
+    <p>
+      No $\mu$. No subtraction. Usually no $\beta$ either. The hypothesis behind it is that the part of
+      normalization that does the real work is <em>rescaling</em> — keeping activation magnitudes under
+      control — and that <em>recentering</em> contributes little. The geometry is clean: LayerNorm first
+      slides the input vector onto the zero-mean hyperplane and then projects it onto a sphere; RMSNorm
+      skips the slide and projects onto the sphere directly. The widget lets you drag an input around and
+      compare the two — for many inputs the outputs sit nearly on top of each other, which is the visual
+      version of "the mean step rarely mattered."
+    </p>
+
+    <div class="widget-frame" id="rms-geom-widget">
+      <p class="widget-title">LayerNorm vs RMSNorm, geometrically</p>
+      <p class="widget-sub">
+        Drag the input vector. LayerNorm recenters <em>then</em> rescales; RMSNorm only rescales. Watch
+        how often the two land in nearly the same place.
+      </p>
+    </div>
+
+    <p>
+      Two practical wins follow. It is <em>cheaper</em> — no mean, no subtraction, fewer parameters; a
+      small but real saving repeated in every layer of a very large model. And it is empirically just as
+      stable to train. That combination is why RMSNorm has quietly become the default in modern large
+      language models — LLaMA, T5, PaLM, Mistral, Qwen and most recent releases use RMSNorm, not
+      LayerNorm. It is the rare simplification that costs nothing and is therefore simply correct. If you
+      are building a Transformer today, RMSNorm is the reasonable default.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="weightnorm">
+    <h2>9. WeightNorm: normalize the weights instead</h2>
+
+    <p>
+      Every method so far normalizes <em>activations</em> — the data flowing through the network.
+      <strong>WeightNorm</strong> (Salimans &amp; Kingma, 2016) is the odd cousin: it normalizes the
+      <em>weights</em>. It reparameterizes each weight vector as a direction times a magnitude,
+    </p>
+
+    <p class="eq">$$ w \;=\; g \,\frac{v}{\lVert v \rVert}, $$</p>
+
+    <p>
+      where the direction $v/\lVert v\rVert$ and the scalar magnitude $g$ are learned as separate
+      parameters. Splitting the two makes the optimization geometry friendlier — the length of a weight
+      vector can be tuned without disturbing its direction.
+    </p>
+
+    <p>
+      WeightNorm is worth knowing as a concept — it shows "normalization" is a family of ideas, not one
+      operation, and the same direction/magnitude split reappears in <em>weight standardization</em>,
+      which pairs with GroupNorm inside the normalization-free networks of section 12. But in everyday
+      practice it is rare: it does not deliver the loss-landscape smoothing that activation normalization
+      does, and the activation-based methods won. File it under "good to recognize, unlikely to reach
+      for."
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="conditional">
+    <h2>10. Conditional normalization: when γ and β are predicted, not learned</h2>
+
+    <p>
+      Return to the recipe. Step two applied a learnable scale and shift, $y = \gamma\hat{x} + \beta$, and
+      until now $\gamma$ and $\beta$ have been ordinary parameters — fixed after training, the same for
+      every input. Conditional normalization makes one move: <strong>let $\gamma$ and $\beta$ be
+      <em>computed</em> from some conditioning signal</strong> instead. They stop being constants and
+      become the <em>output of a small network</em> that reads a condition $c$:
+    </p>
+
+    <p class="eq">$$ \gamma = f_\gamma(c), \qquad \beta = f_\beta(c), \qquad y = \gamma\,\hat{x} + \beta. $$</p>
+
+    <p>
+      That is the entire idea, and it is more powerful than it looks. Recall the lesson from InstanceNorm:
+      a feature map's per-channel mean and variance largely encode its <em>style</em>. So a layer that
+      first normalizes (washing the old style out) and then writes in a <em>predicted</em> $\gamma, \beta$
+      is, quite literally, a layer that paints a chosen style onto the content. Conditional normalization
+      is how a single network is steered by a class label, a text prompt, a diffusion timestep, or
+      another image. It comes in a family:
+    </p>
+
+    <ul>
+      <li><strong>FiLM</strong> (Perez et al., 2018) — "Feature-wise Linear Modulation" — is the general
+        statement: a conditioning network emits a per-channel scale and shift that modulate features
+        elsewhere. Every method below is a special case of it.</li>
+      <li><strong>Conditional BatchNorm</strong> learns a separate $\gamma, \beta$ per class label —
+        used in class-conditional GANs such as BigGAN to let one generator serve hundreds of categories.</li>
+      <li><strong>AdaIN</strong> (Huang &amp; Belongie, 2017) takes the $\gamma, \beta$ straight from
+        <em>another image</em>: it instance-normalizes the content image, then rescales by the
+        <em>style</em> image's own per-channel mean and standard deviation,
+        $\mathrm{AdaIN}(x,y) = \sigma(y)\frac{x-\mu(x)}{\sigma(x)} + \mu(y)$. This is the engine of
+        arbitrary fast style transfer, and a close relative drives the original StyleGAN.</li>
+      <li><strong>adaLN</strong> and <strong>adaLN-Zero</strong> are conditional LayerNorm, and they power
+        the Diffusion Transformer (DiT) — the architecture behind Stable Diffusion 3 and Sora. A small
+        MLP reads the timestep-and-class embedding and regresses the LayerNorm $\gamma, \beta$ for every
+        block (plus a scale on the residual branch). The <em>-Zero</em> refinement initializes that MLP
+        to output zeros, so every block starts as the identity and the network eases into conditioning
+        rather than lurching — a real training-stability win. (Our companion
+        <a href="../dit/index.html">DiT explainer</a> walks through adaLN-Zero in full.)</li>
+      <li><strong>SPADE</strong> (Park et al., 2019) lets $\gamma, \beta$ vary across <em>spatial
+        position</em>, predicted from a segmentation map — so the modulation can say "sky here, grass
+        there." It is conditional normalization with the condition resolved per pixel.</li>
+    </ul>
+
+    <p>
+      The widget below is the whole family in miniature: move a conditioning signal, watch a small MLP
+      turn it into $\gamma$ and $\beta$, and watch those repaint a set of normalized features.
+    </p>
+
+    <div class="widget-frame" id="cond-norm-widget">
+      <p class="widget-title">Conditional normalization</p>
+      <p class="widget-sub">
+        The affine step, predicted from a condition. Drag the conditioning signal; the MLP emits a new
+        $\gamma$ and $\beta$, and the normalized features are repainted.
+      </p>
+    </div>
+
+    <p>
+      Notice that nothing about the <em>normalize</em> half of the recipe changed. Conditional
+      normalization is entirely an upgrade to step two. The taxonomy of section 2 still holds — it just
+      now has a second axis of variation: not only <em>which numbers you pool</em>, but <em>where
+      $\gamma$ and $\beta$ come from.</em>
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="placement">
+    <h2>11. Where the norm goes</h2>
+
+    <p>
+      We have settled which numbers a norm pools and where its $\gamma, \beta$ come from. One question is
+      left, and in deep Transformers it is the one that decides whether training even succeeds:
+      <em>where in the block do you put the layer?</em>
+    </p>
+
+    <p>
+      A Transformer block is built around a residual connection — a sublayer $F$ (attention, or an MLP)
+      whose output is added back to its input: $x + F(x)$. The LayerNorm can sit in one of two places.
+    </p>
+
+    <p class="eq">$$ \textbf{Post-LN:}\quad x_{\ell+1} = \mathrm{LN}\big(x_\ell + F(x_\ell)\big) \qquad\qquad \textbf{Pre-LN:}\quad x_{\ell+1} = x_\ell + F\big(\mathrm{LN}(x_\ell)\big) $$</p>
+
+    <p>
+      <strong>Post-LN</strong> — normalize <em>after</em> the residual addition — is what the original
+      2017 Transformer used. <strong>Pre-LN</strong> — normalize <em>inside</em> the residual branch,
+      before the sublayer, leaving the residual highway itself untouched — is what essentially every
+      Transformer since roughly 2020 uses. The difference is not cosmetic.
+    </p>
+
+    <p>
+      In Post-LN, every residual addition is followed by a normalization, so the clean "highway" that a
+      residual connection is supposed to provide gets squeezed at every floor. Xiong et al. (2020) showed
+      the consequence: at initialization, Post-LN's gradients are badly scaled — very large near the
+      output layers — and training is fragile. It works only with a <em>learning-rate warmup</em>: you
+      must start the learning rate near zero and ramp it up over thousands of steps, or the model
+      diverges. In Pre-LN, the residual highway runs uninterrupted from input to output; the norm only
+      ever touches the branch. Gradients stay well-behaved at all depths, warmup becomes optional, and you
+      can stack the network far deeper before it becomes unstable.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/pre-post-ln.png" alt="Pre-LN vs Post-LN Transformer block placement"/>
+      <figcaption>
+        Xiong et al. (2020). Panel (a), Post-LN: the LayerNorm sits on the residual path, applied after
+        each addition. Panel (b), Pre-LN: the LayerNorm sits inside the branch, and the residual stream
+        flows through untouched. Pre-LN's gradients are well-scaled at initialization, which removes the
+        need for learning-rate warmup and permits much deeper stacks.
+      </figcaption>
+    </figure>
+
+    <div class="widget-frame" id="prepost-widget">
+      <p class="widget-title">Pre-norm vs post-norm</p>
+      <p class="widget-sub">
+        Send a signal through a deep residual stack. Toggle where the LayerNorm sits and watch the
+        activation magnitude stay bounded — or run away with depth.
+      </p>
+    </div>
+
+    <p>
+      Placement keeps generating new ideas. <strong>QK-norm</strong> moves a normalization <em>inside</em>
+      the attention operation: it normalizes the query and key vectors before their dot product. As
+      models scale, those dot products can grow large enough to saturate the attention softmax — the
+      model attends to one token and goes deaf to the rest, an "attention entropy collapse." Normalizing
+      Q and K first bounds the logits and prevents it; QK-norm is now standard in very large vision and
+      language models. The lesson generalizes: a normalization layer is not just a thing you sprinkle
+      between blocks. <em>Where</em> you place it is a design decision with consequences as large as which
+      one you pick.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="frontier">
+    <h2>12. Do we even need it?</h2>
+
+    <p>
+      We have spent eleven sections taking normalization apart. The honest closing question is whether the
+      layer needs to exist at all — and the recent evidence says: less than you would think.
+    </p>
+
+    <p>
+      The provocative result is <strong>DynamicTanh</strong> (Zhu et al., 2025), titled, plainly,
+      "Transformers without Normalization." The authors looked at what a trained LayerNorm actually does
+      to its inputs and found that, in practice, its input-to-output mapping traces an S-shaped curve —
+      it gently squashes large values and leaves small ones almost alone. That is just a scaled
+      $\tanh$. So they replaced the whole layer — mean, variance, the lot — with a fixed elementwise
+      function:
+    </p>
+
+    <p class="eq">$$ \mathrm{DyT}(x) \;=\; \gamma \odot \tanh(\alpha x) + \beta, $$</p>
+
+    <p>
+      where $\alpha$ is a single learnable scalar and $\gamma, \beta$ are the familiar affine parameters.
+      <em>No mean. No variance. No statistics of any kind.</em> Transformers built with DyT match their
+      normalized counterparts across vision and language. It is strong evidence that computing statistics
+      was never the essential part — the essential part was the bounded, squashing nonlinearity that
+      keeping activations in range provides.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/dynamic-tanh.png" alt="A trained LayerNorm behaves like a scaled tanh"/>
+      <figcaption>
+        Zhu et al. (2025). The input/output relationship of a LayerNorm in a trained Transformer traces
+        an S-shaped, $\tanh$-like curve. DynamicTanh keeps that curve and discards the statistics
+        entirely — and the resulting networks train just as well.
+      </figcaption>
+    </figure>
+
+    <p>
+      DyT is part of a longer thread. <em>Normalizer-free networks</em> (NFNets, and earlier Fixup and
+      ReZero) reach the accuracy of normalized ones by careful initialization, residual scaling, and
+      tricks like adaptive gradient clipping. The picture emerging from all of it: normalization layers
+      are an extremely convenient, robust way to keep activations well-scaled and the loss landscape
+      smooth — but they are <em>one</em> way, not the only way. For now they remain the default, because
+      they are simple and they reliably work. Just know the default is not load-bearing forever.
+    </p>
+
+    <h3>The cheat-sheet</h3>
+
+    <p>Until the frontier arrives, here is the practical decision table.</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Your situation</th><th>Use</th><th>Why</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">ConvNet, big batch, classification</td><td>BatchNorm</td><td>Its home turf; the loss-landscape smoothing and free regularization are real.</td></tr>
+        <tr><td class="cat">ConvNet, small batch / detection / segmentation</td><td>GroupNorm</td><td>Batch-independent — sidesteps the batch-size cliff.</td></tr>
+        <tr><td class="cat">Transformer / LLM</td><td>RMSNorm (or LayerNorm)</td><td>Per-token, batch-independent; RMSNorm is cheaper and now the default.</td></tr>
+        <tr><td class="cat">Recurrent network</td><td>LayerNorm</td><td>BatchNorm has no coherent batch to pool across timesteps.</td></tr>
+        <tr><td class="cat">Style transfer / image stylization</td><td>InstanceNorm / AdaIN</td><td>Per-channel statistics <em>are</em> the style knob.</td></tr>
+        <tr><td class="cat">Conditional generation (diffusion, cGAN)</td><td>adaLN-Zero / conditional BN</td><td>Predict $\gamma,\beta$ from the condition; zero-init for stability.</td></tr>
+        <tr><td class="cat">Attention logits unstable at scale</td><td>add QK-norm</td><td>Bounds the dot products; prevents attention-entropy collapse.</td></tr>
+        <tr><td class="cat">Transformer block placement</td><td>Pre-LN, always</td><td>Well-scaled gradients, no warmup needed, trains far deeper.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The footguns</h3>
+
+    <p>And the things that will silently cost you a weekend if you do not know them:</p>
+
+    <ul>
+      <li><strong>Forgetting <code>model.eval()</code>.</strong> BatchNorm (and Dropout) keep training-mode
+        behavior; accuracy drops with no error. The single most common normalization bug.</li>
+      <li><strong>BatchNorm on tiny batches.</strong> Below a batch of ~8–16 per device the statistics go
+        noisy and the model can do worse than with no norm at all. Switch to GroupNorm.</li>
+      <li><strong>BatchNorm leaks across the batch.</strong> One example's output depends on its
+        batch-mates. This silently breaks contrastive methods — SimCLR and BYOL need ShuffleBN or other
+        care so the model cannot "cheat" through batch statistics.</li>
+      <li><strong>Distributed training.</strong> By default each GPU computes BatchNorm statistics on its
+        own local sub-batch. If that sub-batch is small, reach for SyncBatchNorm to pool across devices.</li>
+      <li><strong>BatchNorm folds away for free.</strong> At inference a BatchNorm is a fixed affine map,
+        so it can be merged into the preceding convolution — a genuine, lossless speed-up that frameworks
+        do automatically.</li>
+      <li><strong>The calm ones.</strong> LayerNorm, RMSNorm, GroupNorm and InstanceNorm keep no running
+        statistics and never cross the batch. They behave identically in training and inference, at any
+        batch size, including one. Most of the footguns above are BatchNorm footguns.</li>
+    </ul>
+
+    <h3>The one thing to remember</h3>
+
+    <p>
+      If you keep a single sentence from this explainer, keep this one. A normalization layer
+      <strong>standardizes a pile of numbers and then applies a learnable scale and shift</strong> — and
+      every named method is just a different answer to <em>which numbers go in the pile</em> and
+      <em>where the scale and shift come from</em>. BatchNorm pools across the batch and pays for it
+      forever after. LayerNorm and its group of relatives pool inside one example and stay calm.
+      RMSNorm drops the recentering. Conditional norms predict the scale and shift from context.
+      DynamicTanh suggests the statistics were never the point. It was never a zoo. It was always one
+      layer, and one knob.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      A concept explainer, built from: Ioffe &amp; Szegedy 2015 (BatchNorm) &middot; Ba, Kiros &amp;
+      Hinton 2016 (LayerNorm) &middot; Ulyanov et al. 2016 (InstanceNorm) &middot; Salimans &amp; Kingma
+      2016 (WeightNorm) &middot; Huang &amp; Belongie 2017 (AdaIN) &middot; Perez et al. 2018 (FiLM)
+      &middot; Wu &amp; He 2018 (GroupNorm) &middot; Santurkar et al. 2018 (how BN helps) &middot; Zhang
+      &amp; Sennrich 2019 (RMSNorm) &middot; Xiong et al. 2020 (Pre-LN) &middot; Peebles &amp; Xie 2022
+      (adaLN-Zero / DiT) &middot; Zhu et al. 2025 (DynamicTanh).
+    </p>
+    <p class="tiny">All figures © their original authors, reproduced here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

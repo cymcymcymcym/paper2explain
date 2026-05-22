@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Image Generators are Generalist Vision Learners — an interactive explainer</title>
+  <meta name="description" content="A long, interactive, beginner-friendly explainer of the Vision Banana paper: how a single image generator beats specialist models on segmentation, depth, and surface normals." />
+
+  <!-- KaTeX for math -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Image Generators are Generalist Vision Learners</h1>
+    <p class="byline">
+      Gabeur, Long, Peng <em>et&nbsp;al.</em> &middot;
+      Google DeepMind &middot; April 2026 &middot;
+      <a href="https://arxiv.org/abs/2604.20329" target="_blank" rel="noopener">arXiv&nbsp;2604.20329</a>
+    </p>
+    <p class="lede">
+      Image generators look like one-trick ponies: type a prompt, get a picture.
+      This paper argues they have been hiding a second skill the whole time —
+      <em>understanding</em> images well enough to do depth estimation, segmentation,
+      and surface normals at the level of, or better than, the world's best specialist models.
+      The trick to unlocking it is almost embarrassingly simple.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#llm-moment">The LLM moment, for vision</a></li>
+      <li><a href="#trick">The trick: tasks as image generation</a></li>
+      <li><a href="#depth">Deep dive: depth as RGB</a></li>
+      <li><a href="#segmentation">Segmentation: color as label</a></li>
+      <li><a href="#normals">Surface normals: a vector that's already a color</a></li>
+      <li><a href="#recipe">The recipe: Vision Banana</a></li>
+      <li><a href="#results">Results: beating the specialists</a></li>
+      <li><a href="#why">Why it works</a></li>
+      <li><a href="#paradigm">What this means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/teaser.png" alt="Vision Banana teaser figure showing an input image and four different visual task outputs"/>
+      <figcaption>
+        Vision Banana takes an instruction prompt and an image, and emits an <em>image</em> back —
+        but that image is decoded into segmentation masks, depth, normals, or a referred object.
+        One model. One interface. (Figure 1 from the paper.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Suppose I hand you a photo of a kitchen and ask: <em>how far is each object from the camera?</em>
+      A specialist depth estimator like Depth Anything V3 has been trained for exactly this.
+      An image generator like Nano Banana Pro hasn't — its job is to <em>create</em> kitchens, not measure them.
+    </p>
+    <p>
+      The Vision Banana paper makes a surprising claim: the image generator can answer the depth question
+      <strong>better than the specialist</strong>, after a tiny bit of instruction-tuning. And the same model
+      can also segment cats, label road scenes, estimate surface normals — every classic computer-vision task
+      reframed as <em>just generate the right kind of picture</em>.
+    </p>
+    <p>
+      This post walks through how it works, why it works, and why the authors think we're in the middle of a
+      paradigm shift for computer vision.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="llm-moment">
+    <h2>1. The LLM moment, for vision</h2>
+
+    <p>
+      Take a moment to remember what GPT-3 felt like in 2020. Researchers had been training language models
+      to <em>predict the next token</em> — a generative task. Yet the resulting models could answer trivia,
+      translate French, summarize legal documents, write Python, and follow instructions. The same training
+      objective that taught them to generate had taught them to understand.
+    </p>
+    <p>
+      We have a default name for this now: <em>generative pretraining</em>. It is the foundation of nearly every
+      capable text model on Earth.
+    </p>
+    <p>
+      Computer vision has gone in a different direction. The flagship vision representation methods aren't
+      generative — they're <strong>discriminative</strong>:
+    </p>
+    <ul>
+      <li><strong>Contrastive learning</strong> (CLIP, SigLIP): push matched image–text pairs together, mismatched apart.</li>
+      <li><strong>Masked auto-encoding</strong> (MAE, BEiT): reconstruct hidden patches.</li>
+      <li><strong>Bootstrapping</strong> (DINO): predict your own teacher's features.</li>
+      <li><strong>Supervised pretraining</strong> on ImageNet labels.</li>
+    </ul>
+    <p>
+      The few attempts at generative vision pretraining — Image-GPT in 2020, sequential pixel models since —
+      have produced great pictures but mediocre features. Generative just <em>didn't</em> seem to be the right
+      pretraining task for understanding images.
+    </p>
+    <p>
+      Vision Banana flips that conclusion. The authors take a state-of-the-art image generator and ask: <em>are
+      you secretly a generalist vision learner?</em> The answer, after a tiny finetuning trick, is yes.
+    </p>
+
+    <aside class="callout">
+      <strong>What's a "generalist vision learner"?</strong>
+      In LLM-land, a base model that can be steered to many tasks via prompts and a sprinkle of instruction-tuning
+      is called a <em>foundation model</em>. The Vision Banana authors want the visual equivalent: one model whose
+      pretrained weights solve every classical vision task with only a thin layer of task adaptation.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="trick">
+    <h2>2. The trick: vision tasks as image generation</h2>
+
+    <p>
+      Here is the central conceptual move. Take a perception task — say, semantic segmentation. The traditional
+      framing is: <em>for each pixel, output a class label</em>. The neural network has a classification head, an
+      output channel per class, and a loss like cross-entropy.
+    </p>
+    <p>
+      Vision Banana's framing is: <em>output an image where each pixel's color encodes its class label</em>.
+      You tell the model:
+    </p>
+    <blockquote>
+      "Generate a semantic segmentation visualization, using this color mapping:
+      <code>{"cat": "red", "lock": "pink", "exit sign": "light purple", "background": "yellow"}</code>."
+    </blockquote>
+    <p>
+      The model — which is, fundamentally, an image generator — generates an image. It happens to be a brightly
+      colored image where every cat-pixel is red and every lock-pixel is pink. To convert that image back into a
+      segmentation mask, you simply cluster pixels by which target color they're closest to. Done.
+    </p>
+
+    <p>
+      No new architecture. No classification head. No new loss. The model is doing exactly what it was already
+      trained to do: generate an image. The instruction-tuning step only teaches it which kinds of images to
+      generate when asked.
+    </p>
+
+    <div class="widget-frame" id="task-switcher">
+      <p class="widget-title">Same image. Four task outputs. One model.</p>
+      <p class="widget-sub">Click a task to see what Vision Banana produces from the same input.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <p>The paper highlights three properties of this framing:</p>
+    <ol>
+      <li><strong>Unified.</strong> The weights are shared across all tasks. Only the prompt changes.</li>
+      <li><strong>Data-efficient.</strong> You're not teaching new visual <em>concepts</em> — those are already
+        baked in from generative pretraining. You're only teaching <em>output formatting</em>.</li>
+      <li><strong>Preserves generation.</strong> Because the outputs <em>are</em> images, the model never
+        learns to stop generating images. Its native skill is intact.</li>
+    </ol>
+
+    <p>
+      Each vision task gets its own little encoder/decoder pair — a way to turn the ground-truth annotation
+      <em>into</em> a target image, and a way to read predictions <em>out of</em> a generated image. Let's look
+      at the three the paper actually uses.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="depth">
+    <h2>3. Deep dive: depth as RGB</h2>
+
+    <p>
+      Depth is the trickiest task to encode as an image. The output isn't a label — it's a real number, the
+      distance in meters from the camera plane to the surface that pixel sees. Real numbers don't live naturally
+      inside a color cube. We need to be careful.
+    </p>
+
+    <p>The paper's depth encoder has two steps:</p>
+    <ol>
+      <li><strong>Warp distance into [0, 1).</strong> Apply a <em>power transform</em> to turn an unbounded
+        distance into a bounded number. Crucially, the curve is shaped so that nearby distances get a lot of
+        resolution and faraway distances get little.</li>
+      <li><strong>Walk along the RGB cube.</strong> Map that warped number to a color by traversing the edges of
+        the unit RGB cube, in a fixed path from black through the six primary colors to white.</li>
+    </ol>
+
+    <h3>Step 1: the power transform</h3>
+
+    <p>
+      Why warp distance at all? Imagine a robot trying to grasp a coffee cup. Whether the cup is 0.3m or 0.4m
+      away matters a lot. Whether the wall behind it is 8m or 12m away barely matters. The paper's curve
+      reflects this: it spends most of its dynamic range on close objects.
+    </p>
+
+    <p>The formula:</p>
+    <p class="eq">
+      $$ f(d; \lambda, c) = 1 - \left(1 - \frac{d}{\lambda c}\right)^{\lambda + 1} $$
+    </p>
+    <p>
+      with $\lambda = -3$ and $c = 10/3$. The negative $\lambda$ gives you a curve that approaches 1
+      asymptotically as $d \to \infty$, so the function maps $[0, \infty)$ to $[0, 1)$, and the
+      "curving" makes the early part of the domain expand into a lot of the output range. (This power-transform
+      family was introduced by <a href="https://arxiv.org/abs/2503.07215">Barron 2025</a>.)
+    </p>
+
+    <h3>Step 2: walk the cube</h3>
+
+    <p>
+      Now we have a number $t \in [0, 1)$. We need to turn it into a color. The choice the paper makes is
+      pleasingly geometric: visit the eight corners of the RGB cube in the order
+    </p>
+    <p class="seq">
+      black → red → yellow → green → cyan → blue → magenta → white
+    </p>
+    <p>
+      and interpolate linearly along the edges connecting consecutive corners. This traces out a path along
+      seven edges of the cube, like a tiny 3-D Hilbert curve. Divide $t$ into seven equal sub-intervals; each
+      sub-interval owns one edge.
+    </p>
+    <p>
+      Why this path? Because it's an <strong>injection</strong> — different inputs go to different outputs — and
+      because it covers a wide range of saturated, perceptually distinct colors. That matters: the model's job is
+      to <em>generate</em> these colors precisely. If two depths mapped to nearly identical colors, the model
+      would have no signal to distinguish them.
+    </p>
+
+    <div class="widget-frame" id="depth-explorer">
+      <p class="widget-title">The depth ↔ RGB bijection</p>
+      <p class="widget-sub">Drag the slider. Watch the depth value flow through the power transform, walk the
+        cube edges, and arrive at a specific RGB color.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <h3>The animation</h3>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/depth_bijection.mp4" type="video/mp4" />
+    </video>
+    <p class="video-caption">
+      The whole pipeline in motion. Notice how the cursor moves <em>much faster</em> through the colors when
+      depth is small — that's the power transform spending its dynamic range on what matters.
+    </p>
+
+    <h3>Why it's a bijection (and why that matters)</h3>
+
+    <p>
+      A bijection is a one-to-one and onto correspondence: every depth value has exactly one color, and every
+      color on the path has exactly one depth value. Both pieces are required for evaluation:
+    </p>
+    <ul>
+      <li><strong>Training:</strong> ground-truth depths get turned into target RGB images, which the generator
+        is asked to produce.</li>
+      <li><strong>Inference:</strong> the generated RGB image gets decoded back to depth values, which can be
+        compared against benchmark ground truth like NYU or ETH3D.</li>
+    </ul>
+    <p>
+      Decoding is straightforward: for each predicted pixel color, find the closest point on the seven-edge
+      path, recover $t$, and invert the power transform to get back the original distance $d$.
+    </p>
+
+    <p>
+      To make the model robust to small color drifts during generation, the authors also train on alternative
+      color maps — Plasma, Inferno, Viridis, grayscale — so that it doesn't latch onto the specific aesthetic of
+      one scheme.
+    </p>
+
+    <figure class="paper-figure depth-real">
+      <div class="row">
+        <div>
+          <img src="assets/figures/depth_real_input.jpg" alt="phone photo at Kinkaku-ji"/>
+          <p class="cap">phone photo at Kinkaku-ji</p>
+        </div>
+        <div>
+          <img src="assets/figures/depth_real_output.png" alt="Vision Banana depth prediction"/>
+          <p class="cap">Vision Banana depth</p>
+        </div>
+        <div>
+          <img src="assets/figures/depth_real_gmap.png" alt="Google Maps measurement of the same scene"/>
+          <p class="cap">Google Maps cross-check</p>
+        </div>
+      </div>
+      <figcaption>
+        One of the authors took an everyday phone photo at Kinkaku-ji, ran Vision Banana on it, decoded the
+        starred pixel's color back to a distance of <strong>13.71 m</strong>, then measured the same point on
+        Google Maps and got <strong>12.87 m</strong>. That's a 6.5% absolute relative error on a smartphone
+        shot the model had never been trained on. (Figure 7.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="segmentation">
+    <h2>4. Segmentation: color as label</h2>
+
+    <p>
+      After the depth gymnastics, segmentation is refreshing. The encoder is barely an encoder:
+      <em>paint each class a different color</em>. The model is told the color mapping in the prompt.
+    </p>
+
+    <p>
+      The paper showcases three flavors of segmentation, each with its own quirk.
+    </p>
+
+    <h3>Semantic segmentation</h3>
+    <p>
+      Every pixel gets a class label. The prompt explicitly maps each class to a color, sometimes by name
+      (<code>"cat": "red"</code>), sometimes by hex (<code>"#80C000"</code>), sometimes by RGB triples
+      (<code>&lt;255, 165, 0&gt;</code>). The model has to follow that color contract.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/semseg_input.jpg" alt="semantic seg input"/>
+      <img src="assets/figures/semseg_output.png" alt="semantic seg output"/>
+      <figcaption>
+        Prompt: <em>"Generate a semantic segmentation visualization, using this color mapping:
+        {'cat': 'red', 'lock': 'pink', 'exit sign': 'light purple', 'background': 'yellow'}."</em>
+        The cats' whiskers come out clean. (From Figure 2.)
+      </figcaption>
+    </figure>
+
+    <h3>Instance segmentation</h3>
+    <p>
+      Now the catch: the model doesn't know in advance how many instances of "garlic clove" are in the image,
+      so it can't be told the colors. Instead, the authors run inference <strong>one class at a time</strong>
+      and let the model freely assign distinct colors to each instance. At evaluation, the decoder clusters
+      pixels with similar colors.
+    </p>
+
+    <figure class="paper-figure three-up">
+      <img src="assets/figures/insseg_input.jpg" alt="instance seg input"/>
+      <img src="assets/figures/insseg_pred1.png" alt="garlic instance segmentation"/>
+      <img src="assets/figures/insseg_pred2.png" alt="beef instance segmentation"/>
+      <figcaption>
+        Same image, two prompts. Left: input. Middle: <em>"Each piece of garlic is colored differently."</em>
+        Right: <em>"Each piece of beef is colored differently."</em> The model handles both. (Figure 3.)
+      </figcaption>
+    </figure>
+
+    <h3>Referring expression segmentation</h3>
+
+    <p>
+      This is where the generative-pretraining inheritance really shines. The prompt isn't a class name —
+      it's a free-form natural language description: <em>"the man in pink t-shirt,"</em> <em>"the cat that is
+      stretching,"</em> <em>"the toaster being used as a game controller,"</em> <em>"the chef's names in Chinese
+      and English."</em> The model has to <strong>understand</strong> the language and ground it in the image,
+      then segment.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/refseg_input.jpg" alt="man in pink t-shirt input"/>
+      <img src="assets/figures/refseg_pred.png" alt="man in pink t-shirt output"/>
+      <figcaption>
+        <em>"A segmentation map image. The area that corresponds to the man in pink t-shirt is rendered solid
+        white; the other man is rendered in green."</em> The model picks the right person. (Figure 4.)
+      </figcaption>
+    </figure>
+
+    <div class="widget-frame" id="seg-encoder">
+      <p class="widget-title">Color-coded segmentation, live</p>
+      <p class="widget-sub">Click classes to recolor them, see the encoded mask change, and watch the decoder
+        recover the original mask by nearest-color clustering.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <h3>One sneaky observation</h3>
+    <p>
+      The paper notes that Vision Banana picks up referring-expression behavior <em>in tasks it was never
+      explicitly trained to do</em>. In semantic segmentation, asked to color "the patterns on the wall," it
+      complies. In instance segmentation, asked for "crescent-shaped croissants," it distinguishes them from
+      other croissant shapes. The skills cross-pollinate across task heads — which is exactly the foundation
+      model behavior the authors want to demonstrate.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="normals">
+    <h2>5. Surface normals: a vector that's already a color</h2>
+
+    <p>
+      Surface normal estimation is the geometric counterpart to depth. For each pixel, the model has to predict
+      the unit vector $(x, y, z)$ pointing perpendicular to the surface at that point. It's a window into the
+      local shape: flat walls vs. curved cups vs. tilted tabletops.
+    </p>
+
+    <p>
+      The encoder for normals is the most beautiful part of the paper, because there isn't one. Each component
+      of a unit vector is already in $[-1, 1]$. Rescale to $[0, 1]$ and you have an RGB color. Done.
+    </p>
+
+    <p>The paper uses camera-space normals with a right-handed coordinate system:</p>
+    <ul>
+      <li>$+x$: rightward → maps to <strong>red</strong></li>
+      <li>$+y$: upward → maps to <strong>green</strong></li>
+      <li>$+z$: out of the image plane (toward camera) → maps to <strong>blue</strong></li>
+    </ul>
+
+    <p>So:</p>
+    <ul>
+      <li>A surface facing <em>left</em>, $(-1, 0, 0)$: red &asymp; 0, green &asymp; 0.5, blue &asymp; 0.5
+        → <strong>pinkish red</strong></li>
+      <li>A surface facing <em>up</em>, $(0, 1, 0)$: <strong>light green</strong></li>
+      <li>A surface facing <em>the camera</em>, $(0, 0, 1)$: <strong>light blue/purple</strong></li>
+    </ul>
+
+    <div class="widget-frame" id="normal-compass">
+      <p class="widget-title">Surface normal compass</p>
+      <p class="widget-sub">Drag the arrow head on the hemisphere to point a normal vector in any direction —
+        watch its RGB encoding update live.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <figure class="paper-figure three-up">
+      <img src="assets/figures/normal_input.jpg" alt="indoor scene input"/>
+      <img src="assets/figures/normal_lotus.jpg" alt="Lotus-2 normal prediction"/>
+      <img src="assets/figures/normal_vb.jpg" alt="Vision Banana normal prediction"/>
+      <figcaption>
+        Indoor scene. Left: input. Middle: Lotus-2 (a SOTA specialist normal estimator). Right: Vision Banana.
+        Zoom in: the windows, the books, the textured wall — Vision Banana keeps the fine geometric detail
+        Lotus-2 smooths over. (From Figure 8.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="recipe">
+    <h2>6. The recipe: Vision Banana</h2>
+
+    <p>
+      With the encoders/decoders pinned down for each task, the rest of the method is short to describe.
+      The base model is Google's image generator <strong>Nano Banana Pro</strong> (NBP). Vision Banana is
+      what you get when you instruction-tune NBP on a specific mixture of data.
+    </p>
+
+    <p>The mixture:</p>
+    <ul>
+      <li>Mostly: <strong>NBP's own original training data</strong> (image generation, image editing).</li>
+      <li>Sprinkled in at a "very low ratio": <strong>vision task data</strong> — examples where the input is an
+        image and an instruction prompt, and the output is the task's encoded RGB visualization.</li>
+      <li>For 2-D tasks: <strong>in-house model annotations on web-crawled images</strong> (so labels come from
+        existing AI annotators, not human labelers).</li>
+      <li>For 3-D tasks: <strong>synthetic data from rendering engines</strong>. Zero real-world depth data, ever.</li>
+      <li>Critically: <strong>no training data from any benchmark used for evaluation</strong>. Every result
+        below is strictly zero-shot transfer.</li>
+    </ul>
+
+    <p>
+      That's it. No new architecture, no new loss, no auxiliary task. The instruction-tuning step is
+      light enough that the base model's generation capabilities — which underwent enormous pretraining — are
+      preserved nearly intact. The authors verify this with two human-evaluation benchmarks (more on this in
+      the results).
+    </p>
+
+    <aside class="callout">
+      <strong>Why "low ratio"?</strong> Instruction-tuning data tends to overwhelm pretrained behavior if you let
+      it. You can easily destroy your image generator by fine-tuning it too hard on segmentation masks — it'll
+      start outputting flat-color masks even when you ask for a photo of a beach. Keeping the new task data as a
+      <em>small fraction</em> of the mixture means the model treats vision tasks as one of many things it can
+      do, not its whole identity.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. Results: beating the specialists</h2>
+
+    <p>
+      Time for the numbers. Each row below compares Vision Banana to the best specialist model for that task.
+      Wherever Vision Banana wins, the cell is highlighted.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Capability</th><th>Benchmark &amp; Metric</th><th>Vision Banana</th><th>Best Counterpart</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="4" class="cat">2D understanding</td>
+          <td>Referring seg.: RefCOCOg val (cIoU ↑)</td>
+          <td class="win"><strong>0.738</strong></td>
+          <td>0.734 <em>(SAM 3 Agent)</em></td>
+        </tr>
+        <tr>
+          <td>Referring seg.: ReasonSeg val (gIoU ↑)</td>
+          <td class="win"><strong>0.793</strong></td>
+          <td>0.770 <em>(SAM 3 Agent)</em></td>
+        </tr>
+        <tr>
+          <td>Semantic seg.: Cityscapes val (mIoU ↑)</td>
+          <td class="win"><strong>0.699</strong></td>
+          <td>0.652 <em>(SAM 3)</em></td>
+        </tr>
+        <tr>
+          <td>Instance seg.: SA-Co/Gold (pmF₁ ↑)*</td>
+          <td>0.540</td>
+          <td class="win"><strong>0.552</strong> <em>(DINO-X)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">3D understanding</td>
+          <td>Metric depth: avg of 4 datasets (δ₁ ↑)</td>
+          <td class="win"><strong>0.929</strong></td>
+          <td>0.918 <em>(Depth Anything 3)</em></td>
+        </tr>
+        <tr>
+          <td>Surface normals: avg mean angular err. (↓)</td>
+          <td class="win"><strong>18.928</strong></td>
+          <td>19.642 <em>(Lotus-2)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Visual generation</td>
+          <td>Text-to-image: GenAI-Bench (win rate ↑)</td>
+          <td class="win"><strong>53.5%</strong></td>
+          <td>46.5% <em>(Nano Banana Pro)</em></td>
+        </tr>
+        <tr>
+          <td>Image editing: ImgEdit (win rate ↑)</td>
+          <td>47.8%</td>
+          <td class="win"><strong>52.2%</strong> <em>(Nano Banana Pro)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">*Evaluated on 500 randomly sampled queries to save compute. From Table 1 of the paper.</p>
+
+    <p>Some highlights:</p>
+    <ul>
+      <li><strong>Cityscapes:</strong> a +4.7 mIoU jump over Segment Anything Model 3, the gold-standard
+        open-vocabulary segmenter, without ever seeing Cityscapes training data.</li>
+      <li><strong>Depth:</strong> beats Depth Anything 3 on the four shared datasets — and does so without
+        camera intrinsics, while every comparable specialist uses them.</li>
+      <li><strong>Surface normals:</strong> lowest mean and median angular error on indoor scenes.</li>
+      <li><strong>Generation:</strong> Vision Banana actually <em>wins</em> the GenAI-Bench head-to-head against
+        its own base model with a 53.5% win rate — instruction-tuning didn't degrade generation, it slightly
+        improved it. Image editing is roughly a wash.</li>
+    </ul>
+    <p>
+      The one loss: instance segmentation on SA-Co/Gold, where DINO-X edges it out 0.552 to 0.540.
+      Notably, SAM 3 (which beats both) <em>was</em> trained on SA-Co, so it isn't zero-shot — when restricted
+      to zero-shot transfer, Vision Banana is competitive with the field.
+    </p>
+
+    <div class="widget-frame" id="comparison">
+      <p class="widget-title">Specialist vs. generalist, side by side</p>
+      <p class="widget-sub">Drag the divider to compare Vision Banana's outputs against specialist models on
+        actual paper figures.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/t2i_vb.jpg" alt="Vision Banana text-to-image sample"/>
+      <img src="assets/figures/t2i_nbp.jpg" alt="Nano Banana Pro text-to-image sample"/>
+      <figcaption>
+        <em>"A ghostly ship sailing on a fog-shrouded, moonlit sea."</em>
+        Left: Vision Banana. Right: Nano Banana Pro (base model). The instruction-tuning preserved generative
+        quality so well that human raters slightly prefer Vision Banana. (From Figure 9.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why it works</h2>
+
+    <p>
+      It would be easy to read this paper as "a clever output format" and move on. But the authors' deeper claim
+      — that <em>generative pretraining is the right pretraining</em> for visual understanding — deserves a
+      little intuition. Two threads in the paper, in particular, are worth pulling on.
+    </p>
+
+    <h3>Generative models learn the full data distribution</h3>
+
+    <p>
+      Many vision tasks are ambiguous. Given a flat 2-D photograph, infinitely many 3-D scenes could have
+      produced it. Reflective surfaces could be windows or paintings. The boundary between a hand and a glove is
+      where, exactly?
+    </p>
+    <p>
+      Discriminative models hate ambiguity. They want one answer. To cope, they bolt on heuristics: SAM
+      predicts <em>three</em> candidate masks per query and only computes loss against the best one. Depth
+      regressors smooth predictions until reflective surfaces become "average depth." These are workarounds.
+    </p>
+    <p>
+      Generative models love ambiguity by design. Their job, since pretraining, has been to model the full
+      distribution over plausible images given a prompt. When asked for a depth map, they don't <em>collapse</em>
+      to a blurry mean — they pick a sharp, specific, coherent depth interpretation that is consistent with
+      everything else they know about how the world looks.
+    </p>
+
+    <h3>The generator already knows a lot about the world</h3>
+
+    <p>
+      Think about what it takes to generate a believable kitchen. The model has to know that countertops are
+      flat and roughly waist-height, that cabinet doors are perpendicular to the floor, that the front of a
+      refrigerator is closer to the camera than the wall behind it, that a knife is roughly the length of a
+      forearm. This is <strong>3-D scene understanding</strong>, baked in.
+    </p>
+    <p>
+      None of that knowledge had to be acquired during the instruction-tuning. The instruction-tuning only had
+      to teach the model how to <em>read out</em> the knowledge in the format we asked for. That's why the data
+      requirements are so modest, and why a single model handles every task.
+    </p>
+
+    <h3>The unifying interface</h3>
+
+    <p>
+      There's a structural elegance here that parallels the LLM story. In language, every task you can name —
+      translation, summarization, sentiment, code, math — has a unified interface: <em>text in, text out</em>.
+      The output format varies by prompt; the model is the same.
+    </p>
+    <p>
+      In vision, the equivalent is <em>image in, image out</em>. Segmentation, depth, normals, image editing, and
+      pure generation are all the same task type from the model's perspective. They live on the same shelf. You
+      could imagine, in time, extending this to optical flow (an RGB vector field), keyframes (a stack of
+      images), or pose (a colored skeleton overlaid on the input).
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="paradigm">
+    <h2>9. What this means</h2>
+
+    <p>
+      Read in its most ambitious framing, the paper is a flag planted in the ground: <em>image generation
+      pretraining is the foundation of computer vision the way LLM pretraining is the foundation of NLP.</em>
+      The authors call this potential future <strong>Foundational Vision Models</strong> and even (somewhat
+      tongue-in-cheek) <strong>Artificial General Intelligence from Vision</strong>.
+    </p>
+
+    <p>That's a strong claim, but the evidence in the paper is the strongest we've seen so far:</p>
+    <ul>
+      <li>One model beating specialized SOTAs across 2-D and 3-D understanding.</li>
+      <li>Zero-shot transfer protocol — no benchmark training data leaked in.</li>
+      <li>Generation capability preserved (even slightly improved).</li>
+      <li>Lightweight instruction-tuning — no full re-pretraining required.</li>
+    </ul>
+
+    <h3>Open problems</h3>
+
+    <ul>
+      <li><strong>Compute.</strong> Running a frontier image generator to produce a segmentation mask is wildly
+        more expensive than a lightweight specialist. Deployment economics will need to change for this to be
+        practical at scale.</li>
+      <li><strong>Instance segmentation gap.</strong> SA-Co/Gold remains a weak spot. Per-class inference is
+        clunky, and there's room for better instance-discrimination encodings.</li>
+      <li><strong>Video.</strong> The current model is monocular images. Video generators (Veo and friends)
+        presumably encode even richer 4-D understanding. Do they unlock temporal tasks the same way?</li>
+      <li><strong>Multi-modal stacking.</strong> What happens when you sandwich a Foundational Vision Model with
+        an LLM, à la a true omni-multimodal foundation?</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+
+    <p>
+      The fundamental insight is one of those ideas that feels obvious after the fact: <em>if a model can
+      generate every possible picture, it must, in some sense, understand every possible picture</em>. The work
+      of Vision Banana is showing how to read that understanding out, one colored visualization at a time.
+    </p>
+
+    <p>
+      If the parallel to LLMs holds, the next decade of computer vision will look very different from the last
+      one. We will stop training one specialist per task. We will train one foundation model, and prompt it for
+      everything.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2604.20329" target="_blank" rel="noopener">arXiv:2604.20329</a>
+      &nbsp;·&nbsp;
+      Project page: <a href="https://vision-banana.github.io" target="_blank" rel="noopener">vision-banana.github.io</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

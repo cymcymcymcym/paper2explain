@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Learning to Discover at Test Time — an interactive explainer</title>
+  <meta name="description" content="TTT-Discover turns test-time search into test-time learning: an LLM that trains on the single problem it is trying to solve, and sets new state of the art in math, GPU kernels, algorithms and biology."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\E': '{\\mathbb{E}}',
+        '\\KL': '{\\mathrm{KL}}',
+        '\\reuse': '{\\texttt{reuse}}',
+        '\\rsota': '{r_{\\mathrm{sota}}}',
+        '\\ssota': '{s_{\\mathrm{sota}}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Learning to Discover at Test Time</h1>
+    <p class="byline">
+      Yuksekgonul, Koceja, Li, Bianchi, &hellip; Zou, Guestrin, Sun &middot;
+      Stanford / NVIDIA / UC San Diego / Together AI &middot; January 2026 &middot;
+      <a href="https://arxiv.org/abs/2601.16175" target="_blank" rel="noopener">arXiv 2601.16175</a> &middot;
+      <a href="https://github.com/test-time-training/discover" target="_blank" rel="noopener">code</a>
+    </p>
+    <p class="lede">
+      AlphaEvolve made headlines using AI to push the frontier of open math problems. But look at
+      <em>how</em> it works: it prompts a <em>frozen</em> language model thousands of times and keeps the
+      lucky guesses. The model itself never learns a thing. TTT-Discover asks a sharper question — what if
+      the model <em>trained</em> on the problem while solving it? That one change, turning test-time
+      <em>search</em> into test-time <em>learning</em>, beats AlphaEvolve on the Erdős minimum overlap
+      problem by a margin <strong>16× larger than AlphaEvolve's own improvement</strong>, makes a GPU
+      kernel <strong>2× faster than the best human expert</strong>, and would have won past AtCoder
+      contests — all with an <em>open</em> 120B model, for about <strong>$500 a problem</strong>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#section-2">Search, or learning?</a></li>
+      <li><a href="#section-3">Why standard RL is the wrong tool</a></li>
+      <li><a href="#section-4">The entropic objective</a></li>
+      <li><a href="#section-5">PUCT: what to build on</a></li>
+      <li><a href="#section-6">The full recipe</a></li>
+      <li><a href="#results">The discoveries</a></li>
+      <li><a href="#why">Why it works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/figure1.png" alt="Reward distribution of 512 solutions, evolving over test-time training steps, surpassing the best human."/>
+      <figcaption>
+        <strong>Figure 1.</strong> TTT-Discover keeps training an LLM on a single problem at test time.
+        Each curve is the reward distribution of 512 solutions sampled at training step 0, 9, 24, and 49 —
+        recorded live while training for the GPUMode TriMul kernel competition. The whole distribution
+        marches rightward and surpasses the best human. The frozen Best-of-<em>N</em> model, handed the
+        same total sampling budget, never moves.
+      </figcaption>
+    </figure>
+
+    <p>
+      Suppose you want to use AI to make a <em>discovery</em> — to find a faster algorithm, a tighter
+      mathematical bound, a better GPU kernel than anything that currently exists. By definition, that
+      answer is not in the model's training data. It is not in anyone's training data. So the model has
+      to do something genuinely hard: produce an idea that is new to the world.
+    </p>
+    <p>
+      The dominant recipe for this, popularized by DeepMind's AlphaEvolve, is <em>test-time search</em>.
+      Keep a frozen language model. Prompt it thousands of times. Store the attempts in a buffer, and use
+      hand-crafted, domain-specific heuristics — mutation, crossover, fitness — to assemble the next
+      prompt from the best ones so far. It works, and it has produced real results. But notice what is
+      missing: the model never improves. It is a student who reads the textbook, keeps guessing at the
+      hard problem, occasionally guesses well — and never internalizes a single new idea.
+    </p>
+    <p>
+      The most direct way for anything to get better is to <em>learn</em>. And across the history of AI,
+      for the hardest problems — Go, protein folding — learning has eventually superseded search. So
+      TTT-Discover does the obvious-in-hindsight thing: it keeps <em>training</em> the model, on the very
+      problem it is trying to solve. The problem is hard because it is out-of-distribution; but the
+      model's own attempts at it are a data distribution that is finally, exactly, <em>about this
+      problem</em>.
+    </p>
+    <p>
+      The catch is that doing this naïvely — "just run reinforcement learning" — quietly optimizes for
+      the wrong thing. The rest of this piece is about the two small, sharp design choices that fix that,
+      and the discoveries they unlocked.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="section-2">
+    <h2>1. Search, or learning?</h2>
+    <p>
+      To be precise about the difference, the paper casts every scientific problem as an environment — a
+      Markov decision process. A problem arrives as a text description $d$. A <strong>state</strong> $s$
+      is a candidate solution: a Triton kernel, a step function, a C++ program. An <strong>action</strong>
+      $a$ is what the model emits — some thinking tokens followed by code. The
+      <strong>transition</strong> runs or parses that code into the next state $s'$. And a
+      <strong>reward</strong> $R(s)\in\mathbb{R}$ scores it: the inverse runtime of a kernel, the bound a
+      construction certifies, a competition score, $1/\text{MSE}$ — and exactly zero if the solution
+      fails its validity checks.
+    </p>
+    <p>
+      Write $\ssota$ for the best solution anyone has so far, and $\rsota = R(\ssota)$ for its reward.
+      Then the goal has a one-line definition:
+    </p>
+    <p class="eq">$$\textbf{Discovery:}\quad \text{find a state } s \text{ with } R(s) > \rsota.$$</p>
+    <p>
+      The larger the gap $R(s) - \rsota$, the more significant the discovery. Every method in the paper —
+      baselines included — is just a different way of searching this environment for such a state.
+    </p>
+    <p>
+      There is a ladder of those methods, and all of them keep the model's weights $\theta$
+      <em>frozen</em>. The simplest, <strong>Best-of-$N$</strong>, draws $N$ independent samples from the
+      policy and keeps the best. <strong>State reuse</strong> adds a buffer $\mathcal{H}$ of past
+      solutions and warm-starts each new attempt from a promising one — and because reusing a solution
+      means the model is editing it rather than starting over, each reuse quietly adds another timestep
+      to the trajectory. <strong>State-action reuse</strong> — what AlphaEvolve calls
+      <em>evolutionary search</em> — goes further, feeding past attempts back as natural-language context
+      and steering the buffer with elaborate hand-built heuristics.
+    </p>
+    <p>
+      TTT-Discover keeps that whole loop and changes one line. After each attempt is scored and filed in
+      the buffer, the policy takes a gradient step on its own experience — the buffer of attempts has
+      quietly become a training set.
+    </p>
+    <aside class="callout">
+      <strong>Search vs. learning.</strong> Search asks: <em>given this frozen model, what is the best
+      prompt I can build?</em> Learning asks: <em>given this problem, what is the best model I can
+      build?</em> Same loop, same buffer, same compute budget — but only one of them lets the model walk
+      away changed.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="section-3">
+    <h2>2. Why standard RL is the wrong tool</h2>
+    <p>
+      Once you frame discovery as an environment, the next move looks obvious: reach for reinforcement
+      learning. The environment is a single problem; run PPO or GRPO on it; maximize expected reward.
+      This is the natural baseline — and it underperforms badly, because a discovery problem is
+      <em>not</em> a standard RL problem. Two differences matter.
+    </p>
+    <p>
+      First, the policy only has to solve <em>this one problem</em> — it never needs to generalize to
+      others. Second, and stranger: you only need <em>one</em> great solution. The policy is not the
+      prize; it is scaffolding. In ordinary RL the policy <em>is</em> the artifact, and the goal is high
+      reward <em>on average</em>, across many deployments. In discovery there is no deployment. A policy
+      can be terrible on average and still be a triumph, as long as it stumbles onto a new record once.
+    </p>
+    <p>
+      Ignore those differences and naïve RL springs three leaks:
+    </p>
+    <h3>The objective optimizes the average, not the maximum</h3>
+    <p>
+      Expected-reward RL is indifferent to records. Suppose the best known kernel runs in
+      $2000\,\mu s$. A kernel at $1900\,\mu s$ would be a genuine breakthrough; a kernel at $1990\,\mu s$
+      is a rounding error. To an objective that averages reward, those two attempts look almost
+      identical — both are "slightly better than typical." The signal that should scream <em>discovery</em>
+      is averaged into silence.
+    </p>
+    <h3>The horizon is too short</h3>
+    <p>
+      Start every attempt from a blank page and you cap how far any single attempt can reach. Reusing a
+      previous solution effectively grants extra timesteps — the model refines instead of restarting —
+      so genuinely complex solutions can accrete over many steps. Naïve RL, with its fixed
+      start-from-scratch distribution, throws that away.
+    </p>
+    <h3>Exploration collapses</h3>
+    <p>
+      Chasing expected reward, a policy learns to play it safe: reliable, decent actions beat risky ones,
+      even though it is precisely the risky actions that might land a discovery. And at the buffer level,
+      naïvely always reusing the current best over-exploits a handful of states and starves the search of
+      diversity.
+    </p>
+    <p>
+      So TTT-Discover changes exactly two things — the <strong>objective</strong> and the
+      <strong>reuse rule</strong>. The next two sections are those two changes.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="section-4">
+    <h2>3. The entropic objective</h2>
+    <p>
+      The fix for leak one is to stop maximizing the average reward and maximize a <em>soft maximum</em>
+      instead. This is the <strong>entropic objective</strong>:
+    </p>
+    <p class="eq">$$J_\beta(\theta)\;=\;\mathbb{E}_{\,s\,\sim\,\texttt{reuse}(\mathcal{H})}\Big[\;\log\;\mathbb{E}_{\,a\,\sim\,\pi_\theta(\cdot\mid s)}\big[\,e^{\beta(s)\,R(s,a)}\,\big]\;\Big]$$</p>
+    <p>
+      The inner $\log\mathbb{E}\,e^{\beta R}$ is a log-sum-exp — a knob-controlled blend of the mean and
+      the max. The knob is $\beta$. As $\beta \to 0$, the objective collapses to the ordinary expected
+      reward $\mathbb{E}[R]$. As $\beta \to \infty$, it tends to the plain $\max R$. In between, $\beta$
+      dials smoothly from "I want all my attempts to be good on average" to "I only care about my single
+      best attempt" — which, for a discovery problem, is exactly the thing you actually care about.
+    </p>
+    <p>
+      Differentiate it and the policy gradient survives almost unchanged — it is still
+      $\mathbb{E}[\,w(a)\,\nabla_\theta\log\pi_\theta(a\mid s)\,]$ — but the per-attempt weight is no
+      longer uniform:
+    </p>
+    <p class="eq">$$w_{\beta}(a)\;=\;\frac{e^{\beta R(s,a)}}{\mathbb{E}_{a'\sim\pi_\theta}\!\big[e^{\beta R(s,a')}\big]}\,,\qquad A(a)\;=\;\underbrace{w_{\beta}(a)-1}_{\text{entropic advantage}}\;-\;\lambda\,\log\frac{\pi_\theta(a\mid s)}{\pi_{\theta_0}(a\mid s)}$$</p>
+    <p>
+      At $\beta=0$ every weight is $1$ — that is plain RL, every rollout pulled on equally. As $\beta$
+      grows, the weight piles onto the top rollouts, and the gradient learns to imitate the rare great
+      attempts and ignore the merely average ones. (The $-1$ is a free baseline, since the weights
+      average to $1$; the last term is a KL leash back to the base model $\pi_{\theta_0}$.)
+    </p>
+    <p>
+      Which leaves the real question: what should $\beta$ be? A constant is brittle. Too large early in
+      training and the updates are unstable — one outlier dominates the batch. Too small late in
+      training, when every remaining improvement is tiny, and the advantages all vanish toward zero. The
+      paper's answer is to set $\beta$ <em>adaptively, per state</em>, by spending a fixed
+      <strong>information budget</strong>. Define the tilted distribution $q_\beta \propto \pi_\theta\,
+      e^{\beta R}$ — the weights above are exactly $q_\beta/\pi_\theta$ — and turn $\beta$ up only until
+      it pulls $q_\beta$ a fixed distance from the current policy:
+    </p>
+    <p class="eq">$$\text{pick }\beta(s)\ \text{ so that }\ \KL\big(q_{\beta(s)}\;\|\;\pi_\theta\big)\;=\;\gamma\,,\qquad \gamma=\ln 2.$$</p>
+    <p>
+      On a batch of rollouts this is a one-line bisection search. And it self-tunes in a satisfying way:
+      a state where every attempt scores about the same lets $\beta$ climb high (chase hard — it is safe
+      to); a state where one attempt hit a jackpot forces $\beta$ low (so a single lucky outlier cannot
+      hijack the update). It is even invariant to rescaling the reward. Slide $\beta$ below and watch the
+      gradient's attention sharpen from a flat average onto the best attempts.
+    </p>
+
+    <div class="widget-frame" id="entropic-widget">
+      <p class="widget-title">The entropic objective</p>
+      <p class="widget-sub">16 attempts, one initial state. Slide β — or let the KL budget pick it — and watch the gradient's weights move from a flat average to the single best attempt.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="section-5">
+    <h2>4. PUCT: what to build on</h2>
+    <p>
+      The objective fixes <em>how the model learns from a batch</em>. The reuse rule fixes the other two
+      leaks — horizon and exploration — by answering a different question: of all the solutions in the
+      buffer, <em>which one do you hand the model to build on next?</em>
+    </p>
+    <p>
+      TTT-Discover borrows the selection rule from AlphaZero — <strong>PUCT</strong> — and points it at
+      the archive $\mathcal{H}$ of every solution found so far. Each state $s$ gets a score:
+    </p>
+    <p class="eq">$$\operatorname{score}(s)\;=\;\underbrace{Q(s)}_{\text{exploit}}\;+\;\underbrace{c\cdot\text{scale}\cdot P(s)\cdot\frac{\sqrt{1+T}}{1+n(s)}}_{\text{explore}}$$</p>
+    <p>
+      The first term is exploitation: $Q(s)$ is the <em>best</em> reward ever reached by building on $s$.
+      Not the average — and that is a deliberate break from AlphaZero, which averages over a state's
+      outcomes. What matters for a discovery is the best result reachable from a state, not the typical
+      one. A single brilliant descendant should make its parent attractive, even if every other
+      descendant flopped.
+    </p>
+    <p>
+      The second term is exploration. $P(s)$ is a prior favoring high-reward states — a rank-based prior
+      encoding a simple bet: a fast kernel is more likely to seed an even faster one than a slow kernel
+      is. The $\sqrt{1+T}/(1+n(s))$ factor is the curiosity bonus: it decays as a state $s$ (and its
+      descendants) gets expanded $n(s)$ times, so the search keeps drifting back to under-visited
+      candidates instead of grinding one lineage forever. The coefficient $c$ sets the balance.
+    </p>
+    <p>
+      This is what extends the horizon — every reuse is another timestep on a solution's trajectory — and
+      what keeps exploration alive at the buffer level. Slide $c$ in the widget: at $c=0$ the search
+      fixates on whatever currently looks best; turn $c$ up and it spreads its bets and tends to find
+      more.
+    </p>
+
+    <div class="widget-frame" id="puct-widget">
+      <p class="widget-title">PUCT over the solution buffer</p>
+      <p class="widget-sub">An archive of candidate solutions. Set the exploration coefficient c, then expand states and watch PUCT trade off "build on the best" against "try something under-explored".</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="section-6">
+    <h2>5. The full recipe</h2>
+    <p>
+      That is the whole method. The loop is the familiar search loop; the two new pieces are
+      <code>train</code> — an entropic-objective gradient step — and <code>reuse</code> — PUCT over the
+      buffer.
+    </p>
+
+    <pre class="code"><code>H ← { (∅, R(∅)) }                  # buffer, seeded with the trivial solution
+for i = 0 … N−1:
+    s, c  ← PUCT(H)                # reuse: pick a state to build on
+    a     ← π_θ( · | d, s, c)      # the policy proposes thinking tokens + code
+    s′    ← T(a)                   # run / parse the code → a new candidate
+    r     ← R(s′)                  # score it against the environment
+    H     ← H ∪ { (s, a, s′, r) }  # file the attempt in the buffer
+    θ     ← θ + η · ∇ J_β(θ)       # train: one entropic gradient step
+return  the s′ with the highest reward r ever seen</code></pre>
+
+    <p>
+      The animation below is that loop running on the GPUMode TriMul kernel competition. Each step draws
+      512 solutions; their reward distribution is the curve. As the policy trains, the distribution does
+      not just grow a lucky tail — the <em>whole thing</em> shifts right, sharpens, and crosses the best
+      human. A frozen model handed the identical sampling budget stays exactly where it started.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/reward_march.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The reward distribution of 512 attempts per step, marching past the best-human line over 50 steps of
+      test-time training. Search keeps the model still; learning moves it.
+    </p>
+
+    <p>
+      The implementation is deliberately unglamorous. The model is <strong>gpt-oss-120b</strong> — an
+      <em>open</em> 120B model — fine-tuned with a rank-32 LoRA adapter through Tinker, Thinking Machines'
+      training API. A run is 50 steps; each step samples 512 rollouts (8 groups of 64, every group
+      sharing one PUCT-selected state) and takes a single gradient step. No reward shaping, no
+      task-specific schedule, no human in the optimization loop. Total cost: <strong>around $500 per
+      problem</strong>. AlphaEvolve's headline results, by contrast, leaned on closed Gemini frontier
+      models.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>6. The discoveries</h2>
+    <p>
+      The authors report every problem they attempted — across mathematics, GPU kernels, competitive
+      programming, and biology — and TTT-Discover set a new state of the art in almost all of them.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Domain</th><th>Benchmark</th><th>TTT-Discover</th><th>Best prior result</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Mathematics</td>
+          <td>Erdős minimum overlap (↓)</td>
+          <td class="win"><strong>0.380876</strong></td>
+          <td>0.380924 <em>(AlphaEvolve)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">GPU kernels</td>
+          <td>TriMul, A100 (↓)</td>
+          <td class="win"><strong>2198 μs</strong></td>
+          <td>4531 μs <em>(best human)</em></td>
+        </tr>
+        <tr>
+          <td>TriMul, H100 (↓)</td>
+          <td class="win"><strong>1161 μs</strong></td>
+          <td>1371 μs <em>(best human)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Algorithms</td>
+          <td>AtCoder AHC039 (↑)</td>
+          <td class="win"><strong>567,062</strong></td>
+          <td>566,997 <em>(best human)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Biology</td>
+          <td>Single-cell denoising (↑)</td>
+          <td class="win"><strong>0.71</strong></td>
+          <td>0.64 <em>(MAGIC, best human)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Headline results from Figure 1 of the paper. All achieved with the open gpt-oss-120b model.</p>
+
+    <h3>Mathematics: a 70-year-old problem, an asymmetric answer</h3>
+    <p>
+      The <strong>Erdős minimum overlap problem</strong>, posed in 1955, asks you to split
+      $\{1,\dots,2n\}$ into two equal halves so as to minimize the worst-case overlap of their difference
+      sets, and to pin down the limiting constant $c$. You certify an upper bound by constructing a step
+      function. The best human bound stood at $0.380927$; AlphaEvolve, with frontier models, nudged it to
+      $0.380924$. TTT-Discover reached <strong>0.380876</strong> — an improvement
+      <strong>16× larger</strong> than AlphaEvolve's improvement over the previous record. Its
+      construction is also qualitatively different: a 600-piece <em>asymmetric</em> step function, where
+      every prior solution had been symmetric.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/erdos_comparison.png" alt="Three step functions: the human 51-piece, AlphaEvolve's 95-piece symmetric, and TTT-Discover's 600-piece asymmetric construction."/>
+      <figcaption>
+        <strong>Figure 2.</strong> Step-function constructions for the Erdős minimum overlap problem.
+        Left: the best human result (51 pieces). Middle: AlphaEvolve's prior state of the art (95 pieces,
+        symmetric). Right: TTT-Discover's new record — a jagged, 600-piece, <em>asymmetric</em>
+        construction no human or prior system had found.
+      </figcaption>
+    </figure>
+
+    <p>
+      On the <strong>first autocorrelation inequality</strong> the story repeats: a new bound
+      $C_1 \le 1.50286$ from a 30,000-piece construction, found from scratch, beating the concurrent
+      ThetaEvolve's 1,319-piece refinement. What is striking is the <em>trajectory</em> of the discovery
+      — visible in the buffer as the model trained. Early gains came from gradient descent; the next from
+      switching to linear programming; the record-setting steps from a heuristic the model invented
+      itself, focusing optimization only on the constraints that were nearly tight. The authors note they
+      never once intervened in that process. Equally honestly, they report a problem where it
+      <em>did not</em> work — the second autocorrelation inequality — where TTT-Discover fell just short
+      of AlphaEvolve. And a control worth noting: swapped onto the much weaker Qwen3-8B, TTT-Discover
+      still out-discovered the concurrent ThetaEvolve — which ran a stronger model variant and a larger
+      sampling budget.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/ac1_overlay.png" alt="Step functions and autoconvolutions for AlphaEvolve, ThetaEvolve and TTT-Discover on the first autocorrelation inequality."/>
+      <figcaption>
+        <strong>Figure 3.</strong> The first autocorrelation inequality: step functions (top) and their
+        autoconvolutions (bottom). AlphaEvolve and ThetaEvolve share a 1,319-piece construction;
+        TTT-Discover found a far finer 30,000-piece one, certifying $C_1 \le 1.50286$.
+      </figcaption>
+    </figure>
+
+    <h3>GPU kernels: 2× faster than the best human expert</h3>
+    <p>
+      The <strong>TriMul</strong> task — triangular matrix multiplication, a core primitive in
+      AlphaFold — is a live GPUMode competition with leaderboards full of expert submissions.
+      TTT-Discover, trained against H100 runtime alone, produced kernels that took the top spot on
+      <em>every</em> GPU: A100, H100, B200, and AMD's MI300X — uniformly more than 15% faster than the
+      best human, and on the A100 a full 2× faster.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>TriMul kernel (↓, μs)</th><th>A100</th><th>H100</th><th>B200</th><th>MI300X</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Best human</td>
+          <td>4531</td><td>1371</td><td>1039</td><td>2516</td>
+        </tr>
+        <tr>
+          <td class="cat">Best-of-25600</td>
+          <td>9220</td><td>5390</td><td>3255</td><td>4902</td>
+        </tr>
+        <tr>
+          <td class="cat">TTT-Discover</td>
+          <td class="win"><strong>2198</strong></td>
+          <td class="win"><strong>1161</strong></td>
+          <td class="win"><strong>914</strong></td>
+          <td class="win"><strong>1556</strong></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Table 4 of the paper. Best-of-25600 uses the same model and sampling budget as TTT-Discover, but never trains.</p>
+
+    <p>
+      The kernels are not magic — they are good engineering, found automatically. TTT-Discover correctly
+      diagnosed TriMul as <em>memory-bound</em>: a chain of small elementwise operations, each paying a
+      round-trip to slow GPU memory. So its kernels fuse those operations — the input LayerNorm, the
+      sigmoid gating, the output LayerNorm and gating — collapsing many memory round-trips into one. For
+      the one genuinely compute-heavy step, the $O(N^3)$ matmul, they cast to FP16 and hand it to
+      cuBLAS to ride the TensorCores.
+    </p>
+    <aside class="callout">
+      <strong>Not the authors grading their own homework.</strong> The GPUMode competition organizers
+      reviewed the kernels and signed off. Their assessment: TTT-Discover's strategy mirrors what the
+      strongest human competitors do — but, in their words, <em>"executed better"</em>, because most
+      human entries miss some of the harder fusion opportunities.
+    </aside>
+    <p>
+      Toggle the optimizations below and watch the runtime fall — you need every one of them to clear the
+      human line.
+    </p>
+
+    <div class="widget-frame" id="kernel-widget">
+      <p class="widget-title">Building the TriMul kernel</p>
+      <p class="widget-sub">Fuse the memory-bound elementwise stages, and delegate the big matmul to FP16 + cuBLAS. Each toggle cuts runtime — but only all four together beat the best human.</p>
+    </div>
+
+    <p>
+      The remaining domains round out the picture. On two past <strong>AtCoder</strong> heuristic
+      contests — a geometry problem and a scheduling problem — TTT-Discover's programs would have placed
+      <strong>first</strong> in both, ahead of every human and of AI systems built on Gemini and GPT
+      ensembles. On a <strong>single-cell RNA denoising</strong> benchmark it lifted the score from 0.64
+      to 0.71, though here the authors add a careful disclaimer: a benchmark metric is not the same thing
+      as biological truth.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>7. Why it works</h2>
+    <p>
+      The cleanest evidence is the ablation. On the TriMul competition, the authors knocked out one piece
+      of TTT-Discover at a time. Read the table from the bottom up — it is a short, sharp story.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Configuration</th><th><code>train</code></th><th><code>reuse</code></th><th>Best runtime (↓, μs)</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Best human kernel</td>
+          <td>—</td><td>—</td><td>1371</td>
+        </tr>
+        <tr>
+          <td class="cat">TTT-Discover</td>
+          <td>entropic, adaptive β</td><td>PUCT</td>
+          <td class="win"><strong>1203</strong></td>
+        </tr>
+        <tr>
+          <td class="cat">− adaptive β</td>
+          <td>entropic, constant β</td><td>PUCT</td><td>1484</td>
+        </tr>
+        <tr>
+          <td class="cat">− entropic objective</td>
+          <td>expected reward</td><td>PUCT</td><td>1986</td>
+        </tr>
+        <tr>
+          <td class="cat">− learning</td>
+          <td>no training</td><td>PUCT</td><td>2061</td>
+        </tr>
+        <tr>
+          <td class="cat">− PUCT</td>
+          <td>entropic, adaptive β</td><td>ε-greedy</td><td>1329</td>
+        </tr>
+        <tr>
+          <td class="cat">− reuse</td>
+          <td>entropic, adaptive β</td><td>none</td><td>5274</td>
+        </tr>
+        <tr>
+          <td class="cat">Naïve test-time RL</td>
+          <td>expected reward</td><td>none</td><td>5329</td>
+        </tr>
+        <tr>
+          <td class="cat">Best-of-N</td>
+          <td>no training</td><td>none</td><td>5352</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Table 5 of the paper — best kernel runtime on H100 per ablation, all matched to the same sampling budget.</p>
+
+    <h3>Reuse is the engine</h3>
+    <p>
+      Look at what happens when you remove reuse: every method collapses to roughly $5300\,\mu s$ —
+      nowhere near the $1371\,\mu s$ human, regardless of how cleverly it trains. With no buffer to build
+      on, the horizon is one attempt long, and one attempt is simply not enough room to construct a kernel
+      this good. Reuse is what lets a solution accrete over dozens of timesteps. It is the single
+      load-bearing component.
+    </p>
+    <h3>The entropic objective is what makes learning bite</h3>
+    <p>
+      Reuse alone is not enough either. With PUCT but no training at all, you get $2061\,\mu s$ — still
+      behind the human. Add training, but with the ordinary expected-reward objective, and you reach only
+      $1986\,\mu s$: a policy averaging its rewards barely notices the rare great kernels. Swap in the
+      entropic objective and the run finally clears the human line at $1203\,\mu s$. The objective is what
+      converts "the model is learning" into "the model is learning the right thing."
+    </p>
+    <h3>The whole distribution moves</h3>
+    <p>
+      Best-of-25600 — the same model, the same total budget, no learning — never gets close. And the
+      reward distributions show why this is not luck: TTT-Discover does not merely grow a fortunate tail,
+      it drags the entire distribution upward, step after step. The model is genuinely getting better at
+      the problem.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/reward_stats_trimul.png" alt="Reward distributions over training steps for each ablation configuration."/>
+      <figcaption>
+        <strong>Figure 4.</strong> Reward distributions across training steps for each ablation, all on
+        the same sampling budget. Only the full TTT-Discover — entropic objective plus PUCT reuse — sweeps
+        the whole distribution toward higher reward.
+      </figcaption>
+    </figure>
+
+    <div class="widget-frame" id="ablation-widget">
+      <p class="widget-title">Ablation explorer</p>
+      <p class="widget-sub">Pick a train method and a reuse rule. See the best runtime each combination reached — and how far it lands from the best human.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>8. What it means</h2>
+    <p>
+      The quiet claim in this paper is a shift in where the leverage lives. The reigning recipe for
+      AI-driven discovery treats the language model as a fixed oracle and gets ever more clever about how
+      to <em>prompt</em> it. TTT-Discover treats the problem itself as a tiny, bespoke training set, and
+      gets the model to <em>learn</em> from it. The loop and the budget are nearly the same; the
+      difference is whether the model is allowed to change.
+    </p>
+    <p>
+      And it turns out that, for these problems, the model is where the leverage was hiding. An open 120B
+      model, for a few hundred dollars, beat systems built on closed frontier models — not because it is
+      a better model, but because it was trained on the one problem that mattered. Search scales with
+      compute; so does learning; but on the hardest problems, learning has a way of winning.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Continuous rewards only.</strong> The entropic objective needs a graded reward signal
+        — a runtime, a bound, a score. Problems with sparse or binary rewards, or non-verifiable goals,
+        are out of reach for now. The authors call this the most important direction for future work.</li>
+      <li><strong>You pay per problem.</strong> The trained policy is scaffolding, not a deliverable —
+        it does not transfer. Every new problem is a fresh $500 run. Cheap for a research result;
+        an open question at the scale of "discovery as a service."</li>
+      <li><strong>Benchmarks are not the world.</strong> The biology result comes with the authors' own
+        warning: optimizing a denoising metric is not the same as advancing biology. A reward function
+        is a proxy, and a learner this determined will exploit every gap between the proxy and the goal.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      A hard problem is hard because it lies outside what the model already knows. The reflex is to
+      search harder around a frozen model. TTT-Discover's answer is simpler and, in hindsight, more
+      obvious: let the model's own attempts at the problem become its training data, design the
+      objective to chase records rather than averages, and the reuse rule to keep building. The result is
+      not a smarter model — it is the <em>same</em> model, briefly, deliberately, taught one new thing.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2601.16175" target="_blank" rel="noopener">arXiv:2601.16175</a>
+      &nbsp;·&nbsp; Code: <a href="https://github.com/test-time-training/discover" target="_blank" rel="noopener">test-time-training/discover</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

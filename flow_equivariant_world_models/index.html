@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flow Equivariant World Models — an interactive explainer</title>
+  <meta name="description" content="An interactive, beginner-friendly explainer of Flow Equivariant World Models: how to give a world model a memory that flows in unison with the world, so partially observed dynamics stay consistent over hundreds of timesteps."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Flow Equivariant World Models</h1>
+    <p class="byline">
+      Lillemark, Huang, Zhan, Du, Keller &middot; Harvard / UCSD / CMU &middot; January 2026 &middot;
+      <a href="https://arxiv.org/abs/2601.01075" target="_blank" rel="noopener">arXiv 2601.01075</a>
+      &middot; <a href="https://flowequivariantworldmodels.github.io" target="_blank" rel="noopener">project page</a>
+    </p>
+    <p class="lede">
+      Modern video world models learn motion from scratch every time. Pan a camera, and the model has to
+      relearn that "panning right" shifts pixels left. Turn around in a room, and any object that left the
+      view is forgotten — the model freely hallucinates a new scene when you look back. FloWM fixes this by
+      <em>building the symmetry in</em>: both self-motion and the motion of unseen objects become
+      one-parameter Lie-group <strong>flows</strong>, and the latent map is constructed to flow in unison
+      with the world. The payoff is dramatic. On 2D MNIST-World rollouts, FloWM lands an MSE of
+      <strong>0.0018</strong> at 150 steps where the strongest diffusion baseline gets <strong>0.21</strong>
+      — a 100× gap, generalizing 7.5× beyond the training horizon.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook: a ball you can't see</a></li>
+      <li><a href="#why-models-fail">Why current video models fail at this</a></li>
+      <li><a href="#flows">Flows: motion as a one-parameter group</a></li>
+      <li><a href="#equivariance">Flow equivariance, in one line</a></li>
+      <li><a href="#velocity-channels">Velocity channels: a memory for each possible motion</a></li>
+      <li><a href="#self-motion">Self-motion equivariance: living in the agent's frame</a></li>
+      <li><a href="#instantiations">Two instantiations: 2D conv-RNN and 3D ViT</a></li>
+      <li><a href="#results">Results: 100× gap and 7× length generalization</a></li>
+      <li><a href="#why">Why it works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/intuition_3d.png" alt="A 3D agent observes a ball, turns away, and turns back. FloWM remembers; existing work hallucinates."/>
+      <figcaption>
+        An agent observes a moving ball, turns away (the ball keeps moving), then turns back. FloWM has
+        silently flowed its latent memory in unison with the world, so the ball is right where it should
+        be. Existing video models hallucinate a new scene. <em>(Figure 1.)</em>
+      </figcaption>
+    </figure>
+
+    <p>
+      An agent walks into a room. There is a yellow ball drifting across the floor. The agent watches it
+      for a moment, then turns to look at the opposite wall. Five seconds later, the agent turns back.
+      Where is the ball now?
+    </p>
+
+    <p>
+      Any human, with no special training, predicts the answer with ease. The ball drifted at some
+      velocity for some amount of time, so it's now somewhere else along the same line. We can do this
+      because the part of our brain that holds "the world" doesn't get switched off when our eyes turn.
+      It keeps integrating the world's dynamics, including the dynamics of things outside the field of
+      view. When we look back, we already <em>know</em>.
+    </p>
+
+    <p>
+      Modern video diffusion models have no such organ. They are big sequence transformers that look at
+      the last N frames in a sliding window and predict the next frame. When the ball leaves the window
+      — by leaving the view, or simply by being too far in the past — it's gone. Turn back, and the model
+      will cheerfully draw <em>a different ball, somewhere else, possibly a different color</em>. It has
+      no way to integrate dynamics that aren't currently in its receptive field, because nothing in the
+      architecture corresponds to "the world as it is now, including the parts I can't see."
+    </p>
+
+    <p>
+      Flow Equivariant World Models (FloWM) is a clean architectural answer to this problem. Instead of
+      hoping a big transformer learns the right invariances from billions of frames, the model is
+      <em>built</em> so that its latent state literally flows in step with the world. Motion of the agent
+      and motion of external objects are unified as <strong>flows on a Lie group</strong> — the same
+      mathematical object — and the network is forced to be equivariant to both. The result is a memory
+      that stays calibrated over hundreds of timesteps without retraining, and a stark empirical gap over
+      every diffusion baseline the authors test.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why-models-fail">
+    <h2>1. Why current video models fail at this</h2>
+
+    <p>
+      Before the trick, a quick honest tour of what today's "long-context video models" actually do. The
+      authors compare against two strong baselines: a History-Guided Diffusion Forcing transformer
+      ("DFoT"), and a memory-augmented variant that stacks a Mamba-style state-space model on top
+      ("DFoT-SSM"). Neither is a strawman — both are recent, large, action-conditioned video diffusion
+      models specifically designed for autoregressive rollouts.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/model_comparisons.png" alt="Four world-model architectures: sliding window, no memory, SSM memory, FloWM"/>
+      <figcaption>
+        Four ways a model can try to predict the next frame given a long past. <strong>(a)</strong> A
+        sliding-window transformer simply drops old frames. <strong>(b)</strong> Putting past frames in
+        the context is no help if the model has no way to compose them with current dynamics.
+        <strong>(c)</strong> An SSM memory is just a bag of past observations — it has no notion of
+        <em>where</em> in the world they live, so once the agent moves it can't update them.
+        <strong>(d)</strong> FloWM's memory is a spatial latent map that is rotated and translated by the
+        agent's action $a_t$ <em>and</em> by an internal flow $\psi_1(\nu)$ on every step. <em>(Figure 2.)</em>
+      </figcaption>
+    </figure>
+
+    <p>
+      The deep problem is not "the window is too short." It's that <em>none of these architectures has a
+      slot in its latent state that corresponds to a particular point in the world</em>. When the
+      transformer sees frame $f_t$, the patch tokens are in the agent's image coordinates — pixel
+      $(50, 100)$ of the camera. They are not in world coordinates. So when the agent turns, the same
+      patch of wall ends up in a different token slot. The model has to learn, from data, that these two
+      tokens "are the same wall." With enough data and enough parameters it can fake this — for short
+      rollouts. But the moment the wall leaves the context window, the binding is lost.
+    </p>
+
+    <p>
+      The DFoT-SSM extension makes the context effectively infinite by routing all past observations
+      through a recurrent memory. But the memory has no spatial structure. It's a flat vector that gets
+      updated on every step. When the agent moves left, the memory has no way to "shift right" to keep
+      pointing at the same world location, because nothing in the memory corresponds to a location at
+      all. Adding more memory cells doesn't help; the model is missing a different kind of structure.
+    </p>
+
+    <aside class="callout">
+      <strong>The diagnostic that the paper is right.</strong> Watching the failure modes in the
+      experiments, DFoT-SSM's predictions don't just degrade — they degrade in a <em>specific</em> way.
+      MNIST digits slowly fade to black. Blocks pile up in random positions. The model isn't "running
+      out of compute"; it's running out of a place to put the information.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="flows">
+    <h2>2. Flows: motion as a one-parameter group</h2>
+
+    <p>
+      The first conceptual move is to stop thinking of "motion" as a special thing that happens to videos,
+      and start thinking of it as <strong>a group element parameterized by time</strong>. This is the
+      perspective of Lie theory, and it turns out to be exactly what a world model needs.
+    </p>
+
+    <p>
+      Take a velocity, say "drift right at 0.1 units per timestep." Call it $\nu$. After $t$ timesteps,
+      this velocity has carried any object through the spatial transformation "translate right by
+      $0.1 \cdot t$." That transformation is an element of the 2D translation group $G$. As $t$ ranges
+      over the real line, you get a smooth curve of group elements:
+    </p>
+
+    <p class="eq">$$ \psi_t(\nu) \;:\; \mathbb{R} \times \mathfrak{g} \to G $$</p>
+
+    <p>
+      This curve is called the <strong>flow generated by $\nu$</strong>. It's a one-parameter subgroup of
+      $G$, and the velocity $\nu$ is an element of the Lie algebra $\mathfrak{g}$ — informally, the
+      "tangent direction" at the identity. Translations, rotations, scalings, and many more
+      transformations of interest are all flows of this form. The key property is composition:
+      $\psi_{t_1}(\nu) \cdot \psi_{t_2}(\nu) = \psi_{t_1 + t_2}(\nu)$. Two seconds of drift followed by
+      three seconds of drift equals five seconds of drift.
+    </p>
+
+    <p>
+      Why does this matter for world modeling? Because it gives us a way to talk about the motion of
+      external objects, the self-motion of the agent, and the structure of the latent memory <em>in a
+      single language</em>. They are all flows. The agent's leftward step is $\psi_1(a_t)$. The ball's
+      drift is $\psi_1(\nu)$. The latent map's update is also a flow. The Lie algebra elements compose
+      additively ($\nu_1 + \nu_2$), so multiple simultaneous motions stack naturally.
+    </p>
+
+    <p>
+      With this vocabulary in hand, we can ask a precise question about the model: what should happen to
+      its output when we apply a flow to its input?
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="equivariance">
+    <h2>3. Flow equivariance, in one line</h2>
+
+    <p>
+      Group equivariance is a venerable idea: a function $\phi$ is equivariant if transforming the input
+      by some $g \in G$ produces the same output as transforming the output by $g$:
+    </p>
+
+    <p class="eq">$$ \phi(g \cdot f) = g \cdot \phi(f), \quad \forall g \in G. $$</p>
+
+    <p>
+      The classic example is a translation-equivariant convolution: shift the input image right by 5
+      pixels, and the output feature map shifts right by 5 pixels too. Equivariance is structurally
+      stronger than invariance, because it preserves where things are rather than throwing that
+      information away.
+    </p>
+
+    <p>
+      <strong>Flow equivariance</strong> generalizes this to sequence-to-sequence models. A model $\Phi$
+      mapping $(f_0, \dots, f_T) \mapsto (y_0, \dots, y_T)$ is flow equivariant if applying a flow
+      $\psi_t(\nu)$ to the input sequence produces the same flow applied to the output sequence, frame
+      by frame:
+    </p>
+
+    <p class="eq">$$ \Phi\!\left(\{\psi_i(\nu) \cdot f_i\}_{i=0}^T\right)_t \;=\; \psi_t(\nu) \cdot \Phi\!\left(\{f_i\}_{i=0}^T\right)_t, \quad \forall t. $$</p>
+
+    <p>
+      In words: if every input frame at time $i$ has been pushed by $i$ timesteps of velocity $\nu$, then
+      the output at time $t$ should equal the output you would have computed without the flow, but then
+      pushed by $t$ timesteps of $\nu$. The model's predictions stay in step with the world's motion,
+      automatically.
+    </p>
+
+    <p>
+      This is a beautifully strong constraint. It says the model cannot get "out of sync" with the world's
+      dynamics — not for one velocity, not for ten thousand. The architecture either has this property
+      or it doesn't, and you can read it off the weights without running a single experiment.
+    </p>
+
+    <aside class="callout">
+      <strong>A subtlety for partially observable worlds.</strong> In a real world model, we don't see
+      the full state; we see an observation $f_i = \mathcal{O}(w_i)$ where $w_i$ is the world state.
+      Objects can move while we aren't looking. The paper extends flow equivariance to act on the world
+      state directly, not the observation, so that "the ball drifted while I was looking away" is a
+      valid input the model must equivary to. This is mostly a formality, but it's why the framework
+      makes sense for partial observability at all.
+    </aside>
+
+    <p>
+      Now we have the goal: construct a sequence model whose architecture <em>guarantees</em>
+      Equation&nbsp;(3) holds. The next two sections walk through the two ingredients FloWM uses to get
+      there.
+    </p>
+
+    <div class="widget-frame" id="flow-composition">
+      <p class="widget-title">Flow composition, live</p>
+      <p class="widget-sub">Pick an internal flow velocity $\nu$ (the channel's "guess" about object
+        motion) and an agent action $a_t$ (the agent's self-motion). See the combined flow
+        $\psi_1(\nu - a_t)$ that actually updates the latent memory. Notice that when $\nu = a_t$, the
+        memory doesn't move at all — exactly when the object is moving with the agent.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="velocity-channels">
+    <h2>4. Velocity channels: a memory for each possible motion</h2>
+
+    <p>
+      Here's a puzzle. You're a recurrent model, and you want to be flow equivariant to <em>any</em>
+      velocity $\nu$ an object could have. But at observation time, you don't know which velocity the
+      object is moving at — you just see a frame. How can you commit to flowing the memory at the right
+      rate?
+    </p>
+
+    <p>
+      The Flow Equivariant RNN trick: don't commit. Have one hidden state for each candidate velocity,
+      and let them all flow in parallel. The hidden state $h_t$ becomes a stack of "velocity channels"
+      $h_t(\nu)$, one per $\nu$ in a discrete grid $V$. Each channel is updated by its own flow:
+    </p>
+
+    <p class="eq">$$ h_{t+1}(\nu) \;=\; \sigma\!\left(\psi_1(\nu) \cdot h_t(\nu) + f_t\right) $$</p>
+
+    <p>
+      Whenever a new observation $f_t$ arrives, the encoder writes it (the same content) into all
+      velocity channels — the "trivial lift" condition. Then each channel evolves at its own rate. After
+      a few steps, the channel whose $\nu$ matches the object's true velocity stays aligned with the
+      object's actual position; the others drift away.
+    </p>
+
+    <p>
+      The magic is that you don't need to know the true velocity in advance. The right channel
+      <em>self-organizes</em> through training: the decoder learns to read from whichever channel is
+      currently consistent with the observation, typically via a max-pool over velocity channels at the
+      readout. The reader of this blog is welcome to find this beautiful; the authors of the paper
+      certainly did.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/model_2d_recurrence.png" alt="The 2D conv-RNN recurrence diagram showing velocity channels"/>
+      <figcaption>
+        The Simple Recurrent FloWM. Three velocity channels (rows: rightward $\nu = \rightarrow$,
+        stationary $\nu = \circ$, leftward $\nu = \leftarrow$) each get pre-multiplied by the combined
+        flow $\psi_1(\nu - a_t)$. The blue dashed window is what the agent can actually see; everything
+        outside flows around in the latent map. <em>(Figure 3.)</em>
+      </figcaption>
+    </figure>
+
+    <p>
+      When you also let the input flow — i.e., the agent itself moves, applying $\psi(\hat{\nu})$ to the
+      input sequence — the hidden state's velocity channels <em>permute</em> by the difference between
+      the channel's velocity and the input's velocity:
+    </p>
+
+    <p class="eq">$$ h_t\!\left[\psi(\hat{\nu}) \cdot f\right](\nu) \;=\; \psi_{t-1}(\hat{\nu}) \cdot h_t[f](\nu - \hat{\nu}). $$</p>
+
+    <p>
+      This is the technical reason the architecture works. The Lie-algebra additivity ($\nu - \hat{\nu}$)
+      is the entire reason a single set of weights can handle the cartesian product of all object
+      motions with all agent motions.
+    </p>
+
+    <div class="widget-frame" id="velocity-channels-demo">
+      <p class="widget-title">Velocity channels in action</p>
+      <p class="widget-sub">An object moves with an unknown true velocity $\nu^\star$. Watch how each
+        velocity channel "carries" the object in its own direction. Only the channel whose $\nu$ matches
+        $\nu^\star$ keeps the object pinned at its true location after $t$ steps; the other channels
+        drift away.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="self-motion">
+    <h2>5. Self-motion equivariance: living in the agent's frame</h2>
+
+    <p>
+      External object motion is now handled. What about the agent's own motion?
+    </p>
+
+    <p>
+      The FloWM observation: <em>motion is relative</em>. From the agent's reference frame, the agent
+      stepping left is identical to the entire world stepping right. So we can use the same flow
+      machinery to handle self-motion — with one important advantage. The agent's action $a_t$ is
+      <em>known</em>; we don't have to guess which channel to use. We can just apply the action's flow
+      directly.
+    </p>
+
+    <p>
+      The combined recurrence relation, as a single self-motion flow-equivariant update:
+    </p>
+
+    <p class="eq">$$ \underbrace{h_{t+1}(\nu)}_{\text{next latent}} \;=\; \underbrace{T_{a_t}^{-1}}_{\text{self-action transform}} \;\underbrace{\psi_1(\nu)}_{\text{internal flow}}\; \cdot \; \underbrace{\mathrm{U}_\theta}_{\text{memory update}}\!\Bigl[\,\underbrace{h_t(\nu)}_{\text{prior latent}};\; \underbrace{E_\theta[f_t, h_t](\nu)}_{\text{encoder output}}\,\Bigr]. $$</p>
+
+    <p>
+      Stare at this for a moment. The encoder $E_\theta$ takes the current frame and the previous
+      hidden state and produces a per-channel update. The update operator $U_\theta$ combines it with
+      the prior hidden state. Then two flows are applied: $\psi_1(\nu)$ is the internal flow for the
+      $\nu$-channel (external object motion guess), and $T_{a_t}^{-1}$ is the inverse of the action's
+      flow in the latent space (compensating for the agent's own self-motion).
+    </p>
+
+    <p>
+      When the action group is 2D translation, the action transform $T_{a_t}^{-1}$ is itself a flow
+      $\psi_1(-a_t)$, and by Lie algebra additivity the two flows merge into a single combined
+      $\psi_1(\nu - a_t)$:
+    </p>
+
+    <p class="eq">$$ h_{t+1}(\nu) \;=\; \psi_1(\nu - a_t)\,\cdot\,\sigma\!\left(\mathcal{W}\!\star h_t(\nu) + \mathrm{pad}\bigl(\mathcal{U}\!\star f_t\bigr)\right) $$</p>
+
+    <p>
+      This is the entire recurrence relation for the 2D Simple Recurrent FloWM. Two convolutions, a
+      nonlinearity, and a flow. The blue dashed window in the figure above is where the encoder
+      <em>writes</em> the observation; the rest of the spatial extent of $h_t$ is "the world outside the
+      agent's view," continuously flowing under $\psi_1(\nu - a_t)$ even though no observation is
+      driving it.
+    </p>
+
+    <p>
+      The closure property of group operations gives the framework a satisfying guarantee for free:
+      <em>if the agent's actions return it to a previously observed location, the latent state at that
+      location must be the same.</em> No memory drift, no retraining, no positional encoding tricks.
+      The group structure is doing the bookkeeping.
+    </p>
+
+    <div class="widget-frame" id="self-motion-equivariance">
+      <p class="widget-title">Self-motion equivariance, side by side</p>
+      <p class="widget-sub">Drive the agent around the world with the arrow keys (or touch). Left:
+        a naive memory writes to whichever latent cell aligns with the agent's image. Right: FloWM's
+        memory rotates and translates with the action $T_{a_t}^{-1}$, so the same world cell always
+        lives at the same place in the latent map. Notice how the naive memory fragments after a few
+        turns; FloWM stays clean.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="instantiations">
+    <h2>6. Two instantiations: 2D conv-RNN and 3D ViT</h2>
+
+    <p>
+      The paper instantiates the framework twice. For 2D worlds (MNIST World, where digits roll across a
+      black canvas and the agent pans around), the entire model is a convolutional RNN with maybe a few
+      hundred thousand parameters and the recurrence above. For 3D worlds (Block World, where the agent
+      navigates a textured room with bouncing colored blocks), the encoder and decoder are Vision
+      Transformers, and the hidden state $h_t$ is a set of spatial tokens organized as a top-down
+      egocentric map of the room.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/model_3d_vit.png" alt="The transformer-based FloWM showing encode, update, decode steps"/>
+      <figcaption>
+        Transformer-Based FloWM. <strong>(a)</strong> The ViT encoder $E_\theta$ ingests the current
+        image patches plus the field-of-view tokens from the spatial latent map. <strong>(b)</strong> It
+        writes back into the FoV cells, then the whole map is transformed by the agent's action $a_t$
+        and the internal flow $\psi_1(\nu)$. <strong>(c)</strong> A ViT decoder cross-attends over the
+        new FoV tokens to predict the next image $\hat f_{t+1}$. <em>(Figure 4.)</em>
+      </figcaption>
+    </figure>
+
+    <p>
+      An interesting honest detail: the 3D ViT encoder is <em>not</em> analytically equivariant. Mapping
+      from a 3D first-person camera to a 2D top-down map is not a group action one can implement
+      structurally without explicit depth unprojection. So the authors let the encoder be <em>learned</em>
+      equivariant — they apply the action and internal flow on every step, and let SGD shape the
+      encoder's weights to respect this. Empirically, the model "becomes equivariant" partway through
+      training, after which the velocity channels kick in and learning accelerates.
+    </p>
+
+    <p>
+      For the update operator $U_\theta$, FloWM uses a simple gated combination: each FoV token gets
+      $(1-\alpha) h_t^{(x,y)} + \alpha\, o_t^{(x,y)}$, where the gate $\alpha = \sigma(\mathbf{W}\,
+      \text{concat}[h, o])$ is learned. Tokens outside the FoV are untouched (and just get flowed by the
+      next step's $\psi_1(\nu)$).
+    </p>
+
+    <h3>The pseudocode in one block</h3>
+
+    <pre class="code"><code>def flowm_step(h, f_t, a_t, encoder, decoder, update, psi, T_action):
+    # h: hidden map of shape [|V|, H, W, C]   (velocity channels × spatial × features)
+    # f_t: current observation (image)
+    # a_t: known agent action
+
+    # 1. Encode: combine image patches with current FoV tokens of h
+    o_t = encoder(patchify(f_t), fov(h))     # shape [H_fov, W_fov, C]
+
+    # 2. Update FoV cells; leave the rest of the map alone
+    h_new = h.copy()
+    h_new[fov_idx] = update(h[fov_idx], o_t)  # gated blend per velocity channel
+
+    # 3. Apply flows: internal velocity channels + inverse self-action
+    for nu in V:
+        h_new[nu] = psi(nu) @ h_new[nu]
+    h_new = T_action(a_t).inverse() @ h_new   # rotates / translates the whole map
+
+    # 4. Decode the predicted next image from the new FoV
+    f_hat = decoder(fov(h_new), mask_tokens)
+
+    return h_new, f_hat
+</code></pre>
+
+    <p>
+      That's the entire model. Compare to a video diffusion transformer with billions of parameters,
+      hundreds of context tokens, and no notion of "the world" anywhere in its state — and then look at
+      what happens next.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. Results: 100× gap and 7× length generalization</h2>
+
+    <p>
+      On the 2D MNIST World benchmark, the model is conditioned on 50 frames and asked to predict the
+      next 20 (training horizon) or 150 (length generalization) frames. The agent pans around at random
+      while digits roll across the world. Every metric is computed against the ground-truth world
+      evolution.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th colspan="2">MSE&nbsp;↓</th>
+          <th colspan="2">PSNR&nbsp;↑</th>
+          <th colspan="2">SSIM&nbsp;↑</th>
+        </tr>
+        <tr>
+          <th></th>
+          <th>20</th><th>150</th>
+          <th>20</th><th>150</th>
+          <th>20</th><th>150</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>FloWM (ours)</strong></td>
+          <td class="win"><strong>0.0005</strong></td>
+          <td class="win"><strong>0.0018</strong></td>
+          <td class="win"><strong>32.99</strong></td>
+          <td class="win"><strong>27.56</strong></td>
+          <td class="win"><strong>0.990</strong></td>
+          <td class="win"><strong>0.981</strong></td>
+        </tr>
+        <tr>
+          <td>&nbsp;&nbsp;&nbsp;&nbsp;– no velocity channels</td>
+          <td>0.0041</td><td>0.0334</td>
+          <td>23.83</td><td>14.77</td>
+          <td>0.958</td><td>0.773</td>
+        </tr>
+        <tr>
+          <td>&nbsp;&nbsp;&nbsp;&nbsp;– no self-motion equivariance</td>
+          <td>0.1234</td><td>0.1317</td>
+          <td>9.09</td><td>8.81</td>
+          <td>0.037</td><td>0.013</td>
+        </tr>
+        <tr>
+          <td>&nbsp;&nbsp;&nbsp;&nbsp;– neither (plain conv-RNN)</td>
+          <td>0.1233</td><td>0.1333</td>
+          <td>9.09</td><td>8.75</td>
+          <td>0.037</td><td>0.015</td>
+        </tr>
+        <tr>
+          <td>DFoT (diffusion transformer)</td>
+          <td>0.1448</td><td>0.2111</td>
+          <td>8.39</td><td>6.76</td>
+          <td>0.405</td><td>0.243</td>
+        </tr>
+        <tr>
+          <td>DFoT-SSM (memory-augmented diffusion)</td>
+          <td>0.1277</td><td>0.1688</td>
+          <td>8.94</td><td>7.73</td>
+          <td>0.455</td><td>0.315</td>
+        </tr>
+        <tr>
+          <td><em>all-black baseline</em></td>
+          <td>0.1656</td><td>0.1654</td>
+          <td>7.81</td><td>7.81</td>
+          <td>0.357</td><td>0.356</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Table 1 from the paper. 50 context frames, predict 20 (training horizon) or 150
+       (extrapolation). Note: the diffusion baselines barely beat the "predict an all-black image"
+       baseline at the long horizon — they are actively confabulating the wrong scene.</p>
+
+    <p>
+      Two things to notice. First, removing self-motion equivariance ("no SME") drops performance
+      essentially to the all-black baseline. Without a structured action transform, the convolutional
+      RNN simply can't learn to bind observations to the right world location, and predictions become
+      garbage. Second, removing velocity channels but keeping SME gives a model that handles
+      <em>static</em> partial observability well (note the reasonable SSIM at 20 steps) but drifts out
+      of sync on longer horizons because it has no machinery for predicting external motion.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/mnist_results.png" alt="MNIST World rollouts at t=49..199; FloWM stays consistent while baselines drift to noise"/>
+      <figcaption>
+        <strong>(a)</strong> Rollout frames at $t = 49\dots199$ on dynamic MNIST World. Models are trained
+        only up to $t = 69$. FloWM (ours) tracks the world; DFoT and DFoT-SSM generate plausible-looking
+        but unrelated digits. <strong>(b)</strong> MSE per timestep over 200 steps — note the training
+        horizon ends at $t=69$ and FloWM's curve stays flat while baselines explode.
+        <strong>(c)</strong> Training loss vs. iterations — FloWM converges in an order of magnitude
+        fewer steps. <em>(Figure 5.)</em>
+      </figcaption>
+    </figure>
+
+    <p>
+      On 3D Dynamic Block World — the harder benchmark, with a 3D agent navigating a textured room with
+      bouncing blocks — the headline numbers tell the same story:
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th colspan="2">MSE&nbsp;↓</th>
+          <th colspan="2">PSNR&nbsp;↑</th>
+          <th colspan="2">SSIM&nbsp;↑</th>
+        </tr>
+        <tr>
+          <th></th>
+          <th>70</th><th>210</th>
+          <th>70</th><th>210</th>
+          <th>70</th><th>210</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>FloWM (ours)</strong></td>
+          <td class="win"><strong>0.0006</strong></td>
+          <td class="win"><strong>0.0015</strong></td>
+          <td class="win"><strong>32.19</strong></td>
+          <td class="win"><strong>28.13</strong></td>
+          <td class="win"><strong>0.967</strong></td>
+          <td class="win"><strong>0.953</strong></td>
+        </tr>
+        <tr>
+          <td>&nbsp;&nbsp;&nbsp;&nbsp;– no velocity channels</td>
+          <td>0.0076</td><td>0.0096</td>
+          <td>21.18</td><td>20.17</td>
+          <td>0.905</td><td>0.894</td>
+        </tr>
+        <tr>
+          <td>&nbsp;&nbsp;&nbsp;&nbsp;– no SME, no VC</td>
+          <td>0.0096</td><td>0.0126</td>
+          <td>20.19</td><td>18.99</td>
+          <td>0.878</td><td>0.863</td>
+        </tr>
+        <tr>
+          <td>DFoT</td>
+          <td>0.0118</td><td>0.0217</td>
+          <td>19.30</td><td>16.64</td>
+          <td>0.938</td><td>0.889</td>
+        </tr>
+        <tr>
+          <td>DFoT-SSM</td>
+          <td>0.0226</td><td>0.0226</td>
+          <td>16.46</td><td>16.46</td>
+          <td>0.888</td><td>0.888</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Table 2 from the paper. 70 context frames, predict 70 (training) or 210
+       (extrapolation). At 210 steps FloWM's MSE is ~14× lower than DFoT.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/blockworld_dynamic.png" alt="Dynamic Block World rollouts side by side"/>
+      <img src="assets/figures/blockworld_mse.png" alt="MSE per timestep on Dynamic Block World"/>
+      <figcaption>
+        Left: visualization of 3D Block World rollouts. FloWM remembers blocks behind walls and tracks
+        their bouncing trajectories; DFoT and SSM hallucinate new colors and positions. Right: MSE per
+        timestep diverges sharply at the training-horizon boundary for the baselines, while FloWM stays
+        flat — even into the extrapolation regime past 90 frames. <em>(Figures 6 &amp; 7.)</em>
+      </figcaption>
+    </figure>
+
+    <p>
+      The textured version of the dataset, with random wall, floor, and block colors, shows the same
+      gap, suggesting FloWM's advantage isn't an artifact of the simple visual setup.
+    </p>
+
+    <div class="widget-frame" id="rollout-race">
+      <p class="widget-title">Rollout MSE, by timestep</p>
+      <p class="widget-sub">Drag the timestep slider from $t=0$ out to $t=200$. The curves trace how each
+        model's prediction error grows over time. The dashed line marks the training horizon —
+        everything to the right is length extrapolation. Toggle models to compare.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="manim-section">
+    <h2>8. The whole story in 15 seconds</h2>
+
+    <p>
+      Here's the central conceptual picture, animated. A ball drifts across the agent's world. The agent
+      observes for a moment, then turns away. The ball keeps moving. Naively, you'd lose track of it.
+      FloWM's spatial memory has been silently flowing in unison with the world the whole time, so when
+      the agent turns back the ball is right where it should be.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/flow_memory.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">FloWM's latent memory flows under $\psi_1(\nu - a_t)$ on every step,
+      whether or not the agent is looking. The naive memory waits passively for new observations and
+      misses everything that happens behind the agent.</p>
+
+    <div class="widget-frame" id="po-sim">
+      <p class="widget-title">A live MNIST-World sim</p>
+      <p class="widget-sub">Pan the agent's field of view with the arrow keys (or drag). The digits keep
+        moving whether or not you're watching them. Toggle "show full world" to see what the agent
+        cannot see — and feel why the prediction problem is hard.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>9. Why it works</h2>
+
+    <p>
+      Look past the formalism, and FloWM is doing three things that no transformer-based video model
+      naturally does. Each is the answer to a specific failure of those models.
+    </p>
+
+    <h3>1. The memory has spatial structure that matches the world's spatial structure</h3>
+    <p>
+      The latent $h_t$ is not an unstructured vector or a sequence of tokens — it's a 2D map indexed by
+      world coordinates. A particular cell <em>means</em> "the patch of world at position $(x, y)$." This
+      binding is established by construction, not learned. When the agent moves, the map shifts so that
+      world-position $(x, y)$ still lives at the same cell-in-the-agent's-frame. There is no
+      "re-identification" problem because the architecture already knows which cell is which.
+    </p>
+
+    <h3>2. Group composition gives you closure for free</h3>
+    <p>
+      Because every update is a group element (a flow or an action), <em>composing</em> them yields
+      another group element. Wander around the room and come back to the same spot: by closure, the
+      product of all your action flows is the identity, and the memory is exactly where it started. The
+      same observation produces the same latent. Transformer attention has no such guarantee — wander
+      and return, and you get an approximation of the original embedding, plus noise.
+    </p>
+
+    <h3>3. Velocity channels factor "what's there" from "how it moves"</h3>
+    <p>
+      The lift-and-flow trick (encode the observation into every channel, then let each channel evolve
+      at its own rate) factorizes the model's job. The encoder only has to figure out <em>what</em> is
+      in the observation. The flows take care of <em>where</em> it will be next, for every possible
+      velocity at once. After a few timesteps the wrong channels stop matching observations and
+      effectively self-prune; the right channel persists. This is why a model with a few hundred
+      thousand parameters can outperform a billion-parameter diffusion transformer on dynamics
+      prediction — the diffusion model is wasting all its capacity learning what FloWM gets for free.
+    </p>
+
+    <h3>4. The constraint shapes the encoder, too</h3>
+    <p>
+      An honest finding the authors highlight: the 3D ViT encoder isn't <em>analytically</em> equivariant
+      (mapping a perspective image to a top-down map requires depth, which isn't available). But by
+      forcing the recurrence relation to apply $T_{a_t}^{-1}$ on every step, the encoder is implicitly
+      trained to produce updates that <em>look</em> equivariant from the latent map's perspective.
+      Approximate equivariance, learned through architectural pressure, turns out to be enough.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>10. What it means</h2>
+
+    <p>
+      For a long time the dominant story in generative video modeling has been: more data, more
+      parameters, longer context. FloWM is a different story. It says that for embodied prediction —
+      where the input is the egocentric view of an agent that can move — there is a specific kind of
+      <em>symmetry</em> that video transformers are leaving on the table, and putting it in by hand
+      yields gains that are unreachable by scaling.
+    </p>
+
+    <p>
+      The gains aren't subtle. At 150 steps of extrapolation the gap to the strongest diffusion baseline
+      is roughly two orders of magnitude in MSE; the diffusion baseline barely outperforms predicting a
+      black image. Training is also an order of magnitude faster, which is a hint about how much of the
+      data budget for current video models is being spent on relearning the laws of motion.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Continuous velocity groups.</strong> FloWM uses a discrete grid of velocity channels.
+        Real motion lives in a continuous range. Prior work suggests discrete equivariance is "enough"
+        in practice, but a clean continuous formulation would be more elegant.</li>
+      <li><strong>Non-rigid and semantic actions.</strong> The framework so far handles rigid, geometric
+        motions: translations and rotations. Articulated bodies, deforming objects, and actions like
+        "open the door" or "pick up the cup" need richer group structures or hybrid approaches.</li>
+      <li><strong>3D world maps.</strong> The 3D ViT instantiation uses a 2D top-down map and projects a
+        perspective image into it. A truly 3D voxel map would let the framework handle scenes where
+        floor-plan assumptions break.</li>
+      <li><strong>Stochastic dynamics.</strong> Current training uses single-step reconstruction loss
+        and predicts a single deterministic future. Combining a flow-equivariant memory with stochastic
+        latent variables (à la diffusion) would let it model multimodal futures.</li>
+      <li><strong>Variable-extent maps.</strong> The current latent map is egocentric and fixed-size.
+        Open-world environments need maps that can grow and forget.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      Most "long-context" tricks for video diffusion are trying to extend the size of the context
+      window. FloWM does the opposite: it shrinks the model and gives it a structured place to put
+      world state. The lesson — that the right architectural prior, motivated by the geometry of the
+      problem, can beat scaling by a hundred times — is bigger than video. Anytime your inputs come
+      from an embodied agent moving through a structured environment, somewhere in your model there is
+      a flow you could be exploiting.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2601.01075" target="_blank" rel="noopener">arXiv:2601.01075</a>
+      &nbsp;·&nbsp; Project page: <a href="https://flowequivariantworldmodels.github.io" target="_blank" rel="noopener">flowequivariantworldmodels.github.io</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

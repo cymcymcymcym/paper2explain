@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Asymmetric Flow Models — an interactive explainer</title>
+  <meta name="description" content="A long, interactive, beginner-friendly explainer of AsymFlow: a rank-asymmetric velocity parameterization that lets plain transformers generate pixels at scale, reaching FID 1.57 on ImageNet 256."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Asymmetric Flow Models</h1>
+    <p class="byline">
+      Chen, Ackermann, Kim, Wetzstein, Guibas &middot; Stanford &middot; May 2026 &middot;
+      <a href="https://arxiv.org/abs/2605.12964" target="_blank" rel="noopener">arXiv 2605.12964</a>
+    </p>
+    <p class="lede">
+      Modern flow models live in compressed latent spaces because they have to. Move them to pixels and
+      the velocity target — full of high-dimensional Gaussian noise — chokes the network. AsymFlow's
+      fix is one line: <em>keep the data part of the target full-dimensional, but project the noise part to a
+      low-rank subspace</em>. The full-rank velocity comes back analytically. The result on ImageNet 256:
+      <strong>FID 1.57</strong>, the best practical pixel diffusion model, with no architectural surgery.
+      Bonus: the same trick lets you finetune a pretrained latent FLUX into a pixel-space text-to-image
+      model that beats its own teacher.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#flow-recap">Flow matching, in one box</a></li>
+      <li><a href="#bottleneck">The high-dimensional bottleneck</a></li>
+      <li><a href="#asymmetric">The asymmetric target</a></li>
+      <li><a href="#decomp">Two parameterizations, one slider</a></li>
+      <li><a href="#recover">Recovering the full velocity</a></li>
+      <li><a href="#pca">Why PCA — and not just any subspace</a></li>
+      <li><a href="#finetune">Latent-to-pixel: lifting FLUX into pixels</a></li>
+      <li><a href="#results">Results: FID 1.57, and a 9B pixel T2I model</a></li>
+      <li><a href="#why">Why this works</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/teaser.png" alt="AsymFLUX.2 klein generations: high-fidelity pixel-space text-to-image samples"/>
+      <figcaption>
+        AsymFLUX.2 klein generations. Finetuned from FLUX.2 klein with AsymFlow's rank-asymmetric velocity
+        parameterization, this is a pixel-space text-to-image model that outscores its own latent teacher
+        on HPSv3, DPG-Bench, and GenEval. (Figure 1.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Almost every state-of-the-art image generator today is a flow model in a <em>latent</em> space. The
+      pipeline is: an autoencoder squashes pixels into 16- or 32-channel tokens; a flow transformer learns
+      to move noise to those tokens; the decoder unsquashes the tokens back to pixels. The compression is
+      what makes everything tractable. A 1024×1024 image becomes a small token grid that a plain transformer
+      can actually predict velocities for.
+    </p>
+    <p>
+      The cost of that pipeline is fine detail. The generator can never reach below the decoder's
+      resolution; texture, geometry, sub-pixel structure — those live in the autoencoder, frozen, out of
+      reach. Trying to generate pixels directly would fix this, but every honest attempt has hit the
+      same wall: <strong>the flow-matching target $\vu = \bm{\epsilon} - \vx_0$ contains a high-dimensional
+      noise term, and plain transformers can't predict it without choking</strong>. So the field has
+      either added architectural escape hatches (skip connections, decoder heads), or just dropped the
+      noise term entirely and predicted clean data $\vx_0$.
+    </p>
+    <p>
+      AsymFlow says: don't drop the noise. <em>Compress it.</em> Project $\bm{\epsilon}$ onto a low-rank
+      subspace before asking the network to predict it. The data part stays full-rank. The asymmetric
+      target $\vu_A = \mathbf{P}\bm{\epsilon} - \vx_0$ is much friendlier to a plain transformer, and the
+      full velocity can be recovered analytically with three lines of algebra. Training is unchanged.
+      Sampling is unchanged. The only thing that changes is the target the network is asked to fit.
+    </p>
+    <p>
+      The result is striking. With the same JiT-H/16 backbone (953M params) as the previous best
+      $\vx_0$-prediction baseline, AsymFlow reaches <strong>1.76 FID</strong>; with a standard REPA loss
+      on top, <strong>1.57</strong>. Even more telling: when applied to a 9B FLUX.2 klein latent model, the
+      same trick turns it into a pixel-space text-to-image generator that <em>beats its latent teacher</em>
+      on human preference benchmarks.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="flow-recap">
+    <h2>1. Flow matching, in one box</h2>
+
+    <p>
+      To make sense of what AsymFlow changes, we need one shared picture of flow matching. Skip this
+      section if you already have it; it'll take 60 seconds.
+    </p>
+    <p>
+      You have data points $\vx_0 \in \mathbb{R}^D$ and Gaussian noise $\bm{\epsilon} \sim \mathcal{N}(0, \mathbf{I})$.
+      At every diffusion time $t \in (0, 1]$, mix them linearly:
+    </p>
+    <p class="eq">$$ \vx_t \coloneqq (1 - t)\,\vx_0 + t\,\bm{\epsilon}. $$</p>
+    <p>
+      At $t = 0$ you're at the data; at $t = 1$ you're at pure noise. Differentiating gives the velocity
+      of this straight-line interpolation:
+    </p>
+    <p class="eq">$$ \vu \coloneqq \frac{d\vx_t}{dt} = \bm{\epsilon} - \vx_0. $$</p>
+    <p>
+      A flow model is a network $\hat{\vu} = G_\theta(\vx_t, t)$ trained to predict this velocity. The loss
+      is just MSE between the predicted velocity and the true velocity:
+    </p>
+    <p class="eq">$$ \mathcal{L}_\mathrm{FM} = \mathbb{E}_{t,\vx_0,\bm{\epsilon}}\,\big\| \vu - \hat{\vu}\,\big\|^2. $$</p>
+    <p>
+      At sampling time you flip the script: start at $t = 1$ with pure noise, integrate
+      $\vx_{t-\Delta t} = \vx_t - \Delta t \cdot \hat{\vu}(\vx_t, t)$ down to $t = 0$, and the network's
+      predicted velocities walk noise back to a clean sample. That's the whole game.
+    </p>
+
+    <aside class="callout">
+      <strong>Two equivalent targets.</strong> Predicting velocity $\vu$ is one option. Predicting clean
+      data $\hat{\vx}_0$ directly and converting via $\hat{\vu} = (\vx_t - \hat{\vx}_0)/t$ is another. The
+      two are mathematically equivalent — the network is the same; only the loss reweighting differs. But
+      they fail in different ways, as we'll see.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottleneck">
+    <h2>2. The high-dimensional bottleneck</h2>
+
+    <p>
+      Here is the problem that AsymFlow exists to solve. In latent space, each token has maybe $d = 16$
+      channels. The noise $\bm{\epsilon}$ that the network must predict is 16-dimensional. The network's
+      internal feature width is, say, 1280. There's plenty of room for the noise to flow through the
+      features without disturbing anything.
+    </p>
+    <p>
+      In pixel space, each $16 \times 16$ patch is $16 \cdot 16 \cdot 3 = 768$-dimensional. The Gaussian
+      noise the network must extract from the input and pass to the output is 768-dimensional. The plain
+      transformer doesn't have skip connections — the only way for the noise to reach the output is
+      <em>through</em> the network's features. So 768 dimensions of i.i.d. noise have to live in the
+      hidden states. They drown the meaningful signal. Image quality collapses.
+    </p>
+    <p>
+      What have people tried?
+    </p>
+    <ul>
+      <li>
+        <strong>Add architectural bypasses.</strong> U-Net skip connections (ADM, DDPM), U-ViT-style hierarchies
+        (SiD2, EPG-G), or decoder heads (PixelDiT, PixNerd, DeCo, DiP). All of these route the noisy input
+        directly to the output, sidestepping the bottleneck. They work, but they break the plain-transformer
+        recipe that scales so well in latent models.
+      </li>
+      <li>
+        <strong>Predict clean data $\vx_0$ instead.</strong> JiT, PixelGen, and PixelREPA all do this. The
+        network never sees $\bm{\epsilon}$ as a target, so the bottleneck disappears. The cost: at low
+        noise levels ($t \to 0$), recovering velocity via $(\vx_t - \hat{\vx}_0)/t$ divides by a tiny
+        $t$, blowing up tiny prediction errors. JiT has to clamp $t$ at $\sigma_\mathrm{min} = 0.04$ to
+        stay numerically stable. And $\vx_0$-prediction is mysteriously incompatible with REPA-style
+        representation alignment, leaving free quality on the table.
+      </li>
+    </ul>
+    <p>
+      Both fixes are real. Neither is satisfying. The first complicates the architecture. The second
+      complicates the loss. AsymFlow asks: <strong>is there a third way that keeps the plain transformer
+      and keeps velocity prediction?</strong>
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="asymmetric">
+    <h2>3. The asymmetric target</h2>
+
+    <p>
+      Look at the velocity target one more time:
+    </p>
+    <p class="eq">$$ \vu = \bm{\epsilon} - \vx_0. $$</p>
+    <p>
+      It has two pieces. A <em>data</em> piece $-\vx_0$, which is highly structured — real images live on
+      a tiny manifold of natural-looking patches. And a <em>noise</em> piece $\bm{\epsilon}$, which is
+      maximally unstructured — i.i.d. Gaussian, isotropic, full-rank.
+    </p>
+    <p>
+      That asymmetry is the whole opportunity. Why are we asking the network to predict the noise piece
+      <em>at the same fidelity</em> as the data piece? The data is what we want; the noise is just a
+      bookkeeping term that came along for the ride.
+    </p>
+    <p>
+      AsymFlow's move: pick a low-rank orthogonal projector $\mathbf{P} = \mathbf{A}\mathbf{A}^\top$, where
+      $\mathbf{A} \in \mathbb{R}^{D \times r}$ is the basis of an $r$-dimensional subspace. Define the
+      <strong>asymmetric velocity target</strong>:
+    </p>
+    <p class="eq">$$ \boxed{\;\vu_A \coloneqq \mathbf{P}\bm{\epsilon} - \vx_0\;} $$</p>
+    <p>
+      The data term is untouched. The noise term has been compressed: instead of asking the network to
+      reproduce all 768 dimensions of $\bm{\epsilon}$, we ask it to reproduce only the $r$ dimensions
+      that lie in the chosen subspace. The orthogonal complement of the noise — $(\mathbf{I} - \mathbf{P})\bm{\epsilon}$ —
+      is just discarded from the target.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/asym_param.png" alt="AsymFlow parameterization and recovery diagram"/>
+      <figcaption>
+        <strong>(a)</strong> The full velocity target $\vu = \bm{\epsilon} - \vx_0$ is perturbed by dense
+        noise. The asymmetric target $\vu_A = \mathbf{P}\bm{\epsilon} - \vx_0$ projects the noise onto a
+        low-rank slice; only the data term spans all dimensions. <strong>(b)</strong> Recovering the full
+        $\hat{\vu}$ from the network's prediction $\hat{\vu}_A$: keep the in-subspace part as-is, and
+        rebuild the orthogonal part using the $\vx_0$-to-$\vu$ conversion. (Figure 2.)
+      </figcaption>
+    </figure>
+
+    <p>
+      The picture matters. Standard velocity targets fill space — they can point anywhere because
+      $\bm{\epsilon}$ is isotropic. The asymmetric target lives on a much smaller manifold: the union of
+      the low-rank subspace (where $\mathbf{P}\bm{\epsilon}$ lives) and the direction $-\vx_0$ (which is
+      structured by the data manifold). It is a vastly more predictable function of the input.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/lowrank_noise.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The central move. Left: standard flow matching asks the network to predict velocity arrows that fan
+      out wildly because $\bm{\epsilon}$ is full-rank noise. Right: AsymFlow projects $\bm{\epsilon}$ onto
+      a low-rank subspace; the arrows now collapse onto a 1-D slice next to the data manifold. Same
+      information about the data direction — far less about the noise.
+    </p>
+
+    <div class="widget-frame" id="velocity-decomp">
+      <p class="widget-title">Velocity decomposition, live</p>
+      <p class="widget-sub">Drag $\vx_0$ (blue) and $\bm{\epsilon}$ (orange). The grey arrow is the
+        standard target $\vu = \bm{\epsilon} - \vx_0$ — points anywhere. The accent arrow is the
+        asymmetric target $\vu_A = \mathbf{P}\bm{\epsilon} - \vx_0$, with $\mathbf{P}$ projecting onto
+        the dashed purple line. Notice that $\vu_A$ is constrained to a much smaller shape.</p>
+      <!-- widget injected here -->
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="decomp">
+    <h2>4. Two parameterizations, one slider</h2>
+
+    <p>
+      Once you write $\vu_A = \mathbf{P}\bm{\epsilon} - \vx_0$ as the target, something elegant happens.
+      Split it along the subspace and its orthogonal complement:
+    </p>
+    <p class="eq">$$
+      \mathbf{P}\,\vu_A = \mathbf{P}\bm{\epsilon} - \mathbf{P}\vx_0 = \mathbf{P}\vu,
+      \qquad
+      (\mathbf{I} - \mathbf{P})\,\vu_A = -(\mathbf{I} - \mathbf{P})\vx_0.
+    $$</p>
+    <p>
+      In words: <em>AsymFlow behaves like $\vu$-prediction inside the subspace, and like $\vx_0$-prediction
+      outside it.</em> The two failure modes we saw — full-rank noise (bad in pixels) and ill-conditioned
+      $\vx_0$-to-$\vu$ conversion (bad at low $t$) — show up only in their natural habitats. Inside the
+      low-rank subspace, where noise prediction is cheap and meaningful, AsymFlow uses velocity. Outside,
+      where the noise would dominate, it uses clean data.
+    </p>
+    <p>
+      This means $\vu_A$ is not a new exotic target — it is a <strong>knob</strong> that interpolates
+      between two well-known ones. The rank $r$ is the knob's setting:
+    </p>
+    <ul>
+      <li>
+        $r = 0$: $\mathbf{P} = \mathbf{0}$ and $\vu_A = -\vx_0$. This is pure $\vx_0$-prediction (up to a
+        sign).
+      </li>
+      <li>
+        $r = D$: $\mathbf{P} = \mathbf{I}$ and $\vu_A = \bm{\epsilon} - \vx_0 = \vu$. This is pure
+        $\vu$-prediction.
+      </li>
+      <li>
+        $0 < r < D$: a genuine middle path. Velocity-style prediction in the meaningful directions,
+        $\vx_0$-style in the rest.
+      </li>
+    </ul>
+    <p>
+      The paper shows that the optimum is around $r = 8$ for a 768-dimensional patch — about 1% of the
+      patch dimensions carry essentially all of the relevant noise variance, and that's all the network
+      needs to predict.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/parameterization.png" alt="Three parameterizations on a continuum"/>
+      <figcaption>
+        Standard $\vx_0$-prediction (left, $r = 0$), AsymFlow (middle, $r = 8$), and standard
+        $\vu$-prediction (right, $r = D$). Notice how the visualized targets sharpen as $r$ drops: at
+        $r = 0$ they're locked to the data manifold; at $r = D$ they explode into isotropic noise; in
+        between, they hug a low-rank slice. (Figure 3.)
+      </figcaption>
+    </figure>
+
+    <div class="widget-frame" id="rank-slider">
+      <p class="widget-title">The rank knob</p>
+      <p class="widget-sub">Move the slider from $r = 0$ to $r = 12$ and watch the target arrows expand
+        from a 1-D slice (pure $\vx_0$-prediction) out into full 2-D space (pure $\vu$-prediction). The
+        FID number is from the paper's ablation; the sweet spot really is intermediate.</p>
+      <!-- widget injected here -->
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="recover">
+    <h2>5. Recovering the full velocity</h2>
+
+    <p>
+      A reasonable worry: if the network is only predicting $\vu_A$ — which lacks the orthogonal noise
+      component — won't sampling be wrong? We're trying to integrate $d\vx/dt = \vu$, not $\vu_A$.
+    </p>
+    <p>
+      Here is the small piece of algebra that makes everything work. Inside the subspace, $\vu_A$ <em>is</em>
+      $\vu$ — the in-subspace velocity equals $\mathbf{P}\vu = \mathbf{P}\bm{\epsilon} - \mathbf{P}\vx_0$,
+      which is exactly what $\mathbf{P}\vu_A$ gives. Outside the subspace, $\vu_A$ gives us
+      $-(\mathbf{I} - \mathbf{P})\vx_0$, which is the $\vx_0$-prediction's data part. We can convert that
+      back to velocity using the standard relation $\vu = (\vx_t - \vx_0)/t$ applied componentwise:
+    </p>
+    <p class="eq">$$
+      \vu \;=\; \underbrace{\mathbf{P}\,\vu_A}_{\text{keep as-is}} \;+\;
+      \underbrace{(\mathbf{I} - \mathbf{P})\,\frac{\vx_t + \vu_A}{t}}_{\text{convert via }\vx_0\text{-to-}\vu}.
+    $$</p>
+    <p>
+      Three observations to make this feel less like a magic trick:
+    </p>
+    <ol>
+      <li>
+        <strong>It's just bookkeeping.</strong> The conversion uses no learned parameters. It's pure
+        algebra on the projector $\mathbf{P}$ and the noisy input $\vx_t$.
+      </li>
+      <li>
+        <strong>The numerical ill-conditioning is now small.</strong> The $1/t$ blowup that bedevils
+        $\vx_0$-prediction only happens in the orthogonal complement now — a $(D - r)$-dimensional space
+        whose contribution to the final image is, by construction, the low-variance part. Empirically,
+        the paper shows AsymFlow loses only 0.52 FID when you remove the $\sigma_\mathrm{min}$ clamp
+        entirely, while JiT loses 1.37. The conversion is much more stable.
+      </li>
+      <li>
+        <strong>Training and sampling are unchanged.</strong> You convert $\hat{\vu}_A \to \hat{\vu}$
+        inside the loss, and you use the standard flow-matching MSE on the recovered $\hat{\vu}$. No
+        custom loss, no new schedule, no architectural change. You're just rewriting what the network
+        is asked to output.
+      </li>
+    </ol>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="pca">
+    <h2>6. Why PCA — and not just any subspace</h2>
+
+    <p>
+      Everything so far has been about reducing the dimension of the noise the network has to handle.
+      But which $r$-dimensional subspace? The bottleneck won't disappear just because we project onto
+      <em>some</em> arbitrary plane. The subspace has to capture the directions that actually carry the
+      signal.
+    </p>
+    <p>
+      The paper's choice for training from scratch is the cheapest one that could possibly work: take a
+      large sample of image patches, run PCA, keep the top $r$ principal components. Use the resulting
+      orthonormal basis as $\mathbf{A}$. The full projector $\mathbf{P} = \mathbf{A}\mathbf{A}^\top$ is
+      applied identically to every patch in the image. It's a single matrix you compute once and freeze.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/rank_fid.png" alt="FID vs rank, PCA vs random subspace"/>
+      <img src="assets/figures/epoch_fid.png" alt="FID vs training epoch, AsymFlow vs JiT"/>
+      <figcaption>
+        Left: ImageNet 256 FID at 160 epochs. PCA at rank $r = 8$ wins; random subspaces of the same
+        rank perform near the baseline. The subspace matters, not just the rank. Right: AsymFlow ($r = 8$)
+        reaches comparable FID about 40% faster than JiT, then continues to a clear final lead. (Figures
+        4–5.)
+      </figcaption>
+    </figure>
+
+    <p>
+      The right panel above is the convergence story. AsymFlow trains faster and ends lower; the gap is
+      visible from the first hundred epochs and never closes. That's what you'd expect from a target that
+      is simply easier for the network to fit: less noise to fight through, more capacity to spend on
+      data.
+    </p>
+
+    <div class="widget-frame" id="pca-vs-random">
+      <p class="widget-title">PCA vs random axis</p>
+      <p class="widget-sub">A toy set of "patches" along a slanted signal direction. Toggle the
+        subspace mode: PCA finds the axis along which most variance lives; a random axis hits anywhere.
+        Reroll to see how stable PCA is across data — and how unstable a random pick is.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <p>
+      The reading from the paper's ablation is sharp: <em>same rank, very different result</em>. Random
+      at $r = 8$ is essentially the JiT baseline. PCA at $r = 8$ knocks 0.10 off the FID. The mechanism
+      that pays for this isn't just dimensionality reduction — it's <strong>meaningful</strong>
+      dimensionality reduction. The low-rank subspace must align with where the patch distribution
+      actually has variance, or the projection throws away the signal along with the noise.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="finetune">
+    <h2>7. Latent-to-pixel: lifting FLUX into pixels</h2>
+
+    <p>
+      Here is the second half of the paper, and arguably the more practical one. If AsymFlow lets us
+      train a pixel-space flow without architectural hacks, can we also <em>take a pretrained latent flow
+      model and convert it into a pixel model?</em>
+    </p>
+    <p>
+      Until now, the answer was no. Latent and pixel spaces have different dimensions and different
+      statistics; you couldn't just plug a 16-channel latent generator into a 768-channel pixel target
+      without retraining from scratch. AsymFlow's rank-asymmetric view gives you the bridge.
+    </p>
+    <p>
+      Take a pretrained latent flow model $G_\phi(\vz_t, t)$ that predicts latent velocities
+      $\vu_\vz = \bm{\epsilon}_\vz - \vz_0$. Build a patch-wise linear lift $\mathbf{A} \in \mathbb{R}^{D \times d}$
+      from latents to pixels by <strong>Procrustes alignment</strong>: solve for the orthonormal matrix
+      that best maps latent codes to their corresponding pixel patches. Then the lifted pixel
+      $\vx_0^L \coloneqq \mathbf{A}\vz_0$ approximates the true pixel $\vx_0$. The key identities:
+    </p>
+    <p class="eq">$$
+      \text{input: }\; \vz_t = \mathbf{A}^\top \vx_t^L, \qquad
+      \text{output: }\; \vu^L = \mathbf{P}\mathbf{A}\vu_\vz + (\mathbf{I} - \mathbf{P}) \frac{\vx_t^L + \mathbf{A}\vu_\vz}{t}.
+    $$</p>
+    <p>
+      Read this carefully: the input identity says "project pixels down to latents with $\mathbf{A}^\top$
+      and feed them to the existing latent network." The output identity says "lift the network's latent
+      velocity prediction $\mathbf{A}\vu_\vz$ back to pixel velocity using the same AsymFlow recovery formula."
+    </p>
+    <p>
+      You fuse $\mathbf{A}^\top$ into the input projection layer of $G_\phi$ and $\mathbf{A}$ into the
+      output projection layer. The result is a pixel-space AsymFlow network with rank $r = d$ (the latent
+      dimension) that, <em>at initialization</em>, generates pixel samples whose latent projections match
+      what the original latent model would have produced.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/init_compare.png" alt="Lifted pixel generation vs decoded latent generation"/>
+      <figcaption>
+        Before any finetuning: the lifted pixel model already generates samples whose high-level
+        semantics and composition match the decoded latent model. The remaining gap is purely low-level
+        — texture, sharpness, fine detail. (Figure 7.)
+      </figcaption>
+    </figure>
+
+    <p>
+      The gap left to close is small and concrete: $\vx_0^L = \mathbf{A}\vz_0$ misses the part of the
+      true pixel signal that lives in the orthogonal complement of $\mathrm{Im}(\mathbf{A})$. That's the
+      high-frequency, low-variance detail the autoencoder discards. Finetuning just has to learn that
+      residual — it doesn't have to relearn what cats look like, or where eyes go on a face.
+    </p>
+
+    <h3>Variance-reduced finetuning</h3>
+
+    <p>
+      Because we have a frozen low-rank model that predicts $\hat{\vx}_0^L$, we can subtract it from the
+      target as a <strong>control variate</strong>. The standard flow-matching loss regresses to $\vx_0$;
+      AsymFlow's finetuning loss regresses to $\vx_0 - \lambda(\vx_0^L - \hat{\vx}_0^L)$. Since $\vx_0^L$
+      is close to $\vx_0$, the residual is small and the gradient variance drops.
+    </p>
+    <p>
+      In equations:
+    </p>
+    <p class="eq">$$
+      \mathcal{L}_{\mathrm{VR}} = \mathbb{E}_{t,\vx_0,\bm{\epsilon}}\!\left[\frac{
+        \big\|\, \lambda\,(\vx_0^L - \hat{\vx}_0^L) + \vx_0 - \hat{\vx}_0\,\big\|^2
+      }{\sigma_t^2}\right].
+    $$</p>
+    <p>
+      Empirically, this control variate dramatically improves fine-grained details. It also introduces a
+      small low-noise approximation error that shows up as visible high-frequency noise — addressed by a
+      gated LPIPS perceptual loss that fades in at low $t$. The two together produce the most realistic
+      texture of any baseline tested.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>8. Results: FID 1.57, and a 9B pixel T2I model</h2>
+
+    <p>
+      On ImageNet 256, AsymFlow with the JiT-H/16 backbone reaches FID 1.76 on its own and 1.57 with a
+      plain REPA loss. That second number is the leading result among practical pixel diffusion
+      models, beating decoder-head methods like PixelDiT and DeCo despite using a strictly simpler
+      architecture.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>family</th><th>method</th><th>params</th><th>target</th><th>FID ↓</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat" rowspan="3">U-Net / U-ViT<br/>(skip connections)</td>
+            <td>ADM-G</td><td>554 M</td><td>$\bm{\epsilon}$</td><td>4.59</td></tr>
+        <tr><td>SiD2, UViT/2</td><td>—</td><td>$\bm{\epsilon}$</td><td>1.73</td></tr>
+        <tr><td>SiD2, UViT/1 (12× FLOPs)</td><td>—</td><td>$\bm{\epsilon}$</td><td><b>1.38</b></td></tr>
+        <tr><td class="cat" rowspan="2">Decoder-head<br/>(DDT-like)</td>
+            <td>DeCo-XL/16</td><td>682 M</td><td>$\bm{\epsilon} - \vx_0$</td><td>1.62</td></tr>
+        <tr><td>PixelDiT-XL/16</td><td>797 M</td><td>$\bm{\epsilon} - \vx_0$</td><td>1.61</td></tr>
+        <tr><td class="cat" rowspan="5">Plain transformers<br/>(DiT-like)</td>
+            <td>PixelFlow-XL/4</td><td>677 M</td><td>$\bm{\epsilon} - \vx_0$</td><td>1.98</td></tr>
+        <tr><td>JiT-H/16</td><td>953 M</td><td>$\vx_0$</td><td>1.86</td></tr>
+        <tr><td>JiT-G/16 (2× larger)</td><td>2 B</td><td>$\vx_0$</td><td>1.82</td></tr>
+        <tr><td>PixelREPA-H/16</td><td>953 M</td><td>$\vx_0$</td><td>1.81</td></tr>
+        <tr><td><b>AsymFlow-H/16 + REPA</b></td><td>953 M</td><td>$\mathbf{P}\bm{\epsilon} - \vx_0$</td>
+            <td class="win"><b>1.57</b></td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      ImageNet 256×256 unconditional FID. Numbers from Table 2 of the paper, ADM evaluation protocol.
+    </p>
+
+    <p>
+      Two things worth lingering on. First: AsymFlow with REPA gains <strong>0.19 FID</strong> from
+      adding REPA (1.76 → 1.57). The previous best $\vx_0$-prediction method (PixelREPA) gained only
+      0.05 (1.86 → 1.81) and required custom additions to make REPA work at all. AsymFlow is just
+      <em>more compatible with auxiliary losses</em>, in the same way that $\vu$-prediction in latent
+      space is. The asymmetric formulation seems to restore properties of velocity prediction that
+      $\vx_0$-prediction loses.
+    </p>
+    <p>
+      Second: this is achieved with a plain transformer. No skip connections, no decoder head, no
+      multi-scale hierarchy. The pixel bottleneck — the entire reason the field had to add architectural
+      machinery — was resolved at the parameterization level.
+    </p>
+
+    <div class="widget-frame" id="convergence-race">
+      <p class="widget-title">Convergence race</p>
+      <p class="widget-sub">Press play and watch the FID-vs-epoch curves descend. AsymFlow reaches the
+        JiT baseline's final quality at around epoch 350, then keeps going. Numbers digitized from
+        Figure 6.</p>
+      <!-- widget injected here -->
+    </div>
+
+    <h3>9B-scale text-to-image</h3>
+
+    <p>
+      The headline finetuning result is more striking still. The authors take FLUX.2 klein Base — a
+      9-billion-parameter latent text-to-image model — and finetune it with AsymFlow into a pixel-space
+      generator they call AsymFLUX.2 klein. They freeze the base model entirely and learn only rank-256
+      LoRA adapters plus the input/output projection layers. The result outscores its own latent teacher:
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>family</th><th>method</th><th>HPSv3 ↑</th><th>DPG-Bench ↑</th><th>GenEval ↑</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat" rowspan="4">Latent</td>
+            <td>SDXL</td><td>8.20</td><td>74.7</td><td>0.55</td></tr>
+        <tr><td>FLUX.1 dev</td><td>10.43</td><td>84.0</td><td>0.67</td></tr>
+        <tr><td>Qwen-Image</td><td>9.52</td><td>87.8</td><td><b>0.86</b></td></tr>
+        <tr><td>FLUX.2 klein Base (teacher)</td><td>9.50</td><td>85.2</td><td>0.80</td></tr>
+        <tr><td class="cat" rowspan="2">Pixel</td>
+            <td>PixelDiT-T2I</td><td>8.95</td><td>83.5</td><td>0.74</td></tr>
+        <tr><td><b>AsymFLUX.2 klein</b></td>
+            <td class="win"><b>10.66</b></td>
+            <td class="win"><b>86.8</b></td>
+            <td class="win"><b>0.82</b></td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      1024×1024 text-to-image system-level comparison. HPSv3 is a human-preference metric; DPG and
+      GenEval focus on prompt alignment. Numbers from Table 4 of the paper.
+    </p>
+
+    <p>
+      HPSv3 — the human-preference benchmark — improves the most. The pixel finetune produces samples
+      that humans prefer over what the original latent model decodes. Visually, the lift shows up as
+      richer textures, sharper edges, and more natural skin and fabric. The qualitative figure in the
+      paper is worth a slow look:
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/t2i_compare.png" alt="Qualitative T2I comparison"/>
+      <figcaption>
+        Same prompts, different models. AsymFLUX.2 klein (right column) preserves the FLUX.2 klein
+        teacher's composition and content but improves low-level fidelity — texture, edge sharpness,
+        material realism. Compared to the prior pixel-space T2I (PixelDiT-T2I), it recovers detail that
+        was previously lost to the bottleneck. (Figure 8.)
+      </figcaption>
+    </figure>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/ablation.png" alt="Loss ablation for AsymFLUX.2 finetuning"/>
+      <figcaption>
+        Ablation of the finetuning losses. Standard flow matching ("FM") already beats the DDT
+        decoder-head baseline. Adding variance reduction sharpens texture (column 3). The LPIPS
+        perceptual correction suppresses residual high-frequency noise (column 4), leaving the cleanest,
+        most natural result. (Figure 9.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>9. Why this works</h2>
+
+    <p>
+      Three intuitions for why something this conceptually small wins so cleanly.
+    </p>
+
+    <h3>The signal really is low-rank in patches</h3>
+
+    <p>
+      Natural image patches are not isotropic. Most of their variance lives in a small number of
+      directions — the same fact that makes JPEG, autoencoders, and dictionary learning all viable. The
+      noise in flow matching is isotropic by design. The mismatch is the whole problem: a plain
+      transformer has finite hidden capacity, and isotropic noise wastes it. PCA-based projection
+      restores the asymmetry that the image distribution actually has.
+    </p>
+    <p>
+      A useful frame: $\vu$-prediction and $\vx_0$-prediction are <em>both</em> answers to the question
+      "what part of the velocity should the network predict?" The first says "all of it." The second
+      says "none of the noise." AsymFlow says "the part of the noise that varies with the signal" — and
+      then proves that this is a well-defined, learnable, well-conditioned objective.
+    </p>
+
+    <h3>The interpolation is principled, not heuristic</h3>
+
+    <p>
+      Earlier work ($k$-Diff) tried scalar interpolations between $\vx_0$- and $\vu$-prediction —
+      essentially picking a number between 0 and 1 and using $(1-k)\bm{\epsilon} - k\vx_0$ as the target.
+      It barely moved the needle. The reason is that scalar interpolation doesn't reduce the
+      dimensionality of the noise term, it just rescales it. The network still has to carry full-rank
+      noise through its features.
+    </p>
+    <p>
+      AsymFlow's interpolation is along a different axis: <em>which directions of the noise to keep</em>.
+      The rank parameter controls dimensionality, not magnitude. That's why it actually fixes the
+      bottleneck instead of just tilting it.
+    </p>
+
+    <h3>Compatibility with auxiliary losses</h3>
+
+    <p>
+      A surprising bonus is that AsymFlow plays much better with REPA, LPIPS, and other auxiliary losses
+      than $\vx_0$-prediction does. The paper documents this empirically — plain REPA only buys 0.05 FID
+      for PixelREPA but buys 0.19 FID for AsymFlow. The probable mechanism: REPA aligns intermediate
+      features with a pretrained vision model. Features that are dominated by isotropic noise residue
+      can't align well; features that are clean (because the noise budget is small and well-targeted)
+      can. Asymmetric targets make the network's representations cleaner, which makes representation
+      alignment work.
+    </p>
+
+    <aside class="callout">
+      <strong>The bigger lesson.</strong> When a high-dimensional target stalls, before you redesign the
+      architecture, look for asymmetry in the target itself. The data and noise components of a flow
+      velocity have radically different statistics; treat them differently.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottom">
+    <h2>10. Bottom line</h2>
+
+    <p>
+      Pixel-space generation, scaled with plain transformers, has been blocked for a while. The
+      conventional explanations — "transformers don't have skip connections," "noise prediction is hard
+      in high dimensions" — accepted high-dimensional noise prediction as the constraint and tried to
+      route around it. AsymFlow declines that constraint. Don't predict full-dimensional noise. Project
+      it to a meaningful subspace, predict that, and recover the rest analytically.
+    </p>
+    <p>
+      The downstream effect is large. Pixel diffusion goes from "interesting but expensive" to
+      "competitive with the best latent models." Pretrained 9B latent models can be turned into
+      pixel-space generators that beat their own teachers. The pieces — PCA, Procrustes, control
+      variates, perceptual loss — are all classical. The synthesis is the contribution: a single
+      $\mathbf{P}$ that makes plain pixel transformers train.
+    </p>
+    <p>
+      The most interesting question this opens isn't about images. It's about every other high-dimensional
+      flow-modeling target: video, point clouds, neural-field weights, 3D occupancy grids. Each of these
+      has the same fundamental problem — full-rank noise drowns the signal. If the AsymFlow principle
+      transfers, the same low-rank projection trick should restore them too. The paper's results on
+      pixels are striking; the framework's reach is potentially much wider.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Hansheng Chen, Jan Ackermann, Minseo Kim, Gordon Wetzstein, Leonidas Guibas.
+      <em>Asymmetric Flow Models</em>. May 2026.
+      <a href="https://arxiv.org/abs/2605.12964" target="_blank" rel="noopener">arXiv 2605.12964</a> ·
+      <a href="https://hanshengchen.com/asymflow" target="_blank" rel="noopener">project page</a>.
+    </p>
+    <p class="tiny">
+      Figures from the original paper. Manim animation, widgets, and prose for this explainer are
+      original. FID numbers in the convergence widget are digitized from Figure 6 of the paper and
+      approximate; refer to the paper for exact values.
+    </p>
+  </footer>
+
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>
