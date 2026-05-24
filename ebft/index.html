@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Matching Features, Not Tokens — an interactive explainer</title>
+  <meta name="description" content="Energy-Based Fine-Tuning (EBFT) trains a language model to match the feature statistics of its own rollouts to the ground truth — a verifier-free, sequence-level objective that beats SFT and matches RLVR while lowering cross-entropy."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\E': '{\\mathbb{E}}',
+        '\\R': '{\\mathbb{R}}',
+        '\\L': '{\\mathcal{L}}',
+        '\\V': '{\\mathcal{V}}',
+        '\\KL': '{D_{\\mathrm{KL}}}',
+        '\\FM': '{\\mathrm{FM}}',
+        '\\CFM': '{\\mathrm{CFM}}',
+        '\\CE': '{\\mathrm{CE}}',
+        '\\phic': '{\\phi_c}',
+        '\\ptheta': '{p_\\theta}',
+        '\\yhat': '{\\hat{y}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Matching Features, Not Tokens</h1>
+    <p class="byline">
+      Jelassi, Kwun, Zhao, Li, Fusi, Du, Kakade, Domingo-Enrich &middot;
+      Harvard / Kempner Institute &middot; MBZUAI &middot; Microsoft Research &middot; March 2026 &middot;
+      <a href="https://arxiv.org/abs/2603.12248" target="_blank" rel="noopener">arXiv 2603.12248</a>
+      &middot; <a href="https://energy-based-fine-tuning.github.io" target="_blank" rel="noopener">project page</a>
+    </p>
+    <p class="lede">
+      Cross-entropy training teaches a model to predict the next token given a <em>perfect</em> prefix —
+      but at generation time the model must feed on its own, imperfect output. That mismatch is why a
+      model with great perplexity can still drift over long generations. Reinforcement learning fixes the
+      mismatch, but it needs a verifier and quietly wrecks the model's language-modeling quality.
+      <strong>Energy-Based Fine-Tuning (EBFT)</strong> proposes a third path: don't match tokens, match
+      <em>features</em>. Embed the model's rollouts and the ground-truth completion through a frozen network,
+      and train so their feature statistics agree. The result needs no verifier, beats supervised fine-tuning
+      on downstream accuracy, ties verifier-based RL — and reaches a <strong>validation cross-entropy of 0.207
+      versus 0.289 for the method that directly optimizes it</strong>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#exposure-bias">The crack in cross-entropy</a></li>
+      <li><a href="#feature-matching">Matching features, not tokens</a></li>
+      <li><a href="#ebft">The EBFT trick</a></li>
+      <li><a href="#energy">An energy model in the loss</a></li>
+      <li><a href="#strided">One sequence, many rollouts</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/front_figure.png" alt="Four panels over training: HumanEval greedy accuracy, HumanEval pass@16, validation cross-entropy, and conditional feature-matching loss, comparing EBFT, SFT and RLVR."/>
+      <figcaption><strong>Figure 1.</strong> Four metrics over training for Qwen2.5-1.5B fine-tuned on
+      OpenCodeInstruct. Left to right: HumanEval greedy accuracy and pass@16 (higher is better), validation
+      cross-entropy and feature-matching loss (lower is better). <span style="color:#2f6fdb;font-weight:600;">EBFT</span>
+      wins on all four. <span style="color:#d05a52;font-weight:600;">RLVR</span> buys downstream accuracy by
+      letting cross-entropy and feature-matching loss <em>explode</em>. The dashed line is the base model.</figcaption>
+    </figure>
+
+    <p>
+      Almost every language model you have ever used was trained, at its core, the same way: predict the next
+      token. Stack enough of these one-step predictions and you get a fluent writer. The objective —
+      cross-entropy under <em>teacher forcing</em> — is dense, stable, and embarrassingly parallel. It is the
+      workhorse of pre-training, mid-training, and supervised fine-tuning (SFT).
+    </p>
+    <p>
+      But there is a crack in it. During training, the model always conditions on a <em>ground-truth</em>
+      prefix. At deployment, it conditions on <em>its own</em> generations. One early mistake shifts the
+      context for every token that follows, and the model finds itself sampling from distributions it was
+      barely trained on. Low perplexity certifies one-step accuracy on clean prefixes; it says nothing about
+      whether a model stays calibrated over a long, self-generated rollout.
+    </p>
+    <p>
+      Reinforcement learning with verifiable rewards (RLVR) attacks exactly this gap — it optimizes
+      sequence-level behavior under the model's own rollouts. But it needs a reliable reward (does the code
+      pass the tests? is the answer correct?), which often does not exist, and it optimizes a single scalar
+      that has nothing to say about distributional quality. As Figure&nbsp;1 shows, RLVR can lift accuracy
+      while <em>more than doubling</em> the model's cross-entropy.
+    </p>
+    <p>
+      This paper asks: what if the training signal lived not in tokens, and not in a scalar reward, but in a
+      rich <em>feature space</em>? Embed a completion through a frozen network, and you get a vector that
+      captures its meaning and structure. Train the model so the average feature of its rollouts matches the
+      feature of the real data. That is EBFT — and it turns out to fix the rollout problem <em>and</em> the
+      language-modeling problem at once.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="exposure-bias">
+    <h2>1. The crack in cross-entropy</h2>
+    <p>
+      The technical name for the crack is <em>exposure bias</em>: the model is never exposed to its own
+      mistakes during training. There is a clean way to <em>measure</em> the damage. Braverman et&nbsp;al.
+      (2019) tracked the expected entropy of the $k$-th generated token as $k$ grows. For a perfect model,
+      generated prefixes look exactly like real text, so this entropy should stay flat. In practice it climbs
+      — the model's own continuations push it further and further off the data manifold, even when training
+      perplexity is excellent.
+    </p>
+    <p>
+      The authors turn this diagnostic into something sharper. Pick a feature map $\phi$ that embeds a full
+      prompt–completion sequence into $\R^d$. For each context $c$, compare the <em>mean feature of the
+      model's completions</em> to the feature of the ground-truth completion. Call the squared gap the
+      <strong>conditional feature-matching (CFM) loss</strong>. Plot it as a function of completion length and
+      you see the crack directly: under SFT, the loss grows the longer the model generates.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/genlen_sft.png" alt="Feature-matching loss increasing with completion length for an SFT model."/>
+      <figcaption><strong>Figure 2.</strong> Conditional feature-matching loss versus completion length for a
+      Qwen2.5-1.5B model fine-tuned with SFT. Some growth is expected even for a perfect model (feature variance
+      grows with length), but part of this climb is SFT failing to calibrate its own rollout distribution.</figcaption>
+    </figure>
+
+    <p>
+      Some of that rise is unavoidable: longer completions are more variable, so even an ideal model would
+      show some growth. But part of it is genuine miscalibration — the model's rollouts drift from the data in
+      feature space. SFT cannot see this, because SFT never looks at its own rollouts. RLVR <em>does</em> look
+      at rollouts, but optimizes a reward that is blind to it. The natural move is to make this very quantity
+      the training objective.
+    </p>
+
+    <aside class="callout">
+      <strong>Why a feature space and not tokens?</strong> Two completions can share almost no tokens yet mean
+      the same thing ("it's raining" / "the weather is wet"), and two near-identical token strings can mean
+      opposite things. Token-overlap metrics miss this; a learned feature map does not. Matching in feature
+      space is matching <em>meaning</em>, not surface form.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="feature-matching">
+    <h2>2. Matching features, not tokens</h2>
+    <p>
+      Here is the central object — built one piece at a time. We have contexts $c$ drawn from the data
+      distribution $p$. For each context, the <em>data</em> supplies ground-truth completions $y \sim p(\cdot\mid c)$,
+      while the <em>model</em> $\ptheta$ supplies its own rollouts $\yhat \sim \ptheta(\cdot\mid c)$. A frozen
+      feature map $\phi$ turns a full sequence into a vector in $\R^d$; we abbreviate
+      $\phic(y) := \phi(c\!:\!y)$, the embedding of the prompt $c$ and completion $y$ stitched into one sequence.
+      From these, form the two <em>mean feature vectors</em> — one per source of completions:
+    </p>
+    <p class="eq">$$ \underbrace{\mu_\theta(c) := \E_{\yhat \sim \ptheta(\cdot\mid c)}\big[\phic(\yhat)\big]}_{\text{model mean}} \qquad\qquad \underbrace{\bar\phi(c) := \E_{y \sim p(\cdot\mid c)}\big[\phic(y)\big]}_{\text{data mean}} $$</p>
+    <p>
+      Read $\mu_\theta(c)$ as the recipe <em>"sample many completions from the model, embed each one, average the
+      vectors"</em>; $\bar\phi(c)$ is the same recipe run on real completions. Both are single points in $\R^d$.
+      The <strong>feature-matching loss</strong> is then just their squared distance, averaged over contexts:
+    </p>
+    <p class="eq">$$ \L_{\FM}(\theta) = \E_{c \sim p}\Big[\;\big\|\, \mu_\theta(c) - \bar\phi(c) \,\big\|^2 \;\Big]. $$</p>
+    <p>
+      A model is <strong>feature-calibrated</strong> when this loss is zero — its expected features match the
+      data's for every context. And here is the quiet power of the construction: if the feature map is rich enough that
+      matching feature moments forces the distributions to match, then $\L_\FM$ is a
+      <em>strictly proper scoring rule</em>. It cannot be gamed by a model that nails some statistics while
+      drifting on others.
+    </p>
+    <p>
+      To build intuition, collapse to the simplest case: completions of a single token ($G=1$), and let $\phi$ be
+      <em>one-hot</em> — it embeds a token as its indicator vector ($1$ in that token's slot, $0$ everywhere else).
+      Then the mean feature is nothing exotic. Averaging the one-hot vectors of the model's samples just recovers
+      the model's next-token distribution, one coordinate per vocabulary token:
+    </p>
+    <p class="eq">$$ \mu_\theta(c) = \E_{\yhat \sim \ptheta(\cdot\mid c)}\big[\,\mathbf{e}_{\yhat}\,\big] = \big(\ptheta(y\mid c)\big)_{y}, \qquad \bar\phi(c) = \big(p(y\mid c)\big)_{y}. $$</p>
+    <p>
+      So the squared distance $\|\mu_\theta(c) - \bar\phi(c)\|^2$ becomes an ordinary $\ell_2$ distance between
+      next-token distributions — here it is beside the usual cross-entropy log loss (the sum runs over vocabulary
+      tokens $y$):
+    </p>
+    <p class="eq">$$ \L_{\FM} = \E_{c}\Big[\textstyle\sum_{y}\big(\ptheta(y\mid c) - p(y\mid c)\big)^2\Big], \qquad \L_{\CE} = -\,\E_{c}\Big[\textstyle\sum_{y} p(y\mid c)\,\log \ptheta(y\mid c)\Big]. $$</p>
+    <p>
+      Both are minimized by the same distribution — the truth, $\ptheta = p$ — so they are <em>not</em> in
+      tension. But their <em>landscapes</em> differ. Cross-entropy is asymmetric: it punishes
+      <em>under</em>estimating a token the data likes far more harshly than overestimating it (drop a true
+      token's probability toward zero and the log loss races to infinity). Feature matching is symmetric. Drag
+      the model distribution around below and watch the two losses respond.
+    </p>
+
+    <div class="widget-frame" id="ce-vs-fm">
+      <p class="widget-title">Two losses, one minimizer</p>
+      <p class="widget-sub">Drag the bars to set the model's next-token distribution $\ptheta(\cdot\mid c)$ against a fixed target $p(\cdot\mid c)$. Both losses bottom out when the bars match — but cross-entropy blows up when you starve a token the data wants.</p>
+    </div>
+
+    <p>
+      This is why feature matching is a <em>complement</em> to cross-entropy rather than a rival. They agree on
+      the destination; they disagree on the road. And once you let completions grow beyond a single token, with
+      a real feature map instead of one-hot vectors, $\L_\FM$ can target <em>sequence-level</em> statistics —
+      coherence, faithfulness, formatting — that the token-by-token CE loss is structurally blind to.
+    </p>
+
+    <h3>Building the feature map</h3>
+    <p>
+      The feature network $\phi$ is just a frozen copy of the model at initialization. To embed a sequence, the
+      authors concatenate intermediate activations from three depths — 25%, 50%, and 75% through the network —
+      normalizing each block to unit norm. The reasoning: early layers carry low-level surface information,
+      final layers are biased toward next-token prediction, and the middle layers hold the semantic and
+      structural content you actually want to match. High-dimensional features from these depths come close to
+      the "rich enough" condition that makes the loss a proper scoring rule.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="ebft">
+    <h2>3. The EBFT trick: rollouts, rewards, REINFORCE</h2>
+    <p>
+      There is an obstacle, and it is the <em>data</em> mean. Recall the loss
+      $\L_\FM(\theta) = \E_c\big[\,\|\mu_\theta(c) - \bar\phi(c)\|^2\,\big]$ compares the model mean $\mu_\theta(c)$
+      against the data mean $\bar\phi(c) = \E_{y\sim p(\cdot\mid c)}[\phic(y)]$. But $\bar\phi(c)$ averages over
+      <em>all</em> valid completions of $c$, and the dataset hands us only <em>one</em> ground-truth completion
+      $y$ per context — so we can never form $\bar\phi(c)$ directly.
+    </p>
+    <p>
+      The fix is to optimize a surrogate built from a single $y$. Define the per-example
+      <strong>conditional feature-matching (CFM) loss</strong>
+    </p>
+    <p class="eq">$$ \L_{\CFM}(\theta; c, y) := \big\|\, \mu_\theta(c) - \phic(y) \,\big\|^2, $$</p>
+    <p>
+      and average it over the ground-truth draw $y \sim p(\cdot\mid c)$. Adding and subtracting the unknown data
+      mean $\bar\phi(c)$ inside the norm produces a clean bias–variance split (dropping the argument $c$ for
+      brevity):
+    </p>
+    <p class="eq">$$
+      \begin{aligned}
+        \E_{y}\big[\L_{\CFM}(\theta; c, y)\big]
+        &= \E_{y}\big\|\,(\mu_\theta - \bar\phi) + (\bar\phi - \phic(y))\,\big\|^2 \\[4pt]
+        &= \underbrace{\|\mu_\theta - \bar\phi\|^2}_{\text{the }\L_\FM\text{ integrand}}
+           \;+\; 2\,(\mu_\theta - \bar\phi)^\top \underbrace{\E_{y}\big[\,\bar\phi - \phic(y)\,\big]}_{=\,0}
+           \;+\; \underbrace{\E_{y}\big\|\phic(y) - \bar\phi\big\|^2}_{=\,\V(c)\ \text{(data feature variance)}}.
+      \end{aligned}
+    $$</p>
+    <p>
+      The cross term vanishes because $\E_y[\phic(y)] = \bar\phi$ by definition, so the deviation averages to zero.
+      What is left is exactly the $\L_\FM$ integrand plus $\V(c)$ — the variance of the data features, which knows
+      nothing about $\theta$. A $\theta$-independent term has zero gradient, so
+    </p>
+    <p class="eq">$$ \nabla_\theta\, \E_{c,\,y}\big[\L_{\CFM}(\theta; c, y)\big] \;=\; \nabla_\theta\, \L_\FM(\theta). $$</p>
+    <p>
+      Minimizing the single-sample CFM loss therefore minimizes the true feature-matching loss <em>exactly</em>,
+      gradient for gradient — even though we never observe $\bar\phi(c)$.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/method_overview.png" alt="EBFT pipeline: a context feeds the generator which samples completions; a frozen feature network embeds rollouts and the ground truth; feature-matching rewards drive a policy-gradient update."/>
+      <figcaption><strong>Figure 3.</strong> The EBFT loop. For a context $c$, the trainable generator $\ptheta$
+      samples $n$ completions. A <em>frozen</em> feature network $\phi$ embeds each prompt–completion pair. Each
+      rollout earns a feature-matching reward measuring its alignment with the ground-truth feature moment, and
+      the generator is updated by REINFORCE with a leave-one-out baseline.</figcaption>
+    </figure>
+
+    <p>
+      Now we differentiate $\L_{\CFM}(\theta; c, y)$. The only place $\theta$ enters is the model mean
+      $\mu_\theta(c) = \sum_{\yhat} \ptheta(\yhat\mid c)\,\phic(\yhat)$ — the ground-truth feature $\phic(y)$ is
+      fixed. Expanding the square and differentiating,
+    </p>
+    <p class="eq">$$ \L_{\CFM}(\theta; c, y) = \|\mu_\theta\|^2 - 2\,\mu_\theta^\top \phic(y) + \|\phic(y)\|^2, \qquad \nabla_\theta \L_{\CFM} = 2\,\big(\mu_\theta - \phic(y)\big)^\top \nabla_\theta \mu_\theta. $$</p>
+    <p>
+      The catch is $\nabla_\theta \mu_\theta$: it is the gradient of an expectation whose <em>sampling
+      distribution</em> depends on $\theta$, and the rollouts $\yhat$ are discrete tokens, so we cannot push the
+      derivative inside $\phic(\yhat)$. This is what the REINFORCE / log-derivative identity is for. Using
+      $\nabla_\theta \ptheta(\yhat\mid c) = \ptheta(\yhat\mid c)\,\nabla_\theta \log \ptheta(\yhat\mid c)$,
+    </p>
+    <p class="eq">$$ \nabla_\theta \mu_\theta = \sum_{\yhat} \nabla_\theta \ptheta(\yhat\mid c)\,\phic(\yhat) = \E_{\yhat \sim \ptheta(\cdot\mid c)}\big[\,\phic(\yhat)\,\nabla_\theta \log \ptheta(\yhat\mid c)\,\big]. $$</p>
+    <p>
+      Substituting back and collecting the scalar that multiplies each score $\nabla_\theta \log \ptheta(\yhat\mid c)$
+      turns the gradient into a policy gradient with a reward attached to each rollout:
+    </p>
+    <p class="eq">$$ \nabla_\theta \L_{\CFM}(\theta; c, y) = \E_{\yhat \sim \ptheta(\cdot\mid c)}\Big[\,\nabla_\theta \log \ptheta(\yhat\mid c)\;\underbrace{2\,\phic(\yhat)^\top\big(\mu_\theta - \phic(y)\big)}_{=\,-\,r(\yhat,\,c)}\,\Big] = -\,\E_{\yhat \sim \ptheta(\cdot\mid c)}\big[\,\nabla_\theta \log \ptheta(\yhat\mid c)\; r(\yhat, c)\,\big]. $$</p>
+    <p>
+      Reading off the reward — and recalling $\mu_\theta = \E_{\tilde{y} \sim \ptheta(\cdot\mid c)}[\phic(\tilde{y})]$ —
+      it decomposes into two intuitive forces:
+    </p>
+    <p class="eq">$$ r(\yhat, c) = \underbrace{2\,\phic(\yhat)^\top \phic(y)}_{\text{alignment}} \;-\; \underbrace{2\,\phic(\yhat)^\top \E_{\tilde{y} \sim \ptheta(\cdot\mid c)}[\phic(\tilde{y})]}_{\text{diversity}}. $$</p>
+    <p>
+      The <strong>alignment</strong> term rewards a rollout for pointing toward the ground-truth feature — pull
+      toward the truth. The <strong>diversity</strong> term penalizes a rollout for pointing toward the
+      <em>average rollout</em> $\mu_\theta$ — push apart from the herd. The minus sign out front is doing real
+      work: the update is $\theta \leftarrow \theta - \eta\,\nabla_\theta \L_{\CFM}$, so it cancels, and the step
+      is gradient <em>ascent</em> — it raises $\log \ptheta(\yhat\mid c)$ for rollouts whose reward is high.
+      Together the two forces say: <em>move the cloud of rollouts so its center lands on the ground truth, but
+      don't collapse the cloud to a single point.</em>
+    </p>
+    <p>
+      In practice both expectations are Monte-Carlo estimated from the same batch of $n>1$ rollouts
+      $\yhat_1,\dots,\yhat_n \sim \ptheta(\cdot\mid c)$. The subtlety is the diversity term: rollout $i$'s reward
+      contains $\mu_\theta$, and estimating $\mu_\theta$ from the <em>full</em> batch would pair $\phic(\yhat_i)$
+      with itself ($\phic(\yhat_i)^\top\phic(\yhat_i) \ge 0$ always), biasing the reward. The fix is a
+      <strong>leave-one-out</strong> mean over the siblings,
+    </p>
+    <p class="eq">$$ \hat\mu_{-i} = \frac{1}{n-1}\sum_{j \ne i} \phic(\yhat_j), \qquad r_i = 2\,\phic(\yhat_i)^\top \phic(y) \;-\; 2\,\phic(\yhat_i)^\top \hat\mu_{-i}, $$</p>
+    <p>
+      an unbiased estimate of $r(\yhat_i, c)$. Pairing it with a REINFORCE leave-one-out (RLOO) baseline
+      $b_i = \tfrac{1}{n-1}\sum_{j\ne i} r_j$ — subtracting the average reward of the <em>other</em> rollouts to
+      cut variance without adding bias — gives the gradient estimator the method actually runs,
+    </p>
+    <p class="eq">$$ \widehat{\nabla_\theta \L_{\CFM}} = -\,\frac{1}{n}\sum_{i=1}^{n} \big(r_i - b_i\big)\,\nabla_\theta \log \ptheta(\yhat_i \mid c). $$</p>
+    <p>
+      That sentence — "move the cloud so its center lands on the ground truth" — <em>is</em> the method.
+      Here it is as the single picture worth holding in your head:
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/feature_matching.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The ground-truth completion is one blue star in feature space. The generator's rollouts are an orange
+      cloud, and the feature-matching loss is the squared distance from the cloud's <em>mean</em> (orange ring)
+      to the star. The REINFORCE update slides that mean onto the ground-truth feature — the loss collapses to
+      zero — while the cloud keeps its spread. Matching the moment, not memorizing the token.
+    </p>
+
+    <p>
+      You can drive the two forces yourself. Below, the blue star is the ground-truth feature and the orange
+      dots are rollouts you can drag. Watch each rollout's reward split into its alignment and diversity parts,
+      and watch the feature-matching loss — the gap between the rollout mean and the star — shrink as you pull
+      the cloud's center onto the target.
+    </p>
+
+    <div class="widget-frame" id="reward-space">
+      <p class="widget-title">Alignment vs. diversity in feature space</p>
+      <p class="widget-sub">Drag the orange rollouts (or the blue ground-truth star). Each rollout shows its reward $r_j$; the dashed line is the feature-matching loss between the rollout mean and the truth. "Take a step" nudges the cloud's mean toward the star.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="energy">
+    <h2>4. An energy model hiding in the loss</h2>
+    <p>
+      Why call it <em>energy-based</em> fine-tuning? Add a KL leash to the objective — keep the new policy
+      $\rho$ close to a reference $q$ while it chases the data's feature moment:
+    </p>
+    <p class="eq">$$ \min_{\rho}\; \E_{c \sim p}\Big[\, \big\| \E_{\rho(\cdot\mid c)}[\phic(y)] - \E_{p(\cdot\mid c)}[\phic(y)] \big\|^2 + \tfrac{1}{\beta}\,\KL\!\big(\rho(\cdot\mid c)\,\|\,q(\cdot\mid c)\big) \Big]. $$</p>
+    <p>
+      The minimizer is not some intractable object — it has a clean closed form, and the derivation is short. The
+      objective separates over contexts, so fix one $c$ and write $m_\rho(c) := \E_{\rho(\cdot\mid c)}[\phic(y)]$
+      for the policy's feature mean and (as in Section&nbsp;3) $\bar\phi(c) := \E_{p(\cdot\mid c)}[\phic(y)]$ for
+      the data's. We are minimizing
+    </p>
+    <p class="eq">$$ F_c(\rho) = \big\|\,m_\rho(c) - \bar\phi(c)\,\big\|^2 + \tfrac{1}{\beta}\,\KL\!\big(\rho(\cdot\mid c)\,\|\,q(\cdot\mid c)\big) $$</p>
+    <p>
+      over the probability simplex. Because $m_\rho(c)$ is linear in $\rho$, the first term is a convex quadratic
+      and the KL is strictly convex, so $F_c$ has a <em>unique</em> minimizer, pinned down by stationarity.
+      Differentiating with respect to the mass $\rho(y\mid c)$ (with a multiplier enforcing
+      $\sum_y \rho(y\mid c)=1$) gives, for every $y$,
+    </p>
+    <p class="eq">$$ \underbrace{2\,\big(m_\rho(c) - \bar\phi(c)\big)^\top \phic(y)}_{\partial\,\|\cdot\|^2} \;+\; \tfrac{1}{\beta}\,\log\frac{\rho(y\mid c)}{q(y\mid c)} \;=\; \text{const (independent of }y\text{)}. $$</p>
+    <p>
+      Solving for $\rho$ and folding the $y$-independent constant into the normalizer, the minimizer is an
+      <em>exponential tilt</em> of the base model:
+    </p>
+    <p class="eq">$$ \rho^\star(y\mid c) = \frac{1}{Z_c}\,q(y\mid c)\,\exp\!\big(-\chi_c^\top \phic(y)\big), \quad Z_c = \sum_{y'} q(y'\mid c)\,e^{-\chi_c^\top \phic(y')}, \quad E(y,c) = \chi_c^\top \phic(y). $$</p>
+    <p>
+      And reading the tilt direction straight off the stationarity condition shows what $\chi_c$ <em>is</em>: it is
+      the residual moment gap, scaled by the leash strength,
+    </p>
+    <p class="eq">$$ \chi_c = 2\beta\,\big(\,m_{\rho^\star}(c) - \bar\phi(c)\,\big) \;=\; 2\beta\,\big(\,\E_{\rho^\star(\cdot\mid c)}[\phic(y)] - \E_{p(\cdot\mid c)}[\phic(y)]\,\big). $$</p>
+    <p>
+      This is an implicit, fixed-point definition — $\chi_c$ depends on the very distribution it tilts — but it
+      says exactly the right thing. The energy points along the direction in which the policy's feature mean still
+      <em>overshoots</em> the data's, and the factor $e^{-\chi_c^\top\phic(y)}$ down-weights precisely the
+      completions that drag the mean further that way. A looser leash (larger $\beta$) lets $\chi_c$ grow and the
+      moment gap shrink; as $\beta\to 0$ the tilt vanishes and $\rho^\star$ collapses back to the reference $q$.
+    </p>
+    <p>
+      This is precisely an <strong>energy-based model</strong>: a Boltzmann distribution over completions with
+      partition function $Z_c$ and an energy $E(y,c)=\chi_c^\top\phic(y)$ that is <em>linear</em> in the features.
+      Read the other way, the optimal tilt direction $\chi_c$ is also the maximum-likelihood fit of that
+      exponential family to the completions actually seen in the data. Crucially, EBFT never builds or learns $\chi_c$.
+      It optimizes the generator's parameters directly, with the feature-matching gradient standing in for the
+      energy model that the objective <em>implicitly</em> defines. The energy view is the explanation, not the
+      implementation.
+    </p>
+    <p>
+      There is a second reading that ties it back to Section&nbsp;1. The same KL-constrained problem is a
+      <em>calibration</em> procedure: project the base model onto the set of distributions whose features match a
+      target moment. Braverman et&nbsp;al. used exactly this idea to fix entropy drift — but with a single
+      <em>scalar</em> statistic, the model's own log-probability. EBFT performs the same correction with a
+      whole high-dimensional, semantically rich feature vector. It is entropy-drift calibration, scaled up from
+      one number to a meaning-laden $\R^d$.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="strided">
+    <h2>5. One sequence, many rollouts</h2>
+    <p>
+      A REINFORCE method that samples completions and runs them through a separate feature network sounds
+      expensive — and naively it is. The authors make it affordable with a borrowed trick from Quiet-STaR:
+      treat one training sequence as a <em>source of many nested prompts</em>. Place anchor points every $s$
+      tokens; from each anchor, the next $G$ tokens are a ground-truth completion, and you also sample a
+      rollout of length $G$. One sequence of length $T$ yields
+    </p>
+    <p class="eq">$$ B = \left\lfloor \frac{T - G}{s} \right\rfloor \quad \text{context–completion pairs.} $$</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/strided_rollouts.png" alt="Branching generation paths: a base token sequence with two rollout branches sampled from different anchor points."/>
+      <figcaption><strong>Figure 4.</strong> Strided parallel rollouts for $T=12$, stride $s=4$, completion
+      length $G=4$. The base sequence is blue; two rollouts (red, green) branch from anchors after tokens 3 and 7.
+      A custom attention mask lets every anchor advance by one token in a <em>single</em> forward pass, so all
+      $B$ rollouts of length $G$ are produced in just $G$ forward passes — then embedded in one batched call to
+      the feature network.</figcaption>
+    </figure>
+
+    <p>
+      The payoff is that supervision is dense: instead of one signal per sequence, you get $B$ of them, and the
+      whole batch of rollouts is generated and embedded together rather than one at a time. Try the arithmetic
+      yourself — see how stride and completion length trade off the number of supervision points against the
+      compute per sequence.
+    </p>
+
+    <div class="widget-frame" id="strided-calc">
+      <p class="widget-title">Strided block-parallel rollouts</p>
+      <p class="widget-sub">Set the sequence length, stride, and completion length. See how many context–completion pairs one sequence yields, and how the parallel scheme collapses the cost from sequential decoding to just $G$ forward passes.</p>
+    </div>
+
+    <h3>Whitening, and why CE goes down</h3>
+    <p>
+      One more ingredient matters. Raw features have correlated, anisotropic directions, so a few dimensions can
+      dominate the loss. EBFT <em>whitens</em> the features using the (pseudo-inverse) second-moment matrix of
+      the rollouts before computing rewards. This is not just a numerical nicety: the whitened feature-matching
+      loss is a relaxation of the local $\chi^2$ divergence between the model and the data, and since
+      $\KL(P\|Q)\approx \tfrac12 \chi^2(P\|Q)$ when $P$ and $Q$ are close, whitened feature matching approximates
+      a <em>sequence-level cross-entropy</em> in the fine-tuning regime. This is the mechanism behind the
+      headline curiosity: EBFT drives down validation cross-entropy more than SFT does.
+    </p>
+
+    <h3>The recipe</h3>
+    <pre class="code"><code># One EBFT training iteration  (generator p_theta, frozen feature net phi)
+for (c, y) in batch:                         # context + ground-truth completion
+    y_hat = [sample(p_theta, c, length=G) for _ in range(n)]   # n rollouts
+    f_gt  = phi(c, y)                         # ground-truth feature
+    f     = [phi(c, yh) for yh in y_hat]      # rollout features
+    f, f_gt = whiten(f, f_gt)                 # condition the feature space
+
+    for j in range(n):                        # feature-matching reward
+        align = 2 * dot(f[j], f_gt)                       # pull toward truth
+        diver = (2/(n-1)) * sum(dot(f[j], f[k]) for k != j)  # push off the herd
+        r[j]  = align - diver
+
+    update p_theta with RLOO( grad_log_prob(y_hat, c), r )   # policy gradient
+# optional: add gamma * cross_entropy(c, y)   to speed up CE reduction</code></pre>
+    <p>
+      The defaults are striking for how small they are: a rollout horizon of only <strong>$G=8$ tokens</strong>
+      (4 for translation), $n=4$ samples per prompt, learning rate $10^{-6}$, temperature 0.6, no KL term, two
+      epochs. The gains from those 8-token rollouts persist and <em>grow</em> at completion lengths far beyond 8.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>6. Results</h2>
+    <p>
+      The experiments span a verifiable setting (Q&amp;A coding, where unit tests give RLVR a reward), a
+      non-verifiable one (raw code from GitHub, where RLVR simply cannot run), and translation. Models are
+      Qwen2.5-1.5B for code and Llama-3.2-1B for translation. The story is consistent: EBFT matches or beats
+      RLVR on downstream accuracy <em>and</em> achieves the best calibration on every task — no tradeoff.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Task</th><th>Metric</th><th>Base</th><th>SFT</th><th>RLVR</th><th>EBFT</th></tr>
+      </thead>
+      <tbody>
+        <tr><td rowspan="4" class="cat">Q&amp;A Coding<br><span class="cat-sub">Qwen2.5-1.5B</span></td>
+            <td>val. cross-entropy (↓)</td><td>0.338</td><td>0.289</td><td>0.774</td><td class="win"><strong>0.207</strong></td></tr>
+        <tr><td>feature-matching (↓)</td><td>0.361</td><td>0.315</td><td>0.442</td><td class="win"><strong>0.258</strong></td></tr>
+        <tr><td>HumanEval greedy (↑)</td><td>0.484</td><td>0.483</td><td>0.535</td><td class="win"><strong>0.548</strong></td></tr>
+        <tr><td>HumanEval pass@16 (↑)</td><td>0.715</td><td>0.728</td><td>0.752</td><td class="win"><strong>0.771</strong></td></tr>
+
+        <tr><td rowspan="3" class="cat">Unstructured<br>Coding<br><span class="cat-sub">no verifier</span></td>
+            <td>val. cross-entropy (↓)</td><td>0.631</td><td>0.501</td><td>—</td><td class="win"><strong>0.499</strong></td></tr>
+        <tr><td>greedy (↑)</td><td>0.473</td><td>0.504</td><td>—</td><td class="win"><strong>0.548</strong></td></tr>
+        <tr><td>pass@16 (↑)</td><td>0.702</td><td>0.747</td><td>—</td><td class="win"><strong>0.769</strong></td></tr>
+
+        <tr><td rowspan="3" class="cat">Translation<br><span class="cat-sub">Llama-3.2-1B</span></td>
+            <td>val. cross-entropy (↓)</td><td>1.870</td><td>1.782</td><td>2.454</td><td class="win"><strong>1.670</strong></td></tr>
+        <tr><td>feature-matching (↓)</td><td>0.637</td><td>0.690</td><td>0.641</td><td class="win"><strong>0.578</strong></td></tr>
+        <tr><td>COMET greedy (↑)</td><td>0.644</td><td>0.717</td><td>0.697</td><td class="win"><strong>0.725</strong></td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      Best result per method, from Table&nbsp;1 of the paper (non-warm-start EBFT shown; the SFT-warm-started
+      variant is comparable or slightly better, e.g. CE 0.190 on Q&amp;A coding). RLVR is inapplicable to
+      unstructured code, where no correctness signal exists. Cross-entropy and feature-matching loss are on
+      held-out subsets of the training data.
+    </p>
+
+    <p>
+      Three numbers deserve a pause. First, on Q&amp;A coding EBFT reaches a cross-entropy of <strong>0.207</strong>
+      while SFT — which <em>directly</em> minimizes cross-entropy — only reaches 0.289. Second, RLVR's
+      cross-entropy <em>rises</em> to 0.774, more than double the base model's 0.338: it is trading away
+      language-modeling quality for task reward. Third, EBFT lands its accuracy gains (greedy 0.548 vs SFT's
+      0.483) <em>without any verifier at all</em>.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/genlen_ebft.png" alt="Feature-matching loss versus completion length: EBFT lowest across all lengths, RLVR worse than base."/>
+      <figcaption><strong>Figure 5.</strong> Feature-matching loss across completion lengths. Despite an 8-token
+      training horizon, EBFT's advantage <em>grows</em> at longer completions — evidence of genuine
+      distributional calibration rather than overfitting to the rollout length. RLVR worsens the loss relative
+      to the base model.</figcaption>
+    </figure>
+
+    <p>
+      The training dynamics make the contrast visceral. Below, scrub through training and watch where each
+      method moves in the accuracy–calibration plane. EBFT slides down-and-right — better accuracy, better
+      calibration. RLVR drifts up — accuracy at the cost of a worse language model.
+    </p>
+
+    <div class="widget-frame" id="tradeoff-scrubber">
+      <p class="widget-title">The tradeoff that EBFT escapes</p>
+      <p class="widget-sub">Scrub training progress and watch SFT, RLVR, and EBFT move in the downstream-accuracy vs. cross-entropy plane (Q&amp;A coding, approximated from Figure&nbsp;1). Up-and-right is the dream; RLVR refuses to go there.</p>
+    </div>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/translation_main.png" alt="Translation training curves: COMET, cross-entropy, and CFM loss for EBFT, SFT, RLVR."/>
+      <img src="assets/figures/scale.png" alt="EBFT improvements across Qwen2.5 1.5B, 3B, and 7B."/>
+      <figcaption><strong>Figure 6.</strong> Left: translation (Llama-3.2-1B on ALMA) — EBFT achieves the lowest
+      CE and feature-matching loss while RLVR's cross-entropy climbs above the base model. Right: EBFT's gains
+      hold across Qwen2.5 scales (1.5B → 3B → 7B), with greedy HumanEval rising from ~0.49 to ~0.60 to ~0.69 and
+      no sign of diminishing returns.</figcaption>
+    </figure>
+
+    <p>
+      Two ablations sharpen the picture. Sweeping the cross-entropy weight $\gamma \in \{0, 0.03, 0.1\}$ changes
+      only how fast CE falls — downstream accuracy and feature-matching loss barely move, and even pure feature
+      matching ($\gamma=0$) beats SFT on cross-entropy. On the feature network, whitening and last-token pooling
+      matter most; random weights hurt only mildly; and swapping the 1.5B feature net for a 7B one barely helps —
+      so the gains come from the <em>objective</em>, not from a bigger critic.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>7. Why this works</h2>
+    <p>
+      It would be easy to read EBFT as "RL with a fancy reward." It is more interesting than that. Three
+      threads explain the results.
+    </p>
+
+    <h3>Feature matching and cross-entropy share a minimizer</h3>
+    <p>
+      The reason EBFT lowers cross-entropy <em>more than SFT</em> is not magic. The two losses have the same
+      unique minimizer — the data distribution — so they pull in the same direction. But feature matching pulls
+      along a better-conditioned path: with whitening it approximates the $\chi^2$ divergence, which is locally
+      the KL divergence (the thing cross-entropy is). SFT optimizes CE on clean prefixes only; EBFT effectively
+      optimizes a sequence-level CE under the model's own rollouts. It is optimizing the right quantity in the
+      right regime.
+    </p>
+
+    <h3>A dense, sequence-level signal without a verifier</h3>
+    <p>
+      RLVR's reward is a single bit — pass or fail — available only when a verifier exists, and it is silent
+      about <em>how</em> a generation is good or bad. The feature-matching reward is a dense vector comparison
+      available for <em>any</em> text, structured or not. That is why EBFT works on raw GitHub code where RLVR
+      cannot even be defined, and why its outputs are qualitatively cleaner: in the paper's examples, RLVR
+      produces code that calls undefined helpers or drifts into multilingual tag-soup, while EBFT produces
+      self-contained, executable code and clean single-sentence translations.
+    </p>
+
+    <h3>Diversity is built into the reward</h3>
+    <p>
+      A pure "pull toward the truth" objective would collapse every rollout onto the single observed completion
+      — a recipe for mode collapse. The diversity term in the reward is what prevents that: it penalizes
+      rollouts for clustering, keeping the cloud spread while its center tracks the data moment. The method
+      matches a <em>distribution's</em> statistics, not a point, which is exactly what a proper scoring rule
+      demands.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>8. What it means</h2>
+    <p>
+      For a decade, the menu for shaping a language model has had two items: maximize likelihood on tokens
+      (cheap, dense, but blind to your own rollouts), or maximize a scalar reward with RL (rollout-aware, but
+      verifier-hungry and corrosive to the base distribution). EBFT proposes a genuinely different third option —
+      a dense, sequence-level, verifier-free signal that lives in feature space and provably targets the true
+      distribution. It connects classical moment matching and distribution alignment to modern LM training,
+      and it reframes "what should a model imitate?" from <em>the exact tokens</em> to <em>the statistics of
+      meaning</em>.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Cost.</strong> EBFT is rollout-based, so it is far slower per update than SFT (≈36 GPU-hours
+      vs ≈0.5 for one Q&amp;A-coding epoch in the paper's un-optimized implementation). It is best deployed as a
+      fine-tuning stage after cross-entropy training, and a vLLM-backed implementation is an obvious win.</li>
+      <li><strong>Frozen features and short horizons.</strong> Results use a frozen feature network (a copy of
+      the model) and rollouts of just 4–8 tokens, on models up to 7B. Scaling the horizon, scaling the model,
+      and exploring <em>learned</em> or adaptive feature networks are all open.</li>
+      <li><strong>How rich is "rich enough"?</strong> The proper-scoring-rule guarantee assumes a feature map
+      expressive enough that matching moments implies matching distributions. The 25/50/75% activation
+      concatenation is a hypothesis, not a proof — characterizing which feature maps suffice is wide open.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      The slogan is the whole idea: <strong>match features, not tokens.</strong> Stop asking the model to
+      reproduce the exact next token on a perfect prefix, and start asking its own rollouts to <em>mean</em> the
+      same thing as the data — measured in a frozen network's feature space, optimized by policy gradient. You
+      get the calibration benefits of reinforcement learning, the density of supervised learning, no verifier,
+      and — almost as a side effect — a lower cross-entropy than the method built to minimize cross-entropy.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2603.12248" target="_blank" rel="noopener">arXiv:2603.12248</a>
+      &nbsp;·&nbsp; Code: <a href="https://github.com/sjelassi/ebft_openrlhf" target="_blank" rel="noopener">sjelassi/ebft_openrlhf</a>
+      &nbsp;·&nbsp; <a href="https://energy-based-fine-tuning.github.io" target="_blank" rel="noopener">project page</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

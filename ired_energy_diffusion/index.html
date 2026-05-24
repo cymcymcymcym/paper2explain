@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Learning Iterative Reasoning through Energy Diffusion — an interactive explainer</title>
+  <meta name="description" content="IRED reframes reasoning as gradient descent on a learned energy function, letting a model spend more optimization steps on harder problems at test time."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vx': '{\\mathbf{x}}',  '\\vy': '{\\mathbf{y}}',  '\\vz': '{\\mathbf{z}}',
+        '\\vI': '{\\mathbf{I}}',
+        '\\vtheta': '{\\boldsymbol{\\theta}}',
+        '\\argmin': '{\\operatorname*{arg\\,min}}',
+        '\\model':  '{\\textsf{IRED}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Learning Iterative Reasoning through Energy Diffusion</h1>
+    <p class="byline">
+      Du, Mao, Tenenbaum &middot; MIT CSAIL &middot; ICML 2024 &middot;
+      <a href="https://arxiv.org/abs/2406.11179" target="_blank" rel="noopener">arXiv 2406.11179</a>
+      &middot; <a href="https://energy-based-model.github.io/ired/" target="_blank" rel="noopener">project page</a>
+    </p>
+    <p class="lede">
+      Here is a neural network that solves Sudoku puzzles <em>harder</em> than any it ever saw in
+      training — not by being bigger, but by <em>thinking longer</em>. The trick is to stop asking the
+      network to spit out an answer and instead ask it to score how good an answer is. Reasoning then
+      becomes a search: roll downhill on a learned energy landscape until you find the bottom. Because
+      the search is explicit, you can simply run more steps when a problem is hard. On a Sudoku split
+      with fewer clues than training, this lifts accuracy to <em>62.1%</em> — where a purpose-built SAT
+      solver gets 3.2% and the previous best neural reasoner gets 28.6%.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#gap">The reasoning gap</a></li>
+      <li><a href="#energy">Reasoning as energy descent</a></li>
+      <li><a href="#anneal">The trick: anneal smooth → sharp</a></li>
+      <li><a href="#train">Training without unrolling</a></li>
+      <li><a href="#recipe">The recipe</a></li>
+      <li><a href="#compute">Thinking longer on harder problems</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/teaser.png" alt="IRED trains on diverse tasks — matrix completion, Sudoku, path finding — by learning annealed energy functions, then generalizes to harder instances: larger magnitudes, fewer given numbers, larger graphs."/>
+      <figcaption>One framework, three flavors of reasoning. IRED learns a sequence of annealed energy
+      functions $E_\theta^k(\vx,\vy)$ on matrix completion, Sudoku, and path finding, then generalizes
+      to harder instances at test time — larger magnitudes, fewer given clues, bigger graphs — by
+      spending more compute. (Figure 1 from the paper.)</figcaption>
+    </figure>
+
+    <p>Reasoning is the part of intelligence that machine learning has had the hardest time with.
+    A classical solver — a SAT engine, a dynamic-programming routine, a path planner — reasons
+    beautifully, but it can't look at a photograph of a Sudoku board, and it needs a human to hand-code
+    the rules. A neural network learns the rules from data and handles raw inputs, but it answers every
+    question with the same fixed slab of computation, whether the question is trivial or brutal.</p>
+
+    <p>So here is the question this paper asks: <strong>can a single model learn the constraints of a
+    reasoning task purely from input–output examples, and then — like a real solver — spend
+    a variable amount of computation depending on how hard the instance is?</strong></p>
+
+    <p>IRED — <em>iterative reasoning through energy diffusion</em> — answers yes, and the mechanism is
+    the interesting part. Let's build it up from the one idea everything rests on: turning reasoning
+    into a descent.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="gap">
+    <h2>1. The reasoning gap</h2>
+    <p>Think about what a solver actually does. To solve Sudoku it doesn't compute a fixed function of
+    the board; it <em>searches</em> — proposing fills, checking constraints, backtracking, iterating
+    until everything is consistent. The amount of work it does is not fixed. A nearly-complete board is
+    quick; a sparse one with many ambiguous cells takes far longer. Computation scales with difficulty.</p>
+
+    <p>A standard feedforward network throws that away. Train it to map boards to solutions and it
+    applies one fixed pass at inference. Make the test board harder than anything it trained on and it
+    has no recourse — no way to "think more." Recurrent and adaptive-computation networks
+    (PonderNet and friends) loosen this a little by repeating a module, but they still don't expose a
+    clean, explicit knob you can turn at test time, and they're trained by backpropagating through the
+    whole unrolled loop, which is slow and unstable.</p>
+
+    <p>The reframing that fixes both problems is to stop predicting the answer directly. Instead, learn
+    a function that <em>scores</em> candidate answers, and recover the answer by searching for the best
+    score. That search is iterative and open-ended — exactly the variable-compute property a solver has,
+    and exactly what a feedforward net lacks.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="energy">
+    <h2>2. Reasoning as energy descent</h2>
+    <p>Concretely, IRED learns an <strong>energy function</strong> $E_\theta(\vx,\vy)$: a single scalar
+    that measures how badly a candidate output $\vy$ violates the constraints of the task, given the
+    input $\vx$. Low energy means "this is a good, consistent answer." The prediction is then whatever
+    output minimizes the energy:</p>
+
+    <p class="eq">$$ \vy \;=\; \argmin_{\vy}\; E_\theta(\vx, \vy). $$</p>
+
+    <p>And how do you minimize a learned scalar function? Gradient descent. Start from random noise and
+    repeatedly step downhill along the energy's gradient:</p>
+
+    <p class="eq">$$ \vy^{\,t} \;=\; \vy^{\,t-1} \;-\; \lambda\, \nabla_{\vy} E_\theta(\vx, \vy^{\,t-1}). $$</p>
+
+    <p>That's the whole interface. Every task — adding matrices, completing a low-rank matrix, solving
+    Sudoku, planning a path through a graph — uses the <em>same</em> training and inference loop. Only
+    the encoder that reads $\vx$ and $\vy$ changes with the data format. The constraints of each task
+    are never hand-coded; they're whatever shape of energy landscape the network learns from examples.</p>
+
+    <aside class="callout">
+      <strong>Why a scalar, not a direction?</strong> A diffusion model learns a <em>score</em> — a
+      vector field that says "step this way." IRED instead learns a scalar energy and takes its
+      gradient. That distinction looks pedantic but it buys three things: a number you can read to
+      gauge difficulty or verify a solution, a landscape that is guaranteed self-consistent (the field
+      is the gradient of <em>something</em>), and the ability to accept only steps that actually lower
+      the energy. The widget below makes the difference tangible.
+    </aside>
+
+    <div class="widget-frame" id="field-compare">
+      <p class="widget-title">Energy field vs. score field</p>
+      <p class="widget-sub">Release a probe and watch it move. An energy model gives a consistent
+      landscape with a readable value; a raw score field is just arrows — it can swirl forever with no
+      bottom to find.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="anneal">
+    <h2>3. The trick: anneal smooth → sharp</h2>
+    <p>There's a catch hiding in "just do gradient descent." A learned energy landscape for a real
+    reasoning task is <em>rugged</em>. Sudoku, for instance, is essentially a constraint-satisfaction
+    problem: the true solution sits at the bottom of a narrow, steep well, surrounded by a vast, nearly
+    flat plateau of almost-valid boards. Drop a ball on that plateau and gradient descent stalls — it
+    has no idea which way is down. Optimizing the sharp landscape directly gets you stuck.</p>
+
+    <p>IRED borrows the cure from diffusion models: <strong>simulated annealing</strong>. Instead of one
+    energy landscape, learn a whole sequence of them, $E_\theta^k$ for $k = 1, \dots, K$, indexed by a
+    noise scale $\sigma_k$. Early landscapes are smooth and easy — a single gentle basin. Later ones are
+    progressively sharper, until the last recovers the true, jagged objective. Formally, each landscape
+    is the energy of the data distribution blurred by Gaussian noise of scale $\sigma_k$:</p>
+
+    <p class="eq">$$ e^{-E_\theta^k(\vx,\vy)} \;\propto\; \int p(\vy^*\mid \vx)\;
+      \mathcal{N}\!\big(\vy;\, \sqrt{1-\sigma_k^2}\,\vy^*,\; \sigma_k^2 \vI\big)\, d\vy^*. $$</p>
+
+    <p>You optimize them in order: start on the smooth landscape, roll to its basin, then carry that
+    solution to the next (slightly sharper) landscape and keep descending, all the way to the final
+    sharp one. The smooth landscapes get you into the right neighborhood; the sharp ones pin down the
+    exact answer. The animation below is the whole idea in one shot.</p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/annealed_descent.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">Annealed descent on a 1-D energy landscape. Starting smooth, the solution
+    slides cleanly into the basin; as the landscape sharpens, it stays locked in the deepening well at
+    the true answer $y^*$. A second ball that descends the sharp landscape <em>directly</em> falls into
+    the nearest ripple and gets trapped in a local minimum — the failure annealing avoids.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/energy_landscape.png" alt="Three scatter plots of energy vs. distance from the ground-truth solution, for landscapes 1, 5, and 10. Landscape 1 is nearly flat; landscape 5 is a gentle bowl; landscape 10 rises steeply with distance."/>
+      <figcaption>The learned landscapes really do anneal. Each plot shows energy against how far a
+      candidate is from the true solution. Landscape 1 (early) is almost flat — every answer looks
+      about equally good, so optimization is unconstrained and easy. By landscape 10 (late), energy
+      climbs steeply with distance — a sharp, decisive well around the right answer. (Figure 4.)</figcaption>
+    </figure>
+
+    <p>Now play with it yourself. Drag the sharpness, click to place a starting point, and race a direct
+    descent against an annealed one:</p>
+
+    <div class="widget-frame" id="annealed-descent">
+      <p class="widget-title">Roll down the annealed landscape</p>
+      <p class="widget-sub">Drag <em>sharpness</em> to morph the landscape from smooth to rugged. Click
+      anywhere to drop the ball, then compare descending the sharp landscape directly vs. annealing into
+      it.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="train">
+    <h2>4. Training without unrolling</h2>
+    <p>The earlier energy-based reasoner this paper builds on (IREM) trained its energy function by
+    unrolling all $T$ optimization steps and backpropagating through them to match the ground truth.
+    That's slow, memory-hungry, and unstable — you're differentiating through a long, possibly chaotic
+    optimization. IRED never does this. It supervises a <em>single</em> step, in two complementary ways.</p>
+
+    <h3>Score supervision (get the slope right)</h3>
+    <p>Take a true answer $\vy^*$, corrupt it with noise at scale $\sigma_k$, and teach the gradient of
+    the energy to point back toward the clean answer — exactly the denoising objective of diffusion
+    models, but applied to the gradient of a scalar:</p>
+
+    <p class="eq">$$ \mathcal{L}_{\text{MSE}}(\theta) \;=\;
+      \big\lVert\, \nabla_{\vy} E_\theta\big(\vx,\, \sqrt{1-\sigma_k^2}\,\vy^* + \sigma_k\,\epsilon;\; k\big) \;-\; \epsilon \,\big\rVert^2,
+      \qquad \epsilon \sim \mathcal{N}(0, \vI). $$</p>
+
+    <p>This shapes the <em>local</em> slope everywhere, so gradient descent always knows which way to go.
+    But there's no guarantee that the deepest point of the landscape — its global minimum — actually
+    sits on the true answer. The slope can be right locally while the global minimum drifts somewhere
+    wrong.</p>
+
+    <h3>Contrastive shaping (put the minimum in the right place)</h3>
+    <p>So IRED adds a second loss. Construct a <em>negative</em> answer $\vy^-$ (a corrupted version of
+    the true one), and push the energy of the true answer below the energy of the negative:</p>
+
+    <p class="eq">$$ \mathcal{L}_{\text{Contrast}}(\theta) \;=\;
+      -\log\!\left( \frac{e^{-E^+}}{e^{-E^+} + e^{-E^-}} \right),
+      \qquad E^+ = E_\theta(\vx, \tilde\vy^*;k),\;\; E^- = E_\theta(\vx, \tilde\vy^-;k). $$</p>
+
+    <p>This is the loss that forces $\argmin_\vy E_\theta$ to land on the ground truth. The widget below
+    shows what it fixes: with score supervision alone, a spurious basin can sit lower than the true one,
+    so the search converges to the wrong answer. Turning up the contrastive term lifts the impostor and
+    deepens the true well until the global minimum snaps back where it belongs.</p>
+
+    <div class="widget-frame" id="contrastive-shaping">
+      <p class="widget-title">Shape the energy landscape</p>
+      <p class="widget-sub">Score supervision alone can leave the global minimum in the wrong basin.
+      Drag the contrastive strength and watch the minimum (the ball) jump back onto the true answer.</p>
+    </div>
+
+    <p>Crucially, both losses are computed on a single noised sample. There is no unrolled optimization
+    to backpropagate through, which is why IRED trains both faster and more stably than IREM while
+    ending up with a far better-behaved landscape.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/model.png" alt="A row of rugged 3-D energy surfaces annealing from one landscape to the next, alongside two boxes: a score-function supervision loss and an energy-landscape (contrastive) supervision loss."/>
+      <figcaption>The full picture. IRED learns a sequence of energy landscapes $E_\theta^1 \to \dots
+      \to E_\theta^K$ (left), each trained with a combination of score-function supervision (top right)
+      and contrastive energy-landscape supervision (bottom right). Inference walks the sequence,
+      gradually sharpening the optimization problem. (Figure 2.)</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="recipe">
+    <h2>5. The recipe</h2>
+    <p>Putting it together, training is a single combined objective, and inference is a nested loop over
+    landscapes and optimization steps. Two details in the inference loop are worth noticing: every
+    gradient step is <em>accepted only if it lowers the energy</em> (the scalar energy gives you a
+    cheap correctness check that a pure score model can't offer), and between landscapes the solution is
+    rescaled to account for the change in noise level.</p>
+
+    <pre class="code"><code># ---- Training (per step) ----
+x, y_star ~ data;   eps ~ N(0, I);   k ~ {1, ..., K}
+y_tilde   = sqrt(1 - sigma_k^2) * y_star + sigma_k * eps        # noise the answer
+L_mse     = || grad_y E(x, y_tilde, k) - eps ||^2              # score supervision
+
+y_neg     = corrupt(y_star)                                    # a wrong answer
+y_tilde_n = sqrt(1 - sigma_k^2) * y_neg + sigma_k * eps
+L_con     = -log( e^-E(x, y_tilde, k)
+                  / ( e^-E(x, y_tilde, k) + e^-E(x, y_tilde_n, k) ) )
+
+minimize  L_mse + L_con   w.r.t. theta     # no backprop through optimization!
+
+# ---- Inference ----
+y = randn()                                # start from Gaussian noise
+for k in 1 .. K:                           # smooth landscape  ->  sharp landscape
+    for t in 1 .. T:                       # T gradient steps on landscape k
+        y_new = y - lambda_k * grad_y E(x, y, k)
+        if E(x, y_new, k) < E(x, y, k):    # accept only energy-decreasing steps
+            y = y_new
+    y = y * sqrt(1 - sigma_k^2) / sqrt(1 - sigma_{k-1}^2)   # rescale into next landscape
+return y</code></pre>
+
+    <p>The paper uses $K = 10$ landscapes with a cosine noise schedule across every domain — more did not
+    help. The one knob left free at test time is $T$, the number of optimization steps per landscape.
+    That knob is where the magic lives.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="compute">
+    <h2>6. Thinking longer on harder problems</h2>
+    <p>Because inference is explicit optimization, $T$ is a dial you can turn <em>after</em> training,
+    on a per-instance basis, with the same frozen weights. Spend a few steps on an easy problem; spend
+    many on a hard one. And the payoff is lopsided in exactly the way you'd hope: extra steps barely
+    move in-distribution accuracy (those problems are already solved), but they keep buying real
+    improvement on the harder-than-training instances.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/performance_sudoku.png" alt="Line chart of Sudoku accuracy vs. optimization steps per landscape. The in-distribution test curve stays flat near 99%; the harder-dataset curve climbs from about 43% at 1 step to about 62% at 20 steps."/>
+      <figcaption>The test-time-compute signature. On standard Sudoku (blue), accuracy is flat near 99%
+      regardless of steps. On the harder split (orange) — boards with fewer given clues than any in
+      training — accuracy climbs from ~43% at one step per landscape to 62.1% at twenty. Same weights;
+      more thinking. (Figure 6.)</figcaption>
+    </figure>
+
+    <p>Drag the dial yourself. These are the paper's actual Sudoku numbers:</p>
+
+    <div class="widget-frame" id="compute-dial">
+      <p class="widget-title">The test-time compute dial</p>
+      <p class="widget-sub">One trained model, one knob. Increase the optimization steps per landscape
+      and see how it moves in-distribution accuracy vs. accuracy on harder-than-training puzzles.</p>
+    </div>
+
+    <p>This is the property no fixed-compute network has. The model effectively detects that a problem
+    is hard — the energy stays high, optimization hasn't bottomed out — and responds by reasoning for
+    longer, just like a search algorithm would.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. Results</h2>
+    <p>IRED is tested across three families: continuous algorithmic reasoning, discrete reasoning, and
+    planning. Each is evaluated on a "same difficulty" split drawn from the training distribution and a
+    "harder difficulty" split that is deliberately out of distribution. The headline is consistent:
+    IRED is competitive in-distribution and pulls decisively ahead as problems get harder.</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Task (split)</th><th>Metric</th><th>IRED</th><th>Best baseline</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="2" class="cat">Sudoku</td>
+          <td>standard test (↑)</td>
+          <td><strong>99.4%</strong></td>
+          <td>99.8% <em>(RRN)</em></td>
+        </tr>
+        <tr>
+          <td>harder, fewer clues (↑)</td>
+          <td class="win"><strong>62.1%</strong></td>
+          <td>28.6% <em>(RRN)</em> · 3.2% <em>(SAT-Net)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Visual Sudoku</td>
+          <td>standard test (↑)</td>
+          <td><strong>98.3%</strong></td>
+          <td>99.8% <em>(RRN)</em></td>
+        </tr>
+        <tr>
+          <td>harder (↑)</td>
+          <td class="win"><strong>46.6%</strong></td>
+          <td>28.6% <em>(RRN)</em> · 0.0% <em>(SAT-Net)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Graph connectivity</td>
+          <td>test, ≤12 nodes (↑)</td>
+          <td class="win"><strong>99.1%</strong></td>
+          <td>94.3% <em>(IREM)</em></td>
+        </tr>
+        <tr>
+          <td>harder, 18 nodes (↑)</td>
+          <td class="win"><strong>93.8%</strong></td>
+          <td>89.8% <em>(IREM)</em> · 61.3% <em>(Diffusion)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Shortest path</td>
+          <td>test, 15 nodes (↑)</td>
+          <td class="win"><strong>92.6%</strong></td>
+          <td>90.4% <em>(IREM)</em> · 45.2% <em>(Diffusion)</em></td>
+        </tr>
+        <tr>
+          <td>harder, 25 nodes (↑)</td>
+          <td class="win"><strong>91.9%</strong></td>
+          <td>88.4% <em>(IREM)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Matrix inverse</td>
+          <td>same difficulty (MSE ↓)</td>
+          <td class="win"><strong>0.0095</strong></td>
+          <td>0.0108 <em>(IREM)</em></td>
+        </tr>
+        <tr>
+          <td>harder, ill-conditioned (MSE ↓)</td>
+          <td class="win"><strong>0.2063</strong></td>
+          <td>0.2083 <em>(IREM)</em> · 0.2132 <em>(Diffusion)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Tables 1–3 from the paper. ↑ higher is better, ↓ lower is better. Baselines:
+    RRN (recurrent relational network), SAT-Net (a differentiable SAT solver), IREM (the prior
+    energy-based reasoner), and a plain denoising-diffusion model with the same architecture.</p>
+
+    <p>The Sudoku gap is the stunner. A SAT solver baked specifically for Sudoku scores <strong>3.2%</strong>
+    on the harder split; IRED scores <strong>62.1%</strong>. The pattern repeats everywhere: on the
+    harder graph-connectivity split IRED holds 93.8% while a diffusion model with the identical encoder
+    collapses to 61.3%. That collapse is the tell — diffusion learns the same denoising slope but lacks
+    the scalar energy, the contrastive shaping, and the accept-if-lower search that let IRED keep
+    refining.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/sudoku_opt.png" alt="Three Sudoku boards showing the optimized solution at landscapes 1, 3, and 10; red error cells progressively disappear until the board is fully correct."/>
+      <img src="assets/figures/energy_minima.png" alt="Four error-map heatmaps of a matrix-inverse solution at landscapes 2, 3, 5, and 10; bright error pixels fade to near-uniform dark as the landscape index increases."/>
+      <figcaption>Watching the answer condense. Left: a Sudoku board across landscapes — red mistakes
+      vanish as optimization moves from the smooth early landscape to the sharp final one (Figure 5).
+      Right: error maps for matrix inversion grow steadily darker (lower error) over the same sequence
+      (Figure 3).</figcaption>
+    </figure>
+
+    <p>An ablation on matrix inversion (harder split) confirms each piece earns its keep: turning on
+    gradient-descent optimization, then multiple steps, then contrastive shaping drops error
+    0.2223 → 0.2135 → 0.2113 → 0.2063, with contrastive shaping providing the largest single gain on the
+    hard split.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why this works</h2>
+    <p>It's worth separating the three reasons IRED beats both a feedforward net and a vanilla diffusion
+    model, because each maps to a design choice you can feel in the widgets above.</p>
+
+    <h3>A scalar energy is a verifier, not just a guide</h3>
+    <p>A diffusion model's score tells you which direction to move; it never tells you whether you've
+    arrived. IRED's energy is a number you can compare across candidates. That single fact powers the
+    accept-if-lower step in the inference loop, lets the model gauge when a problem is still unsolved
+    (energy stays high), and — in principle — lets you compose energies from different constraints by
+    simply adding them. The "energy vs. score" widget is exactly this: the energy field has a bottom to
+    find and a height to read; the score field is just arrows that can circulate forever.</p>
+
+    <h3>Annealing turns a hopeless landscape into a tractable curriculum</h3>
+    <p>The true objective for a constraint problem is brutally non-convex — narrow wells in a sea of
+    flatness. Optimizing it cold is hopeless. By learning a sequence from smooth to sharp, IRED converts
+    one hard search into a chain of easy ones, each initialized by the last. The energy-landscape figure
+    shows the smooth-to-steep progression isn't a story — it's measurably what the learned landscapes
+    look like.</p>
+
+    <h3>Contrastive shaping aligns the minimum with the truth</h3>
+    <p>Score matching gets the local slope right but says nothing about where the global minimum lives.
+    Without the contrastive term, the search can confidently descend into a basin that isn't the answer.
+    Adding it forces the deepest point onto the ground truth — which is why it's the component that helps
+    most precisely on the hard, out-of-distribution instances, where a misplaced minimum hurts the most.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>9. What it means</h2>
+    <p>IRED is, in retrospect, an early and unusually clean statement of an idea that has since reshaped
+    the field: <strong>test-time computation as a first-class lever</strong>. The lesson isn't "energy
+    models are good" so much as "if inference is an explicit search rather than a fixed forward pass, you
+    get to trade compute for accuracy at the moment you need it — adaptively, per problem, with weights
+    you already trained." A model that can recognize a hard instance and respond by reasoning longer is
+    doing something qualitatively closer to what we mean by reasoning than a model that answers
+    everything in one breath.</p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Failure mode: confident wrong minima.</strong> The authors note IRED sometimes assigns
+      lower energy to an invalid-but-plausible board than to the true solution. Better-shaped landscapes
+      — harder negatives, stronger constraints — are an open direction.</li>
+      <li><strong>Knowing when to stop.</strong> The energy value gauges difficulty, but the paper sets
+      $T$ by hand. A principled stopping rule that reads the energy and allocates compute automatically
+      is the natural next step.</li>
+      <li><strong>Scaling the search space.</strong> Gradient descent on a learned energy is elegant for
+      modest $\vy$; scaling to very high-dimensional or richly structured outputs (long plans, large
+      programs) without the landscape becoming intractable remains hard.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>Don't predict the answer — learn to <em>score</em> answers, then search. Smooth the search with
+    annealing so it doesn't get stuck, shape the landscape so the bottom is the truth, and verify each
+    step with the energy itself. Do that, and "think harder on harder problems" stops being a slogan and
+    becomes a slider you can drag. The 62.1% Sudoku number is impressive; the mental model behind it —
+    reasoning as descent you can extend at will — is the part worth keeping.</p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2406.11179" target="_blank" rel="noopener">arXiv:2406.11179</a>
+      &nbsp;·&nbsp; Project &amp; code: <a href="https://energy-based-model.github.io/ired/" target="_blank" rel="noopener">energy-based-model.github.io/ired</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

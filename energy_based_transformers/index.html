@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Energy-Based Transformers — an interactive explainer</title>
+  <meta name="description" content="An interactive walkthrough of Energy-Based Transformers (EBTs): models that learn to think by minimizing a learned energy landscape, entirely from unsupervised learning."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\E': '{\\mathbb{E}}',
+        '\\R': '{\\mathbb{R}}',
+        '\\yhat': '{\\hat{y}}',
+        '\\Etheta': '{E_{\\theta}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Energy-Based Transformers are Scalable Learners and Thinkers</h1>
+    <p class="byline">
+      Gladstone, Nanduru, Islam, Han, Ha, Chadha, Du, Ji, Li, Iqbal &middot; UVA · UIUC · Amazon · Stanford · Harvard &middot; July 2025 &middot;
+      <a href="https://arxiv.org/abs/2507.02092" target="_blank" rel="noopener">arXiv 2507.02092</a>
+      &middot; <a href="https://energy-based-transformers.github.io" target="_blank" rel="noopener">project page</a>
+    </p>
+    <p class="lede">
+      Today's "reasoning models" learn to think slowly only where an answer can be
+      checked by a rule — math, code — and only because someone built the checker.
+      This paper asks a sharper question: <em>can a model learn to think entirely
+      from unsupervised next-token prediction, on any problem, in any modality?</em>
+      The answer is yes, and the trick is disarmingly simple. Instead of generating a
+      prediction in one shot, an Energy-Based Transformer learns to <strong>score</strong>
+      how well a candidate prediction fits the context, then <strong>thinks</strong> by
+      rolling that candidate downhill on the learned score until it converges. Doing this
+      lets them out-scale the standard Transformer++ recipe by up to
+      <strong>35%</strong> during pretraining, squeeze <strong>29%</strong> more out of
+      extra inference compute where a vanilla Transformer gets nothing, and beat a
+      Diffusion Transformer at image denoising while using <strong>99% fewer</strong>
+      forward passes.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#two-systems">Two systems, one missing ability</a></li>
+      <li><a href="#verify">Verification is easier than generation</a></li>
+      <li><a href="#trick">The trick: thinking as energy minimization</a></li>
+      <li><a href="#training">Training a landscape you can roll down</a></li>
+      <li><a href="#animation">Watch a prediction think</a></li>
+      <li><a href="#verification-widget">Think, then check yourself</a></li>
+      <li><a href="#uncertainty">Uncertainty falls out for free</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/energy_landscape.png" alt="A learned energy landscape with gradient-descent optimization interpreted as a thinking process"/>
+      <figcaption><strong>Thinking, visualized.</strong> A learned energy landscape over candidate predictions. The model starts from a random guess (high energy) and follows the gradient downhill, progressively shifting toward a prediction that is <em>compatible</em> with the context. Each step's energy scalar tells the model how good its current guess is — and whether it should keep thinking. (Paper Figure 3, adapted from Li et al. 2018.)</figcaption>
+    </figure>
+
+    <p>For the last two years, "thinking" in AI has meant one specific thing: a chatbot
+      that produces a long chain of reasoning before answering, trained with reinforcement
+      learning against a reward. It works beautifully — on math and code. The catch is that
+      the recipe needs a <em>verifier</em>: a rule that can check whether the final answer is
+      right. That exists for arithmetic and unit tests. It does not exist for "is this a good
+      paragraph?" or "what does the next frame of this video look like?" So the most exciting
+      capability in modern AI is, today, fenced into a small corner of problems.</p>
+
+    <p>The same limitation shows up everywhere you look. Diffusion models can spend more
+      compute by taking more denoising steps — but they typically can't benefit beyond the
+      step count they were trained on, and they need an <em>external</em> verifier to do
+      anything smarter. Recurrent networks loop, but most only update their state with new
+      input; they have no mechanism to deliberate on a single decision. Across the board,
+      a feed-forward Transformer spends exactly the same amount of compute on the easiest
+      token and the hardest one.</p>
+
+    <p>This paper takes the question seriously — <em>can thinking emerge from plain
+      unsupervised learning, with no external verifier, on any modality?</em> — and answers
+      it by building the verifier <strong>into the model itself</strong>. Below we'll build up
+      the idea from scratch, and you'll get to roll predictions downhill on a real energy
+      landscape, run a best-of-N self-verification, and watch why a harder prediction
+      produces a rougher landscape.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="two-systems">
+    <h2>1. Two systems, one missing ability</h2>
+    <p>Psychologists split human cognition into two modes. <strong>System 1</strong> is fast,
+      automatic, intuitive — recognizing a face, completing "peanut butter and ___."
+      <strong>System 2</strong> is slow, effortful, deliberate — planning a route, working
+      through a proof, navigating a situation you've never seen before. Today's models are
+      superb at System 1 and shaky at System 2, and the authors trace this to three concrete
+      <em>facets</em> of deliberate thinking that standard architectures simply don't have.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/architecture.png" alt="EBT for autoregressive modeling: each step feeds a candidate prediction into the model, gets an energy, and updates the prediction via the gradient of that energy"/>
+      <figcaption><strong>An EBT predicting the next token.</strong> Each blue box is a candidate prediction at one step of thinking; the first is random. At every step the model emits an <em>energy</em> for how compatible that candidate is with the context, then takes the gradient of the energy with respect to the candidate and updates it. Iterating refines the prediction until the energy converges — so the model spends more steps when it needs them. (Paper Figure 2.)</figcaption>
+    </figure>
+
+    <p><strong>Facet 1 — dynamic compute.</strong> Humans spend more effort on harder
+      problems. Deciding what to eat for lunch is quick; deciding whether to change careers is
+      not. A vanilla Transformer has a fixed depth, so <em>per token</em> it always does the
+      same amount of work. <strong>Facet 2 — uncertainty.</strong> Before committing, humans
+      weigh how sure they are. In continuous spaces like vision, standard models give no
+      reliable confidence signal without bolt-on tricks. <strong>Facet 3 —
+      verification.</strong> Good thinkers check their own work, which lets them stop early
+      when they're confident or sample several options and keep the best. A feed-forward model
+      has no built-in notion of "how good is this output?"</p>
+
+    <p>Diffusion Transformers get Facet 1 for free — more denoising steps is more compute — but
+      they don't verify or estimate uncertainty. EBTs are designed to hit all three at once.
+      The figure above shows how: a single model that, at every step, reads a candidate
+      prediction and returns a scalar score, then improves the candidate by following that
+      score's gradient.</p>
+
+    <aside class="callout">
+      <strong>Why per-token matters.</strong> When people say an LLM "thinks longer," they
+      mean it generates more tokens of scratch-work. That's thinking at the level of a whole
+      sequence. EBTs do something different and more granular: they give <em>each individual
+      prediction</em> its own optimization loop. A hard token gets more steps than an easy one,
+      automatically, with no chain-of-thought required.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="verify">
+    <h2>2. Verification is easier than generation</h2>
+    <p>The whole approach rests on one old, deep idea from complexity theory: checking a
+      solution is usually far easier than producing one. Verifying that a path solves a maze is
+      trivial; <em>finding</em> the path is the hard part. This asymmetry is the foundation of
+      cryptography and of the P-versus-NP question, and it has a crucial consequence for
+      learning — a verifier tends to <strong>generalize</strong> better than a generator. A
+      model that learned to generate solutions to small mazes may flounder on big ones; a model
+      that learned to <em>check</em> whether a path is valid transfers far more readily.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/concept_ff.png" alt="Feed-forward model: input x maps directly to predicted y"/>
+      <img src="assets/figures/concept_ebm.png" alt="Energy-based model: input x and candidate y map to a scalar energy"/>
+      <figcaption><strong>Two ways to model.</strong> A feed-forward model (left) maps an input
+        $x$ straight to a prediction $\hat{y}$. An energy-based model (right) takes <em>both</em>
+        $x$ and a candidate $\hat{y}$ and returns a single number — the energy, or compatibility,
+        of that pair. Low energy means "these go together." Prediction becomes: search for the
+        $\hat{y}$ that minimizes the energy. (Paper Figure A-style schematic.)</figcaption>
+    </figure>
+
+    <p>Energy-Based Models (EBMs) are built directly on this principle. Rather than learning a
+      function that emits $\hat{y}$ from $x$, an EBM learns a <em>compatibility</em> function
+      $\Etheta(x, \hat{y})$ — the <strong>energy</strong> — that scores how well any candidate
+      $\hat{y}$ fits the context $x$. Low energy means high compatibility. Formally this defines
+      an unnormalized probability,</p>
+
+    <p class="eq">$$ p_\theta(x, \hat{y}) \;\propto\; e^{-\Etheta(x, \hat{y})}, $$</p>
+
+    <p>where we deliberately drop the intractable normalizing constant. We never need the exact
+      probability of a prediction — only which of two predictions is <em>more</em> compatible,
+      and the relative energies tell us that directly. Crucially, the same network that scores a
+      prediction is also what generates one: the generator is defined <em>implicitly</em> as
+      gradient descent on the verifier. Verifier and generator are one model, which sidesteps the
+      adversarial instability you get when a separate generator tries to fool a separate verifier.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="trick">
+    <h2>3. The trick: thinking as energy minimization</h2>
+    <p>Here is the move that makes everything work. If the model gives us a score
+      $\Etheta(x, \hat{y})$ and is fully differentiable, then we can compute the gradient of that
+      score with respect to the <em>prediction itself</em>, and walk the prediction downhill:</p>
+
+    <p class="eq">$$ \hat{y}_{i+1} \;=\; \hat{y}_i \;-\; \alpha \, \nabla_{\hat{y}_i} \Etheta(x, \hat{y}_i). $$</p>
+
+    <p>Start $\hat{y}_0$ as random noise. Feed $(x, \hat{y}_0)$ in, read the energy, take its
+      gradient with respect to $\hat{y}_0$, step in the downhill direction, repeat. Each step is
+      a forward-and-backward pass through the network; each step lowers the energy; the sequence
+      of $\hat{y}_i$ is the model's <em>train of thought</em> for that one prediction. The step
+      size $\alpha$ and the number of steps $N$ are the two knobs of thinking. This is the
+      whole mechanism — and it's worth feeling it directly.</p>
+
+    <div class="widget-frame" id="energy-descent">
+      <p class="widget-title">Roll a prediction downhill</p>
+      <p class="widget-sub">Click anywhere on the landscape to drop a random initial guess, then press <em>think</em>. The ball follows the energy gradient toward the minimum — a prediction compatible with the context. Try changing the step size, the number of steps, and toggling Langevin exploration noise.</p>
+      <!-- widget injected by JS -->
+    </div>
+
+    <p>Notice the trade-offs you can already feel. Too small a step size and the prediction
+      barely moves in $N$ steps; too large and it overshoots and oscillates. More steps means
+      more thinking — and on this smooth bowl, more thinking always helps. That property — "more
+      compute reliably buys more quality" — is exactly what feed-forward Transformers lack and
+      what makes EBTs scale at inference.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="training">
+    <h2>4. Training a landscape you can roll down</h2>
+    <p>How do you teach a network an energy landscape with a nice minimum at the right answer?
+      Not by maximum likelihood — on real data the "true" region is a razor-thin manifold, and
+      pushing energy to infinity off it makes the gradient (and therefore the thinking process)
+      undefined. And not by the classic contrastive recipe of pushing up the energy of negative
+      samples: in high dimensions there are exponentially many negatives, so it doesn't scale.</p>
+
+    <p>Instead, EBTs are trained by the <strong>optimization procedure itself</strong>. During
+      training you run the same gradient-descent thinking loop, then compute an ordinary loss
+      (cross-entropy for text, MSE for images) between the optimized prediction and the ground
+      truth — and backpropagate <em>through the entire loop</em>. This implicitly carves the
+      landscape so it slopes toward the true answer, making it locally convex around the data
+      without ever touching the partition function.</p>
+
+    <pre class="code"><code># Training one EBT step (Algorithm 1)
+y = randn_like(target)                 # start from noise
+for i in range(N):                     # the thinking loop
+    energy = E_theta(x, y)             # verifier: score the candidate
+    grad   = d_energy / d_y            # gradient w.r.t. the prediction
+    y      = y - alpha * grad          # generator: step downhill
+loss = J(y, target)                    # cross-entropy / MSE to ground truth
+loss.backward()                        # backprop THROUGH the whole loop
+update(theta)</code></pre>
+
+    <p>Backpropagating through gradient steps needs second-order derivatives — gradients of
+      gradients. That sounds frightening but isn't: it's done with Hessian-vector products that
+      scale linearly with model size, so a single-step EBT costs only about
+      <strong>1.66×</strong> a vanilla forward pass. And because the backbone is a Transformer,
+      it inherits the three properties EBMs historically lacked: parallelism, training stability,
+      and scalability. That marriage — EBM objective, Transformer body — is what "Energy-Based
+      Transformer" names.</p>
+
+    <p>Real landscapes don't smooth themselves out, though. The authors found three
+      <strong>energy-landscape regularization</strong> techniques essential for good thinking:
+      a <em>replay buffer</em> that simulates longer optimization trajectories so the region near
+      the minimum is well-shaped; a dose of <em>Langevin noise</em>
+      ($\hat{y}_{i+1} = \hat{y}_i - \alpha \nabla \Etheta + \eta_i,\; \eta_i \sim \mathcal{N}(0,\sigma)$)
+      that forces the model to explore the landscape rather than memorize one path to the
+      minimum; and <em>randomizing the step size and step count</em> during training so the
+      landscape stays well-behaved over a whole range of thinking budgets. The exploration noise
+      is the Langevin toggle in the widget above — flip it on and watch the descent jitter as it
+      probes its surroundings.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="animation">
+    <h2>5. Watch a prediction think</h2>
+    <p>Here is the entire idea in motion. A candidate prediction starts as a random guess high on
+      the landscape and follows the gradient down to the minimum, where the energy converges — the
+      model's signal that it's done. Then the landscape morphs: a <em>harder</em> token produces a
+      rougher landscape, the descent gets stuck in a shallow basin, and the energy stays high. That
+      stuck-with-high-energy state <em>is</em> the model's representation of uncertainty.</p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/energy_descent.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">Thinking as energy minimization. Smooth, convex landscape → fast
+      convergence to a confident, low-energy prediction. Rugged landscape → the descent stalls,
+      energy stays high, and the model "knows" it is uncertain and needs to keep exploring.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="verification-widget">
+    <h2>6. Think, then check yourself</h2>
+    <p>Because the model outputs an actual score, it can do something a generator can't: produce
+      several candidate predictions and <strong>keep the one with the lowest energy</strong>. This
+      is the EBT version of best-of-N sampling — but with no external reward model, applied to
+      every single prediction, in any modality. On a rugged landscape with multiple basins, a
+      single random start might roll into a so-so local minimum. Launch a handful of starts and
+      the odds that at least one finds the deep, global minimum climb fast.</p>
+
+    <div class="widget-frame" id="self-verification">
+      <p class="widget-title">Best-of-N self-verification</p>
+      <p class="widget-sub">Launch <em>N</em> random initializations on the same rugged landscape. Each one descends to a minimum; the model then verifies them all and keeps the lowest-energy winner. Slide <em>N</em> up and watch the chance of finding the global optimum improve.</p>
+      <!-- widget injected by JS -->
+    </div>
+
+    <p>This is the second axis of thinking — "self-verification" — alongside "thinking longer."
+      The paper finds that the two compose: using more steps <em>and</em> picking the best of
+      several candidates beats either alone. And reassuringly, EBTs become <em>more</em> robust at
+      self-verification as they train on more data, rather than collapsing into the adversarial
+      failure modes that plague separate generator/verifier setups.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="uncertainty">
+    <h2>7. Uncertainty falls out for free</h2>
+    <p>Here's a lovely consequence the model was never explicitly trained for. Some predictions are
+      genuinely easy — after "the quick brown ___," the word "fox" is overdetermined. Others are
+      hard — "the ___" could be almost anything. An EBT signals this through the <em>shape</em> of
+      the landscape: easy tokens get a deep, smooth bowl that the descent drops into immediately
+      and reaches a low final energy; hard tokens get a shallow, rugged surface where the energy
+      stays high and never quite converges. The energy itself becomes a calibrated confidence
+      signal — in continuous spaces like vision, where standard models struggle to express
+      uncertainty at all.</p>
+
+    <div class="widget-frame" id="uncertainty-tokens">
+      <p class="widget-title">Easy tokens vs hard tokens</p>
+      <p class="widget-sub">Pick a token to predict. Easy, predictable tokens carve a deep smooth well — the descent converges fast to low energy (confident). Hard tokens leave a rugged, shallow landscape — energy stays high and bumpy (uncertain). Watch both the landscape and the energy-vs-step curve.</p>
+      <!-- widget injected by JS -->
+    </div>
+
+    <p>The paper shows exactly this on real text: function words like "the," "but," "a," and "."
+      optimize to low energies quickly, while content words like "quick," "brown," "research," and
+      "problem" stay high and struggle to converge — all learned from unsupervised next-token
+      prediction with no uncertainty supervision whatsoever. The same pattern appears in video,
+      where empty frames read as high-uncertainty and frames with a clearly revealed object read as
+      low-uncertainty.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>8. Results</h2>
+    <p>The headline isn't just that EBTs work — it's that they <strong>scale better</strong>. The
+      authors compare against the Transformer++ recipe (the modern LLaMA-style decoder) for
+      autoregressive modeling and against a Diffusion Transformer for bidirectional image
+      modeling, training everything from scratch under a fixed compute budget.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/learning_scaling.png" alt="Language learning scalability across data, batch size, and depth; EBT out-scales Transformer++"/>
+      <figcaption><strong>Learning scalability (Paper Figure 4).</strong> Validation perplexity as
+        a function of data, batch size, and depth. EBTs start a touch worse but their scaling
+        <em>rate</em> is steeper — up to <strong>35.98%</strong> faster with respect to data — so
+        the lines cross and EBTs pull ahead. EBTs are the first approach to out-scale the
+        Transformer++ recipe across multiple axes without changing the tokenizer.</figcaption>
+    </figure>
+
+    <p>This held across <em>every</em> axis they measured — data, batch size, depth, parameters,
+      FLOPs, width — and on continuous video too, where the scaling-rate gap exceeded 33%. The
+      data-efficiency result is the one to dwell on: data is becoming the binding constraint on
+      frontier models, and EBTs appear to be the first architecture that learns <em>more per
+      token of data</em> than the standard recipe.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/thinking_ood.png" alt="Thinking longer and self-verification reduce EBT perplexity on OOD data while Transformer++ stays flat"/>
+      <img src="assets/figures/thinking_helps_ood.png" alt="Thinking helps more the further out-of-distribution the data is, a roughly linear trend"/>
+      <figcaption><strong>Thinking scalability (Paper Figures 6–7).</strong> Left: on
+        out-of-distribution data, more forward passes (thinking longer) plus self-verification
+        steadily lower an EBT's perplexity, while the Transformer++ flatlines — it cannot improve a
+        prediction by thinking. Right: the further out-of-distribution the data, the more thinking
+        helps, in a strikingly linear trend — exactly the regime where humans lean on System 2.</figcaption>
+    </figure>
+
+    <table class="results">
+      <thead>
+        <tr><th>Setting</th><th>Metric</th><th>EBT</th><th>Baseline</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="2" class="cat">Language: learning</td>
+          <td>Data scaling rate vs Transformer++</td>
+          <td class="win"><strong>+35.98%</strong></td>
+          <td>— <em>(Transformer++)</em></td>
+        </tr>
+        <tr>
+          <td>Batch-size scaling rate vs Transformer++</td>
+          <td class="win"><strong>+28.46%</strong></td>
+          <td>— <em>(Transformer++)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Language: thinking</td>
+          <td>Perplexity gain from extra inference compute (↑)</td>
+          <td class="win"><strong>≈29%</strong></td>
+          <td>≈0% <em>(Transformer++)</em></td>
+        </tr>
+        <tr>
+          <td>GSM8K perplexity, equal/worse pretraining (↓)</td>
+          <td class="win"><strong>43.3</strong></td>
+          <td>49.6 <em>(Transformer++)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="3" class="cat">Vision (bidirectional)</td>
+          <td>OOD denoising PSNR, σ=0.2 (↑)</td>
+          <td class="win"><strong>23.29</strong></td>
+          <td>19.56 <em>(DiT)</em></td>
+        </tr>
+        <tr>
+          <td>Forward passes vs DiT to match/beat it (↓)</td>
+          <td class="win"><strong>99% fewer</strong></td>
+          <td>100× more <em>(DiT)</em></td>
+        </tr>
+        <tr>
+          <td>ImageNet-1k linear-probe Top-1 (↑)</td>
+          <td class="win"><strong>5.32%</strong></td>
+          <td>0.31% <em>(DiT)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Numbers from the paper's Tables 2–3 and Figures 4–7. All models trained from
+      scratch under matched, small compute budgets; perplexity is reported because these models are
+      far below foundation scale. PSNR on COCO denoising; the OOD column tests a higher noise level
+      ($\sigma=0.2$) than training ($\sigma=0.1$).</p>
+
+    <p>The denoising result is the most vivid. An EBT matches or beats a Diffusion Transformer's
+      image quality using one forward pass for every hundred the DiT takes — and the gap is largest
+      on out-of-distribution noise. Slide through the thinking budget below to see how the two
+      paradigms diverge.</p>
+
+    <div class="widget-frame" id="thinking-payoff">
+      <p class="widget-title">More thinking, more payoff — but only for EBTs</p>
+      <p class="widget-sub">Scale up the inference compute (forward passes) and choose how far out-of-distribution the test data is. The EBT's error falls as it thinks more, and falls faster the more OOD the data; the feed-forward baseline can't cash in extra compute at all.</p>
+      <!-- widget injected by JS -->
+    </div>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/denoising.png" alt="Qualitative OOD image denoising: EBT outputs are sharper than DiT outputs while using far fewer steps"/>
+      <figcaption><strong>Qualitative denoising (Paper Figure 8).</strong> Out-of-distribution image
+        denoising. EBT reconstructions (using one step per 100 DiT steps) are noticeably sharper and
+        less blurry than the Diffusion Transformer's. Better quality, two orders of magnitude less
+        compute.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>9. Why this works</h2>
+    <p>Three intuitions explain why a slightly more expensive per-step model ends up ahead — and
+      why it keeps pulling further ahead with scale.</p>
+
+    <h3>Learning to verify generalizes better than learning to generate</h3>
+    <p>This is the deepest reason. A verifier captures the <em>structure</em> of what makes an
+      answer good, which transfers to inputs it has never seen; a generator memorizes a mapping,
+      which doesn't. The paper's cleanest evidence: take an EBT with <em>slightly worse</em>
+      pretraining perplexity than a Transformer++ and it still wins on most downstream tasks
+      (GSM8K, BigBench Math QA, Dyck). Same or worse fit to the training distribution, better
+      generalization beyond it — that's the fingerprint of a model that learned to check rather
+      than to parrot.</p>
+
+    <h3>One coupled model avoids the adversarial trap</h3>
+    <p>Every prior attempt to combine a generator with a verifier — tree search over an LLM, a
+      separate reward model — pays for it with instability and a hunger for samples. Because an
+      EBT's generator <em>is</em> the gradient of its verifier, there is nothing to fool and
+      nothing to game. The paper shows self-verification getting <em>more</em> reliable with scale,
+      the opposite of the adversarial collapse seen elsewhere.</p>
+
+    <h3>An energy scalar is a free uncertainty meter</h3>
+    <p>Because the model emits a compatibility score at every step, it always knows how good its
+      current guess is. That single number underwrites all three facets at once: it decides
+      <em>when to stop</em> thinking (dynamic compute), it <em>is</em> the uncertainty estimate, and
+      it ranks candidates for verification. The reason thinking helps more the further
+      out-of-distribution you go is that OOD inputs produce rougher landscapes — and rougher
+      landscapes are exactly where extra optimization steps and extra samples pay off.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>10. What it means</h2>
+    <p>The reigning recipe treats thinking as a bolt-on: pretrain a generator, then teach it to
+      reason with reinforcement learning against a hand-built verifier, in the narrow domains where
+      one exists. EBTs reframe thinking as something <em>intrinsic</em> to prediction. The verifier
+      isn't external; it's the model. Thinking isn't a special mode; it's the optimization you run
+      to make any prediction. And because it all comes from unsupervised learning, it isn't fenced
+      into math and code — it works on text, images, and video the same way.</p>
+
+    <p>The honest caveats matter, and the authors are upfront about them. EBTs are still small —
+      no one has trained a foundation-scale one, and the case rests on scaling <em>rates</em>
+      extrapolated forward, which is a real bet, not a proof. Each step costs more than a
+      feed-forward pass, and backprop through the thinking loop adds engineering friction. The
+      thinking gains only emerged at sufficient data scale. So this is best read as a new and
+      unusually principled <em>paradigm</em> with strong early signal, not a finished system.</p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Does the scaling hold?</strong> The whole thesis is that EBTs cross over and stay
+        ahead at foundation scale. That crossover has been demonstrated at small scale across many
+        axes; confirming it at billions of parameters and trillions of tokens is the decisive
+        experiment.</li>
+      <li><strong>Taming the landscape.</strong> Keeping high-dimensional energy landscapes smooth
+        and convex enough to optimize is still partly an art — the replay buffer, Langevin noise,
+        and randomized schedules are necessary today and not yet fully understood.</li>
+      <li><strong>Convergence as a stopping rule.</strong> Using energy convergence to decide
+        when to stop thinking — true per-token dynamic compute — is sketched but not yet a robust,
+        deployed mechanism.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>For two years "thinking" has meant generating more words and checking them against a rule
+      someone wrote. Energy-Based Transformers offer a different answer: give a model a way to score
+      its own predictions, and thinking becomes nothing more than rolling downhill on that score
+      until it settles. It's slower per step and the jury is still out at scale — but it's the first
+      recipe where deliberate, verified, uncertainty-aware thinking emerges from plain unsupervised
+      learning, on any problem, in any modality. If the scaling lines keep their slope, that's not a
+      tweak to how models think. It's a new place to stand.</p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2507.02092" target="_blank" rel="noopener">arXiv:2507.02092</a>
+      &nbsp;·&nbsp; Project: <a href="https://energy-based-transformers.github.io" target="_blank" rel="noopener">energy-based-transformers.github.io</a>
+      &nbsp;·&nbsp; Code: <a href="https://github.com/alexiglad/EBT" target="_blank" rel="noopener">github.com/alexiglad/EBT</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>
