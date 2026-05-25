@@ -15,6 +15,17 @@
 
 const BLOGS = [
   {
+    slug: "ebt_policy",
+    title: "EBT-Policy: Energy Unlocks Emergent Physical Reasoning",
+    tag: "robot policy · energy-based",
+    authors: "Davies, Huang, Gladstone, Liu, Chen, Ji, Liu, Hu",
+    venue: "ZhiCheng AI · UIUC · Tsinghua · Peking U",
+    date: "October 2025",
+    paper: "arXiv 2510.27545",
+    blurb: `Diffusion Policy generates a robot's next moves by reversing a fixed ~100-step noise schedule — slow, and once it drifts out-of-distribution it cannot recover. EBT-Policy throws out the schedule: it learns a single <em>energy landscape</em> over action trajectories and generates by rolling downhill. The payoff is the same task in <strong>as few as 2 inference steps instead of 100</strong> (a 50× cut), in 55% fewer training epochs — and a behavior-cloned policy that <strong>retries after a failure it was never trained to recover from</strong>.`,
+    highlights: "4 widgets · 1 manim · ~3,100 words",
+  },
+  {
     slug: "energy_based_transformers",
     title: "Energy-Based Transformers are Scalable Learners and Thinkers",
     tag: "energy-based · System 2 thinking",

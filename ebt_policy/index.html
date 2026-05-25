@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EBT-Policy: Energy Unlocks Emergent Physical Reasoning — an interactive explainer</title>
+  <meta name="description" content="An interactive explainer of EBT-Policy: replacing diffusion's noise schedule with energy descent over action trajectories — 50x fewer inference steps, and emergent retry from plain behavior cloning."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vx': '{\\mathbf{x}}',  '\\vy': '{\\mathbf{y}}',  '\\vz': '{\\mathbf{z}}',
+        '\\va': '{\\mathbf{a}}',  '\\vo': '{\\mathbf{o}}',
+        '\\Eth': '{E_\\theta}',
+        '\\A': '{\\mathcal{A}}',
+        '\\argmin': '{\\operatorname*{arg\\,min}}',
+        '\\vtheta': '{\\boldsymbol{\\theta}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>EBT-Policy: Energy Unlocks Emergent Physical Reasoning</h1>
+    <p class="byline">
+      Davies, Huang, Gladstone, Liu, Chen, Ji, Liu, Hu &middot; ZhiCheng AI · UIUC · Tsinghua · Peking U &middot; October 2025 &middot;
+      <a href="https://arxiv.org/abs/2510.27545" target="_blank" rel="noopener">arXiv 2510.27545</a>
+    </p>
+    <p class="lede">
+      Behavior cloning has a default engine: <strong>Diffusion Policy</strong>, which generates a robot's
+      next moves by reversing a fixed noise schedule — roughly a hundred tiny denoising steps from static to a
+      plan. It works, but it is slow, it drifts when the world surprises it, and once it drifts it cannot
+      recover. EBT-Policy throws out the noise schedule. It learns a single <em>energy landscape</em> over
+      action trajectories and generates by rolling downhill — <em>argmin</em>, not denoise. The payoff: the
+      same task solved in <strong>as few as 2 inference steps instead of 100</strong> (a 50× cut), in
+      <strong>55% fewer training epochs</strong>, and — most strikingly — a behavior-cloned policy that
+      <strong>retries after a failure it was never trained to recover from</strong>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#diffusion-default">The diffusion default, and its cracks</a></li>
+      <li><a href="#energy-not-score">Energy, not score</a></li>
+      <li><a href="#rolling-downhill">Generating actions by rolling downhill</a></li>
+      <li><a href="#recipe">The recipe: making EBMs trainable</a></li>
+      <li><a href="#dynamic">Dynamic inference: think longer when unsure</a></li>
+      <li><a href="#results">Results: faster, cheaper, better</a></li>
+      <li><a href="#emergent">The surprise: retry without retry data</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/energy_landscape.png" alt="EBT-Policy energy landscape diagram: a candidate action trajectory descends a learned energy surface toward a low-energy minimum."/>
+      <figcaption>
+        EBT-Policy generates by searching for a <em>low-energy</em> action trajectory $z$ — in joint or
+        Cartesian space — through energy minimization. The surface is learned end-to-end; inference is the
+        act of descending it. (Figure 1.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Teaching a robot to fold a towel or hang a tool by showing it human demonstrations is called
+      <strong>behavior cloning</strong>. The hard part isn't memorizing one good motion — it's that for any
+      observation there are <em>many</em> reasonable next moves, and a naive network that regresses to the
+      average of them produces mush. The field's answer, borrowed from image generation, was to make the
+      policy <em>generative</em>: model the whole distribution of plausible action sequences and sample from
+      it. Diffusion Policy did exactly that and became the default.
+    </p>
+    <p>
+      But a diffusion policy carries diffusion's baggage into the robot. It denoises along a fixed,
+      externally-imposed schedule; it needs many forward passes per decision; and its chain-structured
+      sampling means an early mistake compounds downstream. In a simulator that's an annoyance. On a real arm,
+      where contact forces nudge the world out of distribution every few seconds, it's a failure mode.
+    </p>
+    <p>
+      This paper asks: what if the policy learned the <em>energy</em> of an action sequence directly — a single
+      scalar saying "how compatible is this plan with what I see?" — and generated by minimizing it? That one
+      change buys speed, robustness, and a behavior nobody put in the training set.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="diffusion-default">
+    <h2>1. The diffusion default, and its cracks</h2>
+    <p>
+      Diffusion Policy is a <em>score-based</em> model. During training it corrupts a demonstration trajectory
+      with noise and teaches a network $\epsilon_\theta(\mathbf{a}_t, t, \ell, \mathbf{o}_t)$ to undo one step of that
+      corruption. Through denoising score matching, the network ends up estimating the gradient of the
+      log-likelihood of demonstrations,
+    </p>
+    <p class="eq">$$ \nabla_{\mathbf{a}} \log p(\mathbf{a}\mid \ell, \mathbf{o}_t), $$</p>
+    <p>
+      — the direction in action space that makes a trajectory <em>more like</em> the demonstrations. At
+      inference you start from pure noise and follow this score downhill for a fixed number of steps (often
+      100), and out pops a feasible plan. It is stable and it models multimodality well. So what's wrong?
+    </p>
+    <p>
+      Three things, all rooted in the same design decision — the reliance on an external noise schedule. First,
+      <strong>cost</strong>: the schedule dictates the number of denoising steps, and that number is large.
+      Second, <strong>exposure bias</strong>: training always conditions on a <em>correctly</em> noised input,
+      but at inference the model conditions on its own imperfect intermediate outputs; the train/test mismatch
+      lets errors accumulate down the chain. Third, and worst for robotics, <strong>brittleness under
+      distribution shift</strong>: a diffusion policy commits to a denoising trajectory. If the world shoves it
+      into a state it never saw — the hook slips, the towel bunches — there is no mechanism that pulls it back
+      toward feasible behavior. It drifts, and the drift compounds.
+    </p>
+    <aside class="callout">
+      <strong>Why not just use a plain regressor?</strong> Because demonstration data is multimodal: faced with
+      the same scene, a human might reach left or right, and averaging those gives a path that goes
+      straight into the table. Generative policies exist precisely to represent "many valid answers" without
+      collapsing to their mean. The question is <em>how</em> you represent that distribution.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="energy-not-score">
+    <h2>2. Energy, not score</h2>
+    <p>
+      An <strong>Energy-Based Model</strong> represents a distribution with a single learned scalar function,
+      the <em>energy</em>, through a Boltzmann form:
+    </p>
+    <p class="eq">$$ p_\theta(\mathbf{a}) = \frac{e^{-E_\theta(\mathbf{a})}}{Z(\theta)}. $$</p>
+    <p>
+      Low energy means high probability. The partition function $Z(\theta)$ is intractable, so EBT-Policy uses an
+      <em>unnormalized</em> EBM: it never computes $Z$, only relative energies, which is all you need to find a
+      minimum. The energy $E_\theta(\ell, \mathbf{o}_t, \mathbf{a})$ scores how compatible a candidate action sequence
+      $\mathbf{a}$ is with the language goal $\ell$ and the recent observations $\mathbf{o}_t$. Generation is then just
+      an optimization:
+    </p>
+    <p class="eq">$$ \pi:\quad \argmin_{\mathbf{a}\in\mathcal{A}^n}\ E_\theta(\ell, \mathbf{o}_t, \mathbf{a}). $$</p>
+    <p>
+      Here is the key relationship that makes this feel familiar. Differentiate the Boltzmann form and the
+      score a diffusion model learns is <em>exactly the negative gradient of the energy</em>:
+    </p>
+    <p class="eq">$$ \nabla_{\mathbf{a}} \log p(\mathbf{a}\mid \ell, \mathbf{o}_t) = -\,\nabla_{\mathbf{a}} E_\theta(\ell, \mathbf{o}_t, \mathbf{a}). $$</p>
+    <p>
+      So diffusion and EBTs are looking at the same landscape from two heights. <strong>Diffusion learns the
+      gradient of the energy</strong> (the slope, everywhere, as a function of noise level). <strong>An EBT
+      learns the energy itself</strong> (the height). That sounds like a minor bookkeeping difference. It is
+      not — having the scalar in hand is what gives EBT-Policy a built-in verifier, a notion of certainty, and
+      a way to recover. Drag the probe below to feel the distinction.
+    </p>
+
+    <div class="widget-frame" id="score-energy">
+      <p class="widget-title">Score vs. energy — two views of the same landscape</p>
+      <p class="widget-sub">Move the probe along action space. Diffusion gives you the <em>arrow</em> (the slope, −E′); an EBT gives you the <em>height</em> (the scalar E). Toggle which one you "see."</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="rolling-downhill">
+    <h2>3. Generating actions by rolling downhill</h2>
+    <p>
+      Concretely, EBT-Policy is an Energy-Based <em>Transformer</em>. At each timestep it takes an $h$-step
+      window of observations — RGB frames $X_{t-h+1:t}$ and proprioceptive states $z_{t-h+1:t}$ — plus an
+      optional language instruction $\ell$, and it must output the next $n$ actions
+      $a_{t:t+n-1}$. It does this by initializing a trajectory from pure noise and repeatedly stepping it
+      downhill on the energy:
+    </p>
+    <p class="eq">$$ \hat{\mathbf{y}}_{i+1} = \hat{\mathbf{y}}_{i} - \alpha_i\, \nabla_{\hat{\mathbf{y}}} E_\theta(\mathbf{x}, \hat{\mathbf{y}}_{i}) + \eta_i. $$</p>
+    <p>
+      That update is gradient descent on the energy with a step size $\alpha_i$ and a dash of injected noise
+      $\eta_i$ — which makes it <em>Langevin dynamics</em>, a Markov-Chain Monte Carlo sampler. The noise lets
+      the search explore rather than fall into the nearest dent; the gradient pulls it toward compatible
+      actions. Crucially, the path from noise to a plan is <strong>learned end-to-end</strong>: there is no
+      noise schedule, no ODE solver, no fixed number of steps the model must obey. It takes whatever route down
+      the landscape works.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/energy_descent.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      A candidate action trajectory starts as noise high on the learned energy landscape and rolls downhill —
+      over a couple of shallow local minima (competing modes) — into the deep basin of valid actions. Then a
+      <em>covariate shift</em> knocks it out-of-distribution, and it re-descends on its own. That last move is
+      the emergent retry we'll come back to in §7.
+    </p>
+
+    <p>
+      The widget below lets you be the physics. Drop a noise initialization anywhere, then watch the candidate
+      descend. Crank the Langevin noise up and it escapes shallow minima but jitters; turn it down and it
+      converges precisely but can get stuck. The descent stops itself when the gradient flattens out — hold
+      that thought for §5.
+    </p>
+
+    <div class="widget-frame" id="energy-descent">
+      <p class="widget-title">Energy-descent playground</p>
+      <p class="widget-sub">Click to place a noise init, then press descend. Tune step size $\eta$ and Langevin noise $\sigma$, and watch the energy and gradient norm fall.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="recipe">
+    <h2>4. The recipe: making EBMs trainable</h2>
+    <p>
+      Energy-based policies are an old idea (Implicit Behavior Cloning tried it in 2021) that never caught on,
+      for two stubborn reasons. <strong>(1) Multimodality tempts local minima:</strong> demonstration data has
+      many valid modes, and naive energy training carves spurious wells the sampler falls into. <strong>(2)
+      The MCMC chain explodes:</strong> backpropagating through a long sequence of gradient-descent steps is
+      like training a deep recurrent net — gradients blow up. EBT-Policy's contribution is a set of concrete
+      tricks that defuse both, while keeping a modern Transformer and a <em>regularized</em> (not contrastive)
+      loss. The training-only tricks promote exploration across modes:
+    </p>
+    <ul>
+      <li><strong>Randomized sampling steps.</strong> The number of MCMC steps is randomized each iteration, so the model learns to reach the basin from many chain lengths rather than memorizing one.</li>
+      <li><strong>Scaled Langevin dynamics with cosine annealing.</strong> Injected noise decays from $\sigma_{\max}$ to $\sigma_{\min}$ over the chain — broad exploration early, precise convergence late:
+        <p class="eq">$$ \sigma_t = \sigma_{\min} + \tfrac{1}{2}\left(\sigma_{\max} - \sigma_{\min}\right)\left[\,1 + \cos\!\left(\frac{\pi\, t}{T}\right)\right]. $$</p>
+      </li>
+      <li><strong>Step-size randomization.</strong> The initial step is drawn as $\eta \sim \mathcal{N}(\eta_b/c,\ \eta_b\, c)$, diversifying sampling trajectories.</li>
+      <li><strong>Nesterov acceleration.</strong> Momentum smooths traversal of the landscape and helps escape shallow minima — exactly what you saw the ball do in the animation.</li>
+    </ul>
+    <p>And three mechanisms keep the optimization from detonating:</p>
+    <ul>
+      <li><strong>Energy-scaled step sizes.</strong> The step grows with predicted energy, so the model takes bold steps when far from a minimum and gentle ones near it: <span class="nowrap">$\alpha_i = \eta\, \exp\!\big(E_\theta(\mathbf{x}, \hat{\mathbf{y}}_i)\big)$</span>.</li>
+      <li><strong>Pre-sample normalization.</strong> Trajectories are RMSNorm-ed to $[-1,1]$ before entering the network, preventing runaway action magnitudes.</li>
+      <li><strong>Gradient clipping</strong> to a global norm of 1.0 — which the authors call empirically <em>the single most critical</em> ingredient for stable training.</li>
+    </ul>
+
+    <figure class="hp-table">
+      <table class="results compact">
+        <tbody>
+          <tr><td>Base step size $\eta_b$</td><td>1000</td><td>Step-size scaling $c$</td><td>1.5</td></tr>
+          <tr><td>Min. LD scale $\sigma_{\min}$</td><td>0.002</td><td>Max. LD scale $\sigma_{\max}$</td><td>0.2</td></tr>
+          <tr><td>Base MCMC train steps</td><td>6</td><td>Randomized extra steps</td><td>3</td></tr>
+          <tr><td>Max MCMC inference steps</td><td>20</td><td>Gradient-clip norm</td><td>1.0</td></tr>
+        </tbody>
+      </table>
+      <figcaption>EBT-Policy training hyperparameters (Table 1).</figcaption>
+    </figure>
+
+    <p>
+      The training loop itself is short. Notice the loss: at <em>every</em> MCMC step the partially-descended
+      trajectory is compared to the ground-truth demonstration. This is the EBT trick — supervise the whole
+      descent, not just its endpoint — and it sidesteps the exponential negative-sampling that sank
+      contrastive energy policies.
+    </p>
+    <pre class="code"><code>EBT-Policy training step  (context x, target y)
+  ŷ₀ ~ N(0, I)                      # start from pure noise
+  z  ← f_θ(x)                       # encode RGB + proprio + language
+  L  ← 0
+  for i = 0 … N-1:
+      ŷᵢ   ← RMSNorm(ŷᵢ) + N(0, σᵢ)          # pre-norm + annealed Langevin noise
+      ŷᵢ₊₁ ← ŷᵢ − αᵢ · ∇_ŷ E_θ(z, ŷᵢ)        # energy-scaled descent step
+      L    ← L + MSE(ŷᵢ₊₁, y)                # supervise every step
+  update E_θ with ∇L  (clip grad norm to 1.0)</code></pre>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="dynamic">
+    <h2>5. Dynamic inference: think longer when unsure</h2>
+    <p>
+      A diffusion policy always runs its fixed number of steps, whether the decision is trivial or treacherous.
+      EBT-Policy doesn't have a step count baked in — it has a <em>stopping criterion</em>. It keeps descending
+      until either it hits a step ceiling $N$ or the energy gradient norm $\lVert g\rVert_2$ drops below a
+      threshold $\tau$:
+    </p>
+    <pre class="code"><code>EBT-Policy dynamic inference  (context x)
+  ŷ₀ ~ N(0, I);  z ← f_θ(x);  i ← 0;  g ← ∞
+  while i &lt; N  and  ‖g‖₂ &gt; τ:
+      ŷᵢ   ← RMSNorm(ŷᵢ)
+      g    ← ∇_ŷ E_θ(z, ŷᵢ)        # the gradient *is* the certainty signal
+      ŷᵢ₊₁ ← ŷᵢ − αᵢ · g
+      i    ← i + 1
+  return ŷ</code></pre>
+    <p>
+      Because the gradient norm measures how far the trajectory still is from a minimum, this loop spends
+      compute where it's needed: an easy, in-distribution state converges in one or two steps; a hard or
+      uncertain state earns more. This is <em>System-2-style</em> adaptive computation, falling out for free
+      from the energy formulation — no separate controller, no learned halting head. The scalar energy is doing
+      double duty as both the objective and the confidence meter.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>6. Results: faster, cheaper, better</h2>
+    <p>
+      Two variants are tested. <strong>EBT-Policy-S</strong> (~30M params, ResNet-18 vision) copies Diffusion
+      Policy's architecture exactly for an apples-to-apples simulation comparison on robomimic. <strong>EBT-Policy-R</strong>
+      (~100M, DINOv3 vision, T5 language) is the real-world, language-conditioned, multitask model deployed on a
+      dual-arm tabletop rig. All baselines are diffusion transformers of comparable size trained on identical
+      data — no billion-parameter VLA pretraining muddying the comparison.
+    </p>
+
+    <figure class="paper-figure four-up">
+      <img src="assets/figures/lift.png" alt="robomimic Lift task"/>
+      <img src="assets/figures/can.png" alt="robomimic Can task"/>
+      <img src="assets/figures/square.png" alt="robomimic Square task"/>
+      <img src="assets/figures/tool_hang.png" alt="robomimic Tool Hang task"/>
+      <figcaption>The four robomimic simulation tasks, in increasing difficulty: Lift, Can, Square, Tool Hang.</figcaption>
+    </figure>
+
+    <p>
+      In simulation, EBT-Policy-S beats Diffusion Policy on every task — and does it whether DP is given its
+      preferred 100 inference steps or starved to 10. At 10 steps, DP simply fails (0% everywhere); EBT-Policy
+      stays strong at just <strong>2</strong> steps. On the hardest task, Tool Hang, it improves the success
+      rate by 24 points.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Simulated task (success %)</th><th>Lift</th><th>Can</th><th>Square</th><th>Tool&nbsp;Hang</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">Diffusion Policy (n=10)</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+        <tr><td class="cat">Diffusion Policy (n=100)</td><td><strong>100</strong></td><td><strong>100</strong></td><td>92</td><td>44</td></tr>
+        <tr><td class="cat">EBT-Policy-S (n≈2)</td><td class="win"><strong>100</strong></td><td class="win"><strong>100</strong></td><td class="win"><strong>98</strong></td><td class="win"><strong>68</strong></td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      On the real dual-arm rig the gap widens where it matters most — deformable, contact-rich manipulation. On
+      <em>Fold Towel</em>, Diffusion Policy manages 10%; EBT-Policy-R hits <strong>86%</strong>.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Real-world task (success %)</th><th>Fold&nbsp;Towel</th><th>Collect&nbsp;Pan</th><th>Pick&nbsp;&amp;&nbsp;Place</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">Diffusion Policy</td><td>10</td><td>65</td><td>90</td></tr>
+        <tr><td class="cat">EBT-Policy-R</td><td class="win"><strong>86</strong></td><td class="win"><strong>75</strong></td><td class="win"><strong>92</strong></td></tr>
+      </tbody>
+    </table>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/step_performance.png" alt="Success rate during training: EBT-Policy reaches 100% by epoch 30 using 2 steps; Diffusion Policy needs 90 epochs and 100 steps."/>
+      <figcaption>
+        Success rate vs. training epoch. EBT-Policy (using just 2 inference steps) reaches 100% by epoch 30;
+        Diffusion Policy needs ~90 epochs and 50× more inference steps to match it. (Figure 6.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Put together: ~50× fewer inference iterations, ~55% fewer training epochs, and higher final success — the
+      efficiency story isn't a trade-off against quality, it's a clean win. The widget below sweeps the
+      inference-step budget so you can watch the two policies diverge.
+    </p>
+
+    <div class="widget-frame" id="steps-compare">
+      <p class="widget-title">Inference-step budget — where the 50× lives</p>
+      <p class="widget-sub">Slide the number of inference steps and watch per-task success for Diffusion Policy vs. EBT-Policy on the four robomimic tasks.</p>
+    </div>
+
+    <figure class="paper-figure three-up">
+      <img src="assets/figures/fold_towel.png" alt="Fold Towel real-world task"/>
+      <img src="assets/figures/collect_pan.png" alt="Collect Pan real-world task"/>
+      <img src="assets/figures/pick_and_place.png" alt="Pick and Place real-world task"/>
+      <figcaption>Real-world tabletop demonstrations: Fold Towel, Collect Pan, and a two-arm Pick &amp; Place hand-off.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="emergent">
+    <h2>7. The surprise: retry without retry data</h2>
+    <p>
+      Here is the result that makes this paper more than an efficiency note. On Tool Hang, the authors nudge the
+      hook into a configuration the policy never saw — a genuine out-of-distribution perturbation. Diffusion
+      Policy does what diffusion policies do: it loses the plot, releases the tool, and diverges. EBT-Policy,
+      with no retry demonstrations and no reward signal, <strong>re-grasps, repositions, and completes the
+      task</strong>. To the authors' knowledge, this is the first time a vanilla behavior-cloned policy — one
+      that only ever outputs instantaneous actions — has shown emergent retry.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/retry_compare.png" alt="Diffusion Policy diverges after missing the hook; EBT-Policy recovers and retries."/>
+      <figcaption>
+        After an OOD perturbation, Diffusion Policy (top) compounds error and diverges. EBT-Policy (bottom)
+        recovers and retries the hook — despite never seeing such a failure or being trained to recover from
+        one. (Figure 7.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Why would minimizing an energy produce retrying? Because the energy is defined over the whole trajectory
+      and is <em>time-invariant</em>: a failed, out-of-distribution state is simply a high-energy state, and the
+      only thing the policy ever does is descend energy. So the same machinery that found the plan in the first
+      place hauls a derailed robot back toward feasible behavior. The authors verify this by tracking the
+      predicted energy through a rollout: it spikes at the failed contact (the red frame), then falls as the
+      robot re-establishes a good grasp (the green frame).
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/uncertainty_energy.png" alt="Per-frame energy across a Tool Hang rollout: low during insertion, spiking at the failed hook, falling again through recovery."/>
+      <figcaption>
+        Per-frame energy across a Tool Hang rollout. Phases: insertion → failed hook attempt (energy spikes,
+        red, step 7) → recovery &amp; successful retry (energy falls, green, step 11). The scalar energy is a
+        readable uncertainty signal. (Figure 5.)
+      </figcaption>
+    </figure>
+
+    <p>
+      The widget makes the contrast tactile. Knock the agent out of distribution and watch what each policy
+      does: the diffusion baseline keeps following its schedule off a cliff; EBT-Policy's energy spikes and then
+      it climbs back into the basin.
+    </p>
+
+    <div class="widget-frame" id="retry-sim">
+      <p class="widget-title">Emergent retry simulator</p>
+      <p class="widget-sub">Press "knock OOD" to perturb the agent, then compare recovery. Watch the energy timeline below the landscape go red at the failure and green again on retry.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why this works</h2>
+    <p>
+      Three properties of the energy formulation, each doing real work, explain the whole results table.
+    </p>
+
+    <h3>Equilibrium dynamics, not a one-way chain</h3>
+    <p>
+      A diffusion policy walks a fixed path from noise to data; if a real-world disturbance teleports it off
+      that path, nothing returns it. An EBT learns a single, static energy surface whose gradients point
+      <em>toward the data manifold from everywhere</em>. Out-of-distribution points are just uphill, and descent
+      brings them back. This is what kills exposure bias and compounding error — and, the authors argue, what
+      lets the policy converge in a couple of steps instead of a hundred: it isn't bound to a schedule or an ODE
+      solver dictating a slow route.
+    </p>
+
+    <h3>The scalar energy is an uncertainty meter</h3>
+    <p>
+      Because the model outputs a number, not just a direction, it knows when it's unsure: uncertainty shows up
+      as high energy or a landscape with several competing minima. That lets the policy spend more descent steps
+      on hard states and fewer on easy ones (§5), and it makes failures legible — you can literally plot the
+      robot's confidence over time, as in Figure 5.
+    </p>
+
+    <h3>A built-in verifier makes it robust</h3>
+    <p>
+      The same scalar acts as a discriminator: low energy ⇒ plausible, high energy ⇒ reject. A diffusion policy
+      is purely generative — it has no native way to say "this state is bad." EBT-Policy does, and that
+      discriminative signal is what makes it noticeably less brittle when the environment changes. Robustness
+      and retry are two faces of the same coin: a model that can <em>recognize</em> a bad state can also climb
+      out of it.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>9. What it means</h2>
+    <p>
+      The honest framing is that this is an early, ambitious paper — the authors say as much, noting that
+      Diffusion Policy still wins on raw training stability and mode coverage, and that their simulation numbers
+      trail the original DP paper's because of hyperparameter differences. What's exciting isn't a leaderboard
+      sweep; it's that a single learned energy function delivers efficiency, uncertainty-awareness, and
+      recovery <em>at the same time</em>, from plain behavior cloning. That bundle is the start of an
+      energy-based <strong>world model</strong> for manipulation: one scalar measuring the consistency of
+      observations, language, actions, and dynamics together.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Training stability.</strong> Long MCMC chains are still finicky; gradient clipping is load-bearing, and richer multimodal data will stress the recipe.</li>
+      <li><strong>Mode coverage.</strong> Energy training can under-represent valid modes that diffusion captures easily — closing that gap is the central technical fight.</li>
+      <li><strong>Scale.</strong> Everything here is ≤100M parameters by design, for fair comparison. Whether the emergent reasoning grows or breaks at VLA scale is wide open.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      Diffusion taught robots to <em>generate</em> actions. EBT-Policy suggests they should <em>evaluate</em>
+      them — learn how good a plan is, and act by improving it. Once the policy holds a scalar that means "how
+      compatible is this with reality," speed, confidence, and the ability to recover from surprise stop being
+      separate features you bolt on. They become the same thing: rolling downhill.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2510.27545" target="_blank" rel="noopener">arXiv:2510.27545</a>
+      &nbsp;·&nbsp; Project page: <a href="https://energy-based-transformers.github.io/ebt-policy/" target="_blank" rel="noopener">energy-based-transformers.github.io/ebt-policy</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>
