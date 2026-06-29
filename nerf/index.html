@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeRF — representing a scene as a neural radiance field</title>
+  <meta name="description" content="An interactive explainer of NeRF (Mildenhall et al., 2020): the 5D radiance field, volume-rendering quadrature, positional encoding and spectral bias, hierarchical sampling, results, and where neural fields sit among 3D representations."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vx': '{\\mathbf{x}}', '\\vd': '{\\mathbf{d}}', '\\vc': '{\\mathbf{c}}',
+        '\\vr': '{\\mathbf{r}}', '\\vo': '{\\mathbf{o}}',
+        '\\Th': '{\\Theta}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>NeRF: a scene is a function you can query</h1>
+    <p class="byline">
+      Mildenhall, Srinivasan, Tancik, Barron, Ramamoorthi, Ng &middot; UC Berkeley / UCSD / Google &middot; ECCV 2020 &middot;
+      <a href="https://arxiv.org/abs/2003.08934" target="_blank" rel="noopener">arXiv 2003.08934</a>
+    </p>
+    <p class="lede">
+      In 2020, a five-author paper proposed something that sounds absurd: store an
+      entire 3D scene — geometry, color, the way a wet surface glints as you move —
+      inside the weights of a single small neural network with <em>no 3D data
+      structure at all</em>. No mesh, no voxels, no point cloud. Just a function that
+      takes a point in space and a viewing direction and returns a color and a
+      density. Render by firing a ray through each pixel and integrating. The result
+      was a leap in photorealistic novel view synthesis so large it spawned a
+      thousand follow-ups and reorganized an entire subfield —
+      <strong>40.15 dB PSNR on diffuse synthetic scenes vs 34.38 for the prior best</strong>,
+      and the first method that made view-dependent reflections look genuinely real.
+      This is the paper that defined the problem
+      <a href="../gaussian_splatting/index.html">3D Gaussian Splatting</a> would later
+      win on speed. Here is how it works, from the integral up.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#field">The representation: a 5D radiance field</a></li>
+      <li><a href="#rendering">Volume rendering: turning a field into a pixel</a></li>
+      <li><a href="#posenc">Positional encoding: defeating spectral bias</a></li>
+      <li><a href="#hierarchical">Hierarchical sampling</a></li>
+      <li><a href="#recipe">The full training recipe</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#why">Why it works</a></li>
+      <li><a href="#representations">Where NeRF sits among 3D representations</a></li>
+      <li><a href="#bottomline">The bottom line</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/teaser.png" alt="NeRF teaser: novel views of synthetic and real scenes"/>
+      <figcaption>Figure 1 of Mildenhall et al. (2020). From a set of input photos with known camera poses (left), NeRF optimizes a continuous volumetric function and renders novel views with convincing geometry and view-dependent appearance (right).</figcaption>
+    </figure>
+
+    <p>
+      The classic way to do novel view synthesis — show a computer some photos of a
+      scene, ask it to render the scene from a viewpoint it never saw — was to build
+      an explicit 3D model: triangulate a mesh, carve a voxel grid, or warp between
+      nearby images. Each carried a hard ceiling. Meshes struggle with fuzz and
+      transparency; voxels eat memory cubically with resolution; image warping breaks
+      when the new view is far from any input.
+    </p>
+    <p>
+      NeRF threw out the data structure. It asks: what if the scene is just a
+      <em>continuous function</em>, and we approximate that function with a neural
+      network? Feed in a 3D point and a viewing direction; get back how much light is
+      emitted there in that direction, and how opaque the point is. The scene lives
+      nowhere in particular — it's smeared across the weights of a multilayer
+      perceptron. To render, you don't traverse a structure; you <em>evaluate the
+      function</em> at hundreds of points along each camera ray and integrate.
+    </p>
+    <p>
+      Two ingredients made this go from "cute idea that produces blurry mush" to
+      state of the art: a <strong>positional encoding</strong> that lets a network
+      represent sharp detail, and a <strong>hierarchical sampling</strong> scheme that
+      spends compute where the scene actually is. We'll build the whole method up from
+      its central object — the volume rendering integral along a ray — and finish by
+      placing neural fields in the full landscape of 3D representations.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="field">
+    <h2>1. The representation: a 5D radiance field</h2>
+    <p>
+      NeRF represents a scene as a single continuous function of five variables:
+      three for a position $\vx = (x,y,z)$ and two for a viewing direction (an angle
+      pair, written in practice as a 3D unit vector $\vd$). The function returns an
+      emitted RGB color $\vc$ and a scalar <em>volume density</em> $\sigma$. A
+      multilayer perceptron with weights $\Th$ approximates it:
+    </p>
+    <p class="eq">$$ F_\Th : (\vx, \vd) \;\longmapsto\; (\vc, \sigma) $$</p>
+    <p>
+      Volume density $\sigma(\vx)$ is the key abstraction. Read it as the
+      differential probability that a ray terminates — hits something — in an
+      infinitesimal step at $\vx$. High density = solid surface; zero density = empty
+      air. Crucially, the scene is not made of surfaces at all; it is a cloud of
+      density everywhere in space, which is exactly why NeRF handles smoke, hair,
+      foliage, and glass so gracefully where a mesh cannot.
+    </p>
+    <p>
+      One design choice does enormous work: density depends on position
+      <em>only</em>, but color depends on position <em>and</em> direction. This is
+      enforced architecturally — the MLP runs 8 layers on the encoded position to
+      produce $\sigma$ plus a 256-dim feature, then concatenates the viewing
+      direction and runs one more layer to produce color. Making $\sigma$
+      view-independent forces the geometry to be consistent across all viewpoints
+      (you can't cheat by inventing different shapes per camera), while letting color
+      vary with direction is what captures specular highlights — the shifting glint on
+      a glossy surface as you walk around it.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/netdiag.png" alt="NeRF MLP architecture diagram"/>
+      <figcaption>The MLP. Encoded position $\gamma(\vx)$ runs through 8 fully-connected layers (256 channels, ReLU, with a skip connection) to output density $\sigma$ and a feature vector. That feature is concatenated with the encoded direction $\gamma(\vd)$ and passed through one more layer (128 channels) to output view-dependent RGB.</figcaption>
+    </figure>
+
+    <div class="widget-frame" id="viewdep">
+      <p class="widget-title">Widget 1 · View-dependent radiance</p>
+      <p class="widget-sub">A single 3D point on a glossy surface. Orbit the camera and watch the color the network emits in your direction. Toggle view dependence off to see the "No View Dependence" ablation — the specular highlight collapses to a flat average color.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="rendering">
+    <h2>2. Volume rendering: turning a field into a pixel</h2>
+    <p>
+      The function above describes the scene. To get an image you need a rule for
+      turning the field along a camera ray into a single pixel color. NeRF borrows the
+      classical volume rendering integral. For a ray $\vr(t) = \vo + t\vd$ from the
+      camera origin $\vo$ in direction $\vd$, the expected color between near and far
+      bounds $t_n, t_f$ is:
+    </p>
+    <p class="eq">$$ C(\vr) = \int_{t_n}^{t_f} T(t)\,\sigma(\vr(t))\,\vc(\vr(t),\vd)\,dt, \qquad T(t) = \exp\!\Big(\!-\!\int_{t_n}^{t}\!\sigma(\vr(s))\,ds\Big) $$</p>
+    <p>
+      Unpack it. At each depth $t$, the amount of color the ray picks up is the
+      emitted color $\vc$, weighted by the density $\sigma$ there (how much stuff is
+      present), weighted again by the <em>transmittance</em> $T(t)$ — the probability
+      the ray got this far without being blocked. $T$ starts at 1 at the camera and
+      decays as it passes through density. The product $T(t)\sigma(t)$ is a weight that
+      automatically peaks at the first opaque surface and falls to nothing behind it.
+      Occlusion comes out for free.
+    </p>
+    <p>
+      You can't integrate a neural network analytically, so NeRF estimates the
+      integral by <em>quadrature</em>. Partition the ray into $N$ bins and draw one
+      <em>stratified</em> sample per bin (uniformly at random within it — so over
+      training the network gets queried at continuous positions, not a fixed grid).
+      The integral becomes a sum that is exactly classical alpha compositing:
+    </p>
+    <p class="eq">$$ \hat{C}(\vr) = \sum_{i=1}^{N} T_i\,\big(1 - e^{-\sigma_i \delta_i}\big)\,\vc_i, \qquad T_i = \exp\!\Big(\!-\!\sum_{j<i}\sigma_j \delta_j\Big), \qquad \alpha_i = 1 - e^{-\sigma_i \delta_i} $$</p>
+    <p>
+      where $\delta_i$ is the distance between adjacent samples. This sum is trivially
+      differentiable in every $(\vc_i, \sigma_i)$, so gradients of a pixel error flow
+      straight back into the MLP weights. That differentiability is the entire game:
+      it is what lets you <em>optimize</em> a scene from nothing but photos.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/ray_render.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The whole rendering pipeline in one loop. A ray is marched through the scene; the
+      MLP returns a color and density at each sample; the density profile $\sigma(t)$
+      and transmittance $T(t)$ determine weights $w_i = T_i(1-e^{-\sigma_i\delta_i})$
+      that spike at the surface; the weighted colors sum into the pixel.
+    </p>
+
+    <div class="widget-frame" id="raymarch">
+      <p class="widget-title">Widget 2 · March a ray and integrate</p>
+      <p class="widget-sub">A 1D scene with two density bumps along a ray. Add samples with the slider and watch the quadrature estimate of the color converge. The transmittance curve shows why the back surface barely contributes — the front one has already absorbed most of the ray.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>The link to splatting.</strong> This exact alpha-compositing equation —
+      $\sum_i T_i \alpha_i \vc_i$ — is the one
+      <a href="../gaussian_splatting/index.html">3D Gaussian Splatting</a> reuses three
+      years later. The physics is identical; what differs is <em>where the samples
+      come from</em>. NeRF samples blindly along the ray and asks a network "what's
+      here?" at every point. Splatting already knows where the matter is, because the
+      matter <em>is</em> the representation — so it skips the network and the marching
+      entirely, and renders 1000× faster.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="posenc">
+    <h2>3. Positional encoding: defeating spectral bias</h2>
+    <p>
+      Here is the single most surprising result in the paper. If you feed raw
+      coordinates $(x,y,z,\theta,\phi)$ straight into the MLP, NeRF produces blurry,
+      oversmoothed mush — no sharp edges, no fine texture. The culprit is
+      <em>spectral bias</em>: deep ReLU networks are strongly biased toward learning
+      low-frequency functions. A coordinate network simply cannot fit the
+      high-frequency detail real scenes contain.
+    </p>
+    <p>
+      The fix is almost embarrassingly simple. Before the network sees a coordinate,
+      lift it into a high-dimensional space with a bank of sinusoids at geometrically
+      increasing frequencies:
+    </p>
+    <p class="eq">$$ \gamma(p) = \big(\sin(2^0\pi p), \cos(2^0\pi p), \ldots, \sin(2^{L-1}\pi p), \cos(2^{L-1}\pi p)\big) $$</p>
+    <p>
+      applied to each coordinate separately. The paper uses $L=10$ for position (20
+      values per coordinate) and $L=4$ for direction. With this Fourier feature
+      mapping in front, the same MLP can suddenly represent crisp geometry and
+      texture. The encoding hands the network a basis of high-frequency functions so
+      it no longer has to manufacture them from scratch against its own bias. (It's
+      the same sinusoidal trick as a Transformer's positional encoding, used for a
+      completely different reason — here, to inject high frequency, not order.)
+    </p>
+    <figure class="paper-figure three-up">
+      <img src="assets/figures/ablation_full.jpg" alt="NeRF complete model"/>
+      <img src="assets/figures/ablation_no_posenc.jpg" alt="NeRF without positional encoding"/>
+      <img src="assets/figures/ablation_no_viewdir.jpg" alt="NeRF without view dependence"/>
+      <figcaption>The two ablations that justify the method. Left: complete model. Middle: no positional encoding — geometry and texture wash out into a smooth blob. Right: no view dependence — the specular reflection on the bulldozer tread disappears. (Ground truth and the full grid are in Fig. 4 of the paper.)</figcaption>
+    </figure>
+
+    <div class="widget-frame" id="posenc-fit">
+      <p class="widget-title">Widget 3 · Why Fourier features beat raw coordinates</p>
+      <p class="widget-sub">Fit a sharp 1D target signal using only the positional-encoding basis $\gamma(p)$, by least squares. Slide $L$ from 0 (raw coordinate — hopelessly smooth, the "No Positional Encoding" ablation) up to 10 and watch the reconstruction snap onto the high-frequency detail.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="hierarchical">
+    <h2>4. Hierarchical sampling: don't waste queries on empty space</h2>
+    <p>
+      Marching a ray with uniform samples is wasteful: most of a ray is empty air or
+      hidden behind the first surface, yet a naive scheme queries the (expensive) MLP
+      there just as densely as at the surface. NeRF fixes this by optimizing
+      <em>two</em> networks — a "coarse" and a "fine" — and sampling in two passes.
+    </p>
+    <p>
+      First, evaluate the coarse network at $N_c$ stratified samples. Its rendering
+      weights, normalized, form a piecewise-constant probability density along the
+      ray — a map of where the scene probably is:
+    </p>
+    <p class="eq">$$ \hat{C}_c(\vr) = \sum_i w_i \vc_i, \qquad w_i = T_i\big(1 - e^{-\sigma_i \delta_i}\big), \qquad \hat{w}_i = w_i \big/ \textstyle\sum_j w_j $$</p>
+    <p>
+      Then draw a second set of $N_f$ samples from that density via inverse-transform
+      sampling, so new samples concentrate near the surface. Evaluate the fine network
+      on all $N_c + N_f$ samples combined. The paper uses $N_c = 64$ and $N_f = 128$.
+      Same compute, far more of it spent where it changes the image.
+    </p>
+
+    <div class="widget-frame" id="hiersample">
+      <p class="widget-title">Widget 4 · Coarse → fine resampling</p>
+      <p class="widget-sub">The coarse pass (uniform samples) discovers the density; the fine pass redraws samples from the resulting PDF, clustering them on the surface. Drag the surface and change the sample counts — watch the fine samples chase the geometry.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="recipe">
+    <h2>5. The full training recipe</h2>
+    <p>
+      Everything assembles into one optimization, run separately per scene. The only
+      inputs are RGB photos and their camera poses (from COLMAP structure-from-motion
+      for real captures). There is no pretraining and no 3D supervision — only the
+      photos.
+    </p>
+    <pre class="code"><code>for each iteration:
+    sample a batch of 4096 rays from random pixels across all photos
+    for each ray:
+        # coarse pass
+        t_i  ~ stratified samples, N_c = 64
+        (c_i, σ_i) = MLP_coarse(γ(x_i), γ(d))
+        Ĉ_c = Σ T_i (1 − e^(−σ_i δ_i)) c_i      # alpha composite
+        # fine pass
+        t_j  ~ inverse-sample from coarse weights, N_f = 128
+        (c_k, σ_k) = MLP_fine(γ(x_k), γ(d))     # on all 64+128 samples
+        Ĉ_f = Σ ...
+    loss = Σ_rays  ‖Ĉ_c − C‖²  +  ‖Ĉ_f − C‖²    # plain squared pixel error
+    Adam step  (lr 5e-4 → 5e-5)</code></pre>
+    <p>
+      The loss is just squared error between rendered and true pixel colors, for
+      <em>both</em> the coarse and fine renderings (the coarse term is kept so its
+      weights stay good enough to guide fine sampling). Positional encoding uses $L=10$
+      for $\vx$ and $L=4$ for $\vd$. Convergence takes 100–300k iterations — roughly
+      <strong>1–2 days on a single V100</strong>. That last number is the headline
+      cost, and the reason the entire next generation of work was about making NeRF
+      fast.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>6. Results</h2>
+    <p>
+      Against the strong baselines of the day — Scene Representation Networks (SRN),
+      Neural Volumes (NV), and Local Light Field Fusion (LLFF) — NeRF won on nearly
+      every metric across synthetic and real datasets, often by large margins.
+    </p>
+    <table class="results">
+      <thead>
+        <tr><th>Dataset</th><th>Metric</th><th>NeRF</th><th>Best baseline</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="2" class="cat">Diffuse Synthetic 360°</td>
+          <td>PSNR (↑)</td>
+          <td class="win"><strong>40.15</strong></td>
+          <td>34.38 <em>(LLFF)</em></td>
+        </tr>
+        <tr>
+          <td>LPIPS (↓)</td>
+          <td class="win"><strong>0.023</strong></td>
+          <td>0.048 <em>(LLFF)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Realistic Synthetic 360°</td>
+          <td>PSNR (↑)</td>
+          <td class="win"><strong>31.01</strong></td>
+          <td>26.05 <em>(NV)</em></td>
+        </tr>
+        <tr>
+          <td>LPIPS (↓)</td>
+          <td class="win"><strong>0.081</strong></td>
+          <td>0.114 <em>(LLFF)</em></td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Real Forward-Facing</td>
+          <td>PSNR (↑)</td>
+          <td class="win"><strong>26.50</strong></td>
+          <td>24.13 <em>(LLFF)</em></td>
+        </tr>
+        <tr>
+          <td>LPIPS (↓)</td>
+          <td>0.250</td>
+          <td class="win"><strong>0.212</strong> <em>(LLFF)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      From Table 1 of the paper. NeRF leads everywhere except LPIPS on real
+      forward-facing scenes, where LLFF edges it; the authors argue their renderings
+      are more multiview-consistent with fewer artifacts (best seen in the video).
+    </p>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/lego_nerf.jpg" alt="NeRF render of the Lego scene"/>
+      <img src="assets/figures/lego_gt.jpg" alt="Ground truth Lego scene"/>
+      <figcaption>Left: NeRF's render of the synthetic <em>Lego</em> scene. Right: ground truth. Fine treads, gaps, and the metallic glint survive — exactly the high-frequency and view-dependent detail the two key tricks unlock.</figcaption>
+    </figure>
+    <p>
+      The ablation table is the real argument. Stripping each ingredient from the full
+      model (PSNR <strong>31.01</strong> on realistic synthetic scenes) costs
+      dearly: no positional encoding drops it to <strong>28.77</strong>, no view
+      dependence to <strong>27.66</strong>, and removing all three of positional
+      encoding, view dependence, and hierarchical sampling collapses it to
+      <strong>26.67</strong>. Each piece is load-bearing.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>7. Why it works</h2>
+    <p>
+      Three properties combine to make a tiny network beat elaborate explicit models.
+    </p>
+    <h3>Continuity buys unlimited resolution</h3>
+    <p>
+      Because the scene is a function evaluated at arbitrary real-valued coordinates —
+      not stored in a grid — there is no resolution cap and no cubic memory blow-up. A
+      5 MB network can encode detail that would take gigabytes of voxels. Stratified
+      sampling reinforces this: the network is queried at continuously varying
+      positions during training, so it learns a genuinely continuous field rather than
+      memorizing a fixed set of points.
+    </p>
+    <h3>Differentiable rendering turns photos into 3D supervision</h3>
+    <p>
+      The volume rendering sum is differentiable end-to-end, so a 2D pixel error
+      becomes a gradient on the 3D field. NeRF never sees a 3D ground truth; it
+      discovers geometry purely because that is the only consistent explanation for
+      dozens of 2D photos. Forcing density to be view-independent is what makes that
+      explanation a coherent 3D shape instead of a per-view hack.
+    </p>
+    <h3>Positional encoding fights the network's own bias</h3>
+    <p>
+      Spectral bias would have doomed the coordinate-MLP approach. Fourier features
+      are the cheap, decisive countermeasure — and the insight rippled far past NeRF
+      into a general lesson about how to feed continuous coordinates to neural
+      networks (later formalized through the neural tangent kernel). It is the detail
+      most worth stealing for problems that have nothing to do with graphics.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="representations">
+    <h2>8. Where NeRF sits among 3D representations</h2>
+    <p>
+      NeRF is the canonical <em>implicit, volumetric</em> representation: the geometry
+      is a function you must query, and it models density everywhere in space rather
+      than a surface. That corner of the design space has distinct strengths and a
+      distinct, fatal-until-fixed weakness — speed. The table below places it against
+      the alternatives; for the explicit-volumetric counterpart that broke NeRF's
+      speed ceiling, see the companion
+      <a href="../gaussian_splatting/index.html">3D Gaussian Splatting</a> post.
+    </p>
+    <table class="results">
+      <thead>
+        <tr><th>Representation</th><th>Type</th><th>Pros</th><th>Cons</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Triangle mesh</td>
+          <td>explicit · surface</td>
+          <td>decades of tooling and GPU rasterization; compact; native textures, rigging, physics; crisp silhouettes</td>
+          <td>fixed topology hard to optimize from photos; poor at fuzz/transparency; quality capped by triangle budget</td>
+        </tr>
+        <tr>
+          <td class="cat">Voxel grid</td>
+          <td>explicit · volume</td>
+          <td>regular structure → fast lookup and 3D convolution; simple occupancy queries</td>
+          <td>memory grows cubically with resolution; blocky without sparse octrees</td>
+        </tr>
+        <tr>
+          <td class="cat">SDF / implicit surface</td>
+          <td>implicit · surface</td>
+          <td>watertight surfaces of any topology; exact normals and distances; best geometry from images (NeuS, Neuralangelo)</td>
+          <td>needs sphere tracing / marching cubes; slow; weak on fuzz and transparency; appearance bolted on</td>
+        </tr>
+        <tr>
+          <td class="cat">NeRF (MLP field)</td>
+          <td>implicit · volume</td>
+          <td>tiny (a few MB); continuous → no resolution limit; principled volume rendering; superb view-dependent effects; graceful with fuzz, hair, glass; learns from photos alone</td>
+          <td>ray marching = hundreds of MLP queries per pixel → slow to train (1–2 days) and render (seconds/frame); scene entangled in weights → not editable; no direct geometry access</td>
+        </tr>
+        <tr>
+          <td class="cat">Hybrid grid NeRF (InstantNGP, Plenoxels)</td>
+          <td>hybrid · volume</td>
+          <td>keeps NeRF's volumetric strengths; trains in minutes; small-to-moderate models</td>
+          <td>still ray-marched → ~10 fps ceiling; resolution/hash limits on fine detail; still not editable</td>
+        </tr>
+        <tr>
+          <td class="cat">3D Gaussians</td>
+          <td>explicit · volume</td>
+          <td>real-time (100–1000+ fps) via rasterization; NeRF-level quality incl. view-dependence; fast training; explicit and editable</td>
+          <td>memory-hungry (100s of MB); no clean surface without fixes; popping; floaters; relighting hard</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      The story since 2020 reads as a single arc. NeRF proved that a differentiable,
+      continuous, volumetric field could win on quality. The hybrid-grid works
+      (InstantNGP, Plenoxels) kept the volume rendering but replaced the slow MLP with
+      fast lookups, cutting training to minutes. Then
+      <a href="../gaussian_splatting/index.html">3D Gaussian Splatting</a> kept the
+      same alpha-compositing math but made the representation <em>explicit</em> — a
+      cloud of primitives you rasterize instead of a function you march — and finally
+      broke the real-time barrier. NeRF didn't lose; it set the target, and the
+      volume-rendering equation at its heart is still running underneath its
+      successors.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottomline">
+    <h2>9. The bottom line</h2>
+    <p>
+      NeRF is one idea executed with unusual taste: a scene is a continuous 5D
+      function from (position, direction) to (color, density); render it by
+      integrating that function along camera rays with classical volume rendering;
+      optimize it end-to-end from photos because the integral is differentiable. Two
+      small additions — Fourier-feature positional encoding and coarse-to-fine
+      sampling — turn the idea from blurry to photorealistic.
+    </p>
+    <h3>Open problems (that became whole research lines)</h3>
+    <ul>
+      <li><strong>Speed.</strong> 1–2 days to train, seconds to render. InstantNGP,
+        Plenoxels, and ultimately Gaussian splatting attacked this directly.</li>
+      <li><strong>Per-scene optimization.</strong> Each scene is its own network.
+        Generalizable and feed-forward NeRFs (pixelNeRF, IBRNet) tried to amortize
+        this across scenes.</li>
+      <li><strong>Static, controlled capture.</strong> The original assumes a rigid
+        scene and accurate poses. Dynamic NeRFs, NeRF-in-the-wild, and pose-free
+        variants followed.</li>
+      <li><strong>Aliasing and scale.</strong> A point-sampled ray ignores how much of
+        the scene a pixel covers; Mip-NeRF and Mip-NeRF360 fixed this with conical
+        frustums.</li>
+      <li><strong>Editing and relighting.</strong> Appearance is baked into opaque
+        weights; decomposing geometry, material, and lighting (NeRF inverse rendering)
+        is still hard.</li>
+    </ul>
+    <h3>The mental model to keep</h3>
+    <p>
+      A NeRF is a scene compressed into a function. There is no model of the chair in
+      memory — there is a network that, asked "what color and how solid is this exact
+      point, seen from this exact angle?", answers consistently enough that integrating
+      its answers along a ray reproduces a photograph. Once you hold that picture, its
+      whole family tree — the fast grids, the explicit splats, the generative 3D
+      models — reads as variations on one question: <em>what is the best way to store,
+      and then render, a differentiable field of light?</em>
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2003.08934" target="_blank" rel="noopener">arXiv:2003.08934</a>
+      &nbsp;·&nbsp; Project: <a href="https://www.matthewtancik.com/nerf" target="_blank" rel="noopener">matthewtancik.com/nerf</a>
+      &nbsp;·&nbsp; Companion post: <a href="../gaussian_splatting/index.html">3D Gaussian Splatting</a>
+    </p>
+    <p class="tiny">All paper figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

@@ -5,7 +5,12 @@
 // Fields:
 //   slug       — folder name under interactive_blogs/
 //   title      — card heading
-//   tag        — single short category, shown top-right and used by tag filter
+//   category   — ONE broad bucket, used by the filter bar. Must be one of:
+//                "Diffusion & Generative", "Attention & Sequence Models",
+//                "Energy & Reasoning", "3D, Vision & World Models",
+//                "Embodiment & Interaction", "Fundamentals & Theory".
+//                (Keep this list in sync with CATEGORIES in index.html.)
+//   tag        — free-form descriptive label shown top-right on the card (not filtered)
 //   authors    — author shortlist
 //   venue      — affiliation / conference
 //   date       — paper or release date, freeform string
@@ -15,7 +20,152 @@
 
 const BLOGS = [
   {
+    slug: "slam",
+    category: "3D, Vision & World Models",
+    title: "SLAM: mapping a place and finding yourself at the same time",
+    tag: "slam · odometry · loop closure · factor graph · triangulation · umi",
+    authors: "A field guide",
+    venue: "Explainer · visual & graph-based SLAM, with a look at UMI",
+    date: "classic → 2026",
+    paper: "EKF-SLAM · FastSLAM · iSAM/GTSAM · ORB-SLAM3 · UMI 2402.10329",
+    blurb: `Drop a robot into a room with no map and no GPS and it faces a chicken-and-egg problem: it can't localize without a map, or map without knowing where it is. <strong>SLAM</strong> solves both at once — by writing every motion step, every sighting, and every "I've been here before" as a weighted constraint in one big sparse <em>factor graph</em>, then finding the trajectory and map that satisfy all of them. The star move is <strong>loop closure</strong>: recognizing a revisited place adds a constraint that snaps a drifted trajectory back into global consistency. We build it from odometry and drift up through least-squares smoothing — then show how the <strong>UMI</strong> data collector runs visual-inertial SLAM on a GoPro-on-a-gripper to turn in-the-wild human demos into robot actions.`,
+    highlights: "5 widgets · 1 manim · ~3,300 words",
+  },
+  {
+    slug: "gpu_crash_course",
+    category: "Fundamentals & Theory",
+    title: "Feed the Beast: a GPU crash course for AI researchers",
+    tag: "gpu · cuda · triton · roofline · memory hierarchy · fusion",
+    authors: "A field guide",
+    venue: "Crash course & roadmap · for algorithm designers",
+    date: "mental models → roadmap · 2026",
+    paper: "Triton · PMPP · roofline · FlashAttention · CUTLASS",
+    blurb: `You can train models for years without knowing what a GPU <em>is</em> — until you want to make something <em>faster</em> and hit a wall of jargon: warps, SMs, coalescing, occupancy, HBM. You don't need to become a hardware engineer. You need ~5 mental models and one master idea: <strong>the GPU's math is cheap; its bottleneck is moving data</strong>, so good algorithms move <em>less data</em>, not fewer FLOPs (that's the whole FlashAttention "magic"). The crash course — throughput vs latency, the memory hierarchy, the <strong>roofline</strong>, the four levers — plus a concrete <strong>roadmap</strong> of what to learn next, in what order, through what. The goal is momentum.`,
+    highlights: "5 widgets · 1 manim · staged roadmap · ~3,100 words",
+  },
+  {
+    slug: "speculative_decoding",
+    category: "Fundamentals & Theory",
+    title: "Speculative decoding: many tokens for the price of one",
+    tag: "inference · draft model · rejection sampling · medusa · eagle · token trees",
+    authors: "A field guide",
+    venue: "Explainer · fast LLM inference",
+    date: "2018 → 2026",
+    paper: "Blockwise 1811.03115 · Speculative 2211.17192 · Spec. sampling 2302.01318 · Medusa 2401.10774 · EAGLE 2401.15077",
+    blurb: `When a large model writes a paragraph, it spends most of its time <em>waiting for memory</em> — reading every weight to produce a single token while the GPU's math units sit idle. Speculative decoding turns that waste into speed: a small, cheap <strong>draft</strong> model guesses the next several tokens, and the big <strong>target</strong> model checks them all in <em>one</em> parallel pass. Most guesses are right, so you get a whole burst of tokens per expensive pass — a <strong>2–4× speedup</strong> — and a one-line identity, <em>min(p,q)+max(0,p−q)=p</em>, guarantees the output is <strong>provably identical</strong> to the big model's. This is the full tour: the memory wall, the accept/reject rule, the speedup math, and the family — Medusa, EAGLE, token trees, lookahead.`,
+    highlights: "5 widgets · 1 manim · ~3,200 words",
+  },
+  {
+    slug: "quantization",
+    category: "Fundamentals & Theory",
+    title: "Quantization: how neural networks shrink their numbers",
+    tag: "fp32 · bf16 · fp8 · int8 · int4 · nf4 · gptq · awq · smoothquant",
+    authors: "A field guide",
+    venue: "Explainer · number formats & quantization techniques",
+    date: "1985 → 2026",
+    paper: "LLM.int8() 2208.07339 · GPTQ 2210.17323 · SmoothQuant 2211.10438 · QLoRA 2305.14314 · AWQ 2306.00978",
+    blurb: `A 70-billion-parameter model stored as 32-bit floats needs <strong>280&nbsp;GB</strong> of memory — more than any single GPU. Quantization rewrites every weight in <em>fewer bits</em> — 16, 8, 4, sometimes barely one — while keeping the answers almost unchanged, so the <em>same</em> 70B model runs on one gaming GPU at <strong>35&nbsp;GB</strong>. This is the bit-by-bit tour: what <code>bf16</code>, <code>fp8</code>, <code>int8</code>, and <code>NF4</code> actually <em>are</em>, how to convert between them with a scale and a zero-point, the outlier problem, and the menagerie of techniques — <strong>GPTQ, AWQ, SmoothQuant, LLM.int8(), QLoRA</strong> — that all answer one question: given a tiny bit budget, where do you put the grid?`,
+    highlights: "5 widgets · 1 manim · ~4,100 words",
+  },
+  {
+    slug: "mixture_of_experts",
+    category: "Attention & Sequence Models",
+    title: "Mixture of Experts: from a 1991 committee to trillion-parameter LLMs",
+    tag: "moe · routing · sparse · switch · mixtral · deepseek",
+    authors: "Jacobs, Shazeer, Fedus, Jiang, Dai, et al.",
+    venue: "Explainer · classical mixtures → sparse LLM MoE",
+    date: "1991 → 2024",
+    paper: "Sparse MoE 1701.06538 · Switch 2101.03961 · Mixtral 2401.04088 · DeepSeek-MoE 2401.06066",
+    blurb: `You don't ask one doctor everything — you go to a specialist. The largest language models now work the same way: a <em>router</em> sends each token to a few <strong>expert</strong> sub-networks and ignores the rest, so a model can hold <em>trillions</em> of parameters while spending the compute of a small one. This is the full thread from the 1991 mixture of experts through <strong>Shazeer's</strong> sparsely-gated layer, the <strong>Switch</strong> Transformer's top-1 routing, and the load-balancing tricks, to <strong>Mixtral</strong> and <strong>DeepSeek</strong>. The one idea that unwelded <em>how big a model is</em> from <em>how much it costs to run</em>.`,
+    highlights: "5 widgets · 1 manim · ~3,400 words",
+  },
+  {
+    slug: "state_space_models",
+    category: "Attention & Sequence Models",
+    title: "State Space Models: from a swinging pendulum to Mamba",
+    tag: "ssm · dynamical systems · hippo · s4 · mamba · selective scan",
+    authors: "Gu, Dao, Ré, et al.",
+    venue: "Explainer · classical control → modern SSMs",
+    date: "2020 → 2024",
+    paper: "HiPPO 2008.07669 · S4 2111.00396 · Mamba 2312.00752",
+    blurb: `One little equation — <em>x′ = Ax + Bu</em> — describes a swinging pendulum, an RLC circuit, and a plane's autopilot. It also powers <strong>Mamba</strong>, a language model that runs in <strong>linear time</strong> and keeps improving on contexts up to a <em>million tokens</em>. This is the full thread from classical dynamical-systems theory — the state, the matrix exponential, eigenvalues, discretization — through <strong>HiPPO</strong>'s principled memory and <strong>S4</strong>'s recurrence↔convolution duality, to Mamba's <em>selective</em> state. The same state, read three ways: physical condition → compressed memory → memory that chooses.`,
+    highlights: "5 widgets · 1 manim · ~4,000 words",
+  },
+  {
+    slug: "attention_zoo",
+    category: "Attention & Sequence Models",
+    title: "The Attention Zoo: every escape from the quadratic curse",
+    tag: "attention · survey · efficiency",
+    authors: "A field guide",
+    venue: "Survey · sparse · linear · SSM · RWKV · hybrid",
+    date: "2019 → 2025",
+    paper: "survey of 25+ methods",
+    blurb: `Standard attention is <strong>O(n²)</strong>. Six years of escapes, organized into <strong>six families</strong>: sparse (skip cells), low-rank/linear (Linformer, Performer), state-space &amp; linear-RNN (<strong>Mamba, RWKV, RetNet</strong>), hardware/distributed (FlashAttention, Ring), and hybrids — plus the newest work from Chinese labs (DeepSeek NSA, Kimi MoBA, MiniMax lightning attention). A quick tutorial on each, then the honest question: <em>which actually ship in production, and which quietly didn't pan out?</em> Cross-links the <a href="sparse_attention/index.html">sparse attention</a> and <a href="flash_attention/index.html">FlashAttention</a> posts.`,
+    highlights: "4 widgets · 1 manim · 25+ methods · ~2,800 words",
+  },
+  {
+    slug: "sparse_attention",
+    category: "Attention & Sequence Models",
+    title: "Sparse attention: how to read a million tokens without reading them all",
+    tag: "attention · long context · efficiency",
+    authors: "Yuan et al. (DeepSeek) + the field",
+    venue: "Topic explainer · anchored on NSA, ACL 2025",
+    date: "February 2025",
+    paper: "arXiv 2502.11089",
+    blurb: `A Transformer compares every token to every other — that <strong>O(n²)</strong> wall is 70–80% of decoding latency at 64k context. Sparse attention skips most comparisons without losing what matters. Builds the theory from the cost equation up, walks the literature (Sparse Transformers → Longformer/BigBird → Reformer → block-sparse → <strong>Native Sparse Attention / MoBA</strong>), and lands on DeepSeek's NSA — three branches (compression + selection + sliding window), <strong>11.6× faster decode and 9× faster training at 64k</strong>, and it <em>beats</em> full attention on accuracy. Cross-links the <a href="flash_attention/index.html">FlashAttention</a> post.`,
+    highlights: "4 widgets · 1 manim · 14-paper timeline · ~2,800 words",
+  },
+  {
+    slug: "nerf",
+    category: "3D, Vision & World Models",
+    title: "NeRF: a scene is a function you can query",
+    tag: "3D representation · neural fields",
+    authors: "Mildenhall, Srinivasan, Tancik, Barron, Ramamoorthi, Ng",
+    venue: "UC Berkeley / UCSD / Google · ECCV 2020",
+    date: "March 2020",
+    paper: "arXiv 2003.08934",
+    blurb: `Store an entire 3D scene — geometry, color, the glint of a wet surface — inside the weights of one small neural network, with <em>no 3D data structure at all</em>. Feed it a point and a viewing direction; get back a color and a density. Render by firing a ray through each pixel and integrating. The result reset photorealistic view synthesis (<strong>40.15 dB PSNR vs 34.38 for the prior best</strong>) and defined the problem <a href="gaussian_splatting/index.html">3D Gaussian Splatting</a> later won on speed. Builds the method from the volume-rendering integral up: positional encoding & spectral bias, hierarchical sampling, and where neural fields sit among all 3D representations.`,
+    highlights: "4 widgets · 1 manim · ~3,200 words",
+  },
+  {
+    slug: "gaussian_splatting",
+    category: "3D, Vision & World Models",
+    title: "3D Gaussian Splatting: the primitive that ate 3D vision",
+    tag: "3D representation · real-time radiance fields",
+    authors: "Kerbl, Kopanas, Leimkühler, Drettakis",
+    venue: "Inria / MPI · SIGGRAPH 2023",
+    date: "August 2023",
+    paper: "arXiv 2308.04079",
+    blurb: `Represent a scene as a few million fuzzy, colored, semi-transparent ellipsoids — and optimize them directly with gradient descent, no neural network in the renderer, no ray marching. The result matched the best NeRF of the day while rendering <strong>~2,000× faster (134 fps vs 0.06)</strong> and training in 40 minutes instead of 48 hours. This explainer builds the theory from the anisotropic-Gaussian primitive up through the real-time rasterizer, maps the <strong>31-paper literature</strong> that exploded around it (a filterable timeline), surveys what splats are used for, and ends with an honest pros/cons of every other 3D representation — meshes, voxels, SDFs, point clouds, NeRFs.`,
+    highlights: "5 widgets · 1 manim · 31-paper timeline · ~4,200 words",
+  },
+  {
+    slug: "high_dim_geometry",
+    category: "Fundamentals & Theory",
+    title: "The strange geometry of high dimensions",
+    tag: "fundamentals · geometry · concentration",
+    authors: "An interactive tour",
+    venue: "Fundamentals · ML intuition",
+    date: "May 2026",
+    paper: "9 phenomena, one theorem",
+    blurb: `Almost everything you know about geometry comes from living in three dimensions. <em>None of it is true in a thousand.</em> A high-dim Gaussian is a thin shell, not a blob. A cube is mostly long spiky corners. Distances collapse onto a single number. Random vectors are nearly orthogonal. Nine of these phenomena, all derived from the same single principle — <strong>concentration of measure</strong> — each with a live widget and a paired ML callout: <strong>weight init, diffusion noise schedules, contrastive temperatures, LoRA, superposition, SAEs, FAISS</strong>, all the way down.`,
+    highlights: "6 widgets · 1 manim · 10 ML callouts · ~5,500 words",
+  },
+  {
+    slug: "elucidating_diffusion",
+    category: "Diffusion & Generative",
+    title: "Elucidating the Design Space of Diffusion-Based Generative Models",
+    tag: "diffusion · sampling · design space",
+    authors: "Karras, Aittala, Aila, Laine",
+    venue: "NVIDIA · NeurIPS 2022",
+    date: "June 2022",
+    paper: "arXiv 2206.00364",
+    blurb: `By 2022 the diffusion literature was three competing frameworks (VP, VE, iDDPM) each presenting an inseparable bundle of noise schedule, network output, and loss. EDM looks at the design space and asks: <em>what if these choices are actually independent?</em> The answer is yes — and decoupling them yields a sweet spot that handily beats every prior model. <strong>FID 1.79 on CIFAR-10 and 1.36 on ImageNet-64 using only 35 NFE per image</strong>, with a sampler swap that drops a pretrained model's FID from 2.07 to 1.55 without touching the weights.`,
+    highlights: "4 widgets · 1 manim · ~3,300 words",
+  },
+  {
     slug: "ebt_policy",
+    category: "Energy & Reasoning",
     title: "EBT-Policy: Energy Unlocks Emergent Physical Reasoning",
     tag: "robot policy · energy-based",
     authors: "Davies, Huang, Gladstone, Liu, Chen, Ji, Liu, Hu",
@@ -27,6 +177,7 @@ const BLOGS = [
   },
   {
     slug: "energy_based_transformers",
+    category: "Energy & Reasoning",
     title: "Energy-Based Transformers are Scalable Learners and Thinkers",
     tag: "energy-based · System 2 thinking",
     authors: "Gladstone, Nanduru, Islam, Han, Ha, Chadha, Du, Ji, Li, Iqbal",
@@ -38,6 +189,7 @@ const BLOGS = [
   },
   {
     slug: "ired_energy_diffusion",
+    category: "Energy & Reasoning",
     title: "Learning Iterative Reasoning through Energy Diffusion",
     tag: "reasoning · energy-based · test-time compute",
     authors: "Du, Mao, Tenenbaum",
@@ -49,6 +201,7 @@ const BLOGS = [
   },
   {
     slug: "ebft",
+    category: "Energy & Reasoning",
     title: "Matching Features, Not Tokens: Energy-Based Fine-Tuning",
     tag: "LLM fine-tuning · energy-based",
     authors: "Jelassi, Kwun, Zhao, Li, Fusi, Du, Kakade, Domingo-Enrich",
@@ -60,6 +213,7 @@ const BLOGS = [
   },
   {
     slug: "ttt_discover",
+    category: "Energy & Reasoning",
     title: "Learning to Discover at Test Time",
     tag: "test-time RL · scientific discovery",
     authors: "Yuksekgonul, Koceja, Li, Bianchi et al.",
@@ -71,6 +225,7 @@ const BLOGS = [
   },
   {
     slug: "normalization",
+    category: "Fundamentals & Theory",
     title: "Every Normalization Layer Is the Same Layer",
     tag: "fundamentals · normalization",
     authors: "12 papers, one idea",
@@ -82,6 +237,7 @@ const BLOGS = [
   },
   {
     slug: "ttt",
+    category: "Attention & Sequence Models",
     title: "Learning to (Learn at Test Time)",
     tag: "long context · architectures",
     authors: "Sun, Li, Dalal, Xu, Vikram, Zhang, Dubois et al.",
@@ -93,6 +249,7 @@ const BLOGS = [
   },
   {
     slug: "flow_equivariant_world_models",
+    category: "3D, Vision & World Models",
     title: "Flow Equivariant World Models: memory for partially observed worlds",
     tag: "world models · equivariance",
     authors: "Lillemark, Huang, Zhan, Du, Keller",
@@ -104,6 +261,7 @@ const BLOGS = [
   },
   {
     slug: "flash_attention",
+    category: "Attention & Sequence Models",
     title: "FlashAttention: fast, exact attention by knowing your GPU",
     tag: "systems · attention kernels",
     authors: "Dao, Fu, Ermon, Rudra, Ré",
@@ -115,6 +273,7 @@ const BLOGS = [
   },
   {
     slug: "dit",
+    category: "Diffusion & Generative",
     title: "DiT: Scalable Diffusion Models with Transformers",
     tag: "diffusion · architectures",
     authors: "Peebles, Xie",
@@ -126,6 +285,7 @@ const BLOGS = [
   },
   {
     slug: "diffusion_dont_memorize",
+    category: "Diffusion & Generative",
     title: "Why Diffusion Models Don't Memorize",
     tag: "diffusion · generalization theory",
     authors: "Bonnaire, Urfin, Biroli, Mézard",
@@ -137,6 +297,7 @@ const BLOGS = [
   },
   {
     slug: "titans",
+    category: "Attention & Sequence Models",
     title: "Titans: Learning to Memorize at Test Time",
     tag: "long context · architectures",
     authors: "Behrouz, Zhong, Mirrokni",
@@ -148,6 +309,7 @@ const BLOGS = [
   },
   {
     slug: "back_to_basics_jit",
+    category: "Diffusion & Generative",
     title: "Back to Basics: Let Denoising Generative Models Denoise",
     tag: "diffusion · pixel generation",
     authors: "Li, He",
@@ -159,6 +321,7 @@ const BLOGS = [
   },
   {
     slug: "asymflow",
+    category: "Diffusion & Generative",
     title: "Asymmetric Flow Models",
     tag: "diffusion · pixel generation",
     authors: "Chen, Ackermann, Kim, Wetzstein, Guibas",
@@ -170,6 +333,7 @@ const BLOGS = [
   },
   {
     slug: "ic_light",
+    category: "Diffusion & Generative",
     title: "IC-Light: Scaling Illumination Editing",
     tag: "diffusion · relighting",
     authors: "Zhang, Rao, Agrawala",
@@ -181,6 +345,7 @@ const BLOGS = [
   },
   {
     slug: "image_generators_vision_learners",
+    category: "3D, Vision & World Models",
     title: "Image Generators are Generalist Vision Learners",
     tag: "vision · foundation models",
     authors: "Gabeur, Long, Peng et al.",
@@ -192,6 +357,7 @@ const BLOGS = [
   },
   {
     slug: "elf_embedded_language_flows",
+    category: "Diffusion & Generative",
     title: "ELF: Embedded Language Flows",
     tag: "language diffusion",
     authors: "Hu, Qiu, Lu, Zhao, Li, Kim, Andreas, He",
@@ -203,6 +369,7 @@ const BLOGS = [
   },
   {
     slug: "drifting",
+    category: "Diffusion & Generative",
     title: "Generative Modeling via Drifting",
     tag: "generative modeling",
     authors: "Deng, Li, Li, Du, He",

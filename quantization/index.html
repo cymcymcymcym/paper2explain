@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quantization: how neural networks shrink their numbers — an interactive explainer</title>
+  <meta name="description" content="An interactive, beginner-friendly tour of number formats (fp32, bf16, fp8, int8, int4, NF4), how they are represented bit-by-bit, how you convert between them, and the quantization techniques (PTQ, QAT, GPTQ, AWQ, SmoothQuant, LLM.int8, QLoRA) that let huge models fit in tiny memory."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\round': '\\operatorname{round}',
+        '\\diag':  '\\operatorname{diag}',
+        '\\clip':  '\\operatorname{clip}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Quantization: how neural networks shrink their numbers</h1>
+    <p class="byline">
+      A field guide &middot; number formats &amp; quantization techniques &middot; June 2026
+    </p>
+    <p class="lede">
+      A 70-billion-parameter model stored the honest way — one 32-bit float per weight — needs
+      <strong>280&nbsp;gigabytes</strong> of memory. No single GPU has that. Quantization is the art of
+      writing each of those numbers in <em>fewer bits</em> — 16, 8, 4, sometimes barely more than one —
+      while keeping the model's answers almost unchanged. Do it naively and the model turns to noise. Do
+      it well and the <em>same</em> 70B model runs on a single gaming GPU at <strong>35&nbsp;GB</strong>,
+      eight times smaller, with a quality loss you'd struggle to measure. This is a tour of what those
+      number formats actually <em>are</em>, bit by bit — how to convert between them, and the surprisingly
+      deep bag of tricks that makes 4-bit language models work.
+    </p>
+  </header>
+
+  <figure class="teaser">
+    <svg viewBox="0 0 760 270" role="img" aria-label="Bit layout of fp32, fp16, bf16, and int8" style="width:100%;height:auto;">
+      <style>
+        .lbl  { font: 600 14px var(--sans, system-ui); fill: var(--fg, #e8e8ee); }
+        .sub  { font: 400 10px var(--mono, monospace); fill: var(--fg-mute, #888); }
+        .seg  { font: 600 11px var(--sans, system-ui); fill: #0e0f12; }
+        .cap  { font: 400 12px var(--sans, system-ui); fill: var(--fg-mute, #888); }
+      </style>
+      <!-- header -->
+      <text x="92" y="24" text-anchor="end" class="cap">format</text>
+      <text x="118" y="24" class="cap">sign</text>
+      <text x="190" y="24" class="cap" fill="#5fa9ff">exponent → dynamic range</text>
+      <text x="420" y="24" class="cap" fill="#66bb6a">mantissa → precision</text>
+
+      <!-- fp32 -->
+      <text x="92" y="58" text-anchor="end" class="lbl">fp32</text>
+      <text x="92" y="71" text-anchor="end" class="sub">32 bits</text>
+      <rect x="100" y="40" width="18"  height="30" fill="#ff5a78"/>
+      <rect x="118" y="40" width="144" height="30" fill="#5fa9ff"/>
+      <rect x="262" y="40" width="414" height="30" fill="#66bb6a"/>
+      <text x="190" y="60" text-anchor="middle" class="seg">8</text>
+      <text x="469" y="60" text-anchor="middle" class="seg">23</text>
+
+      <!-- fp16 -->
+      <text x="92" y="113" text-anchor="end" class="lbl">fp16</text>
+      <text x="92" y="126" text-anchor="end" class="sub">16 bits</text>
+      <rect x="100" y="95" width="18"  height="30" fill="#ff5a78"/>
+      <rect x="118" y="95" width="90"  height="30" fill="#5fa9ff"/>
+      <rect x="208" y="95" width="180" height="30" fill="#66bb6a"/>
+      <text x="163" y="115" text-anchor="middle" class="seg">5</text>
+      <text x="298" y="115" text-anchor="middle" class="seg">10</text>
+
+      <!-- bf16 -->
+      <text x="92" y="168" text-anchor="end" class="lbl">bf16</text>
+      <text x="92" y="181" text-anchor="end" class="sub">16 bits</text>
+      <rect x="100" y="150" width="18"  height="30" fill="#ff5a78"/>
+      <rect x="118" y="150" width="144" height="30" fill="#5fa9ff"/>
+      <rect x="262" y="150" width="126" height="30" fill="#66bb6a"/>
+      <text x="190" y="170" text-anchor="middle" class="seg">8</text>
+      <text x="325" y="170" text-anchor="middle" class="seg">7</text>
+
+      <!-- int8 -->
+      <text x="92" y="223" text-anchor="end" class="lbl">int8</text>
+      <text x="92" y="236" text-anchor="end" class="sub">8 bits</text>
+      <rect x="100" y="205" width="18"  height="30" fill="#ff5a78"/>
+      <rect x="118" y="205" width="126" height="30" fill="#ff9b6a"/>
+      <text x="181" y="225" text-anchor="middle" class="seg">integer + a shared scale</text>
+    </svg>
+    <figcaption>
+      Every number format is a budget. The <span style="color:#5fa9ff">exponent</span> bits buy
+      <em>dynamic range</em> (how big and how small a number you can name); the
+      <span style="color:#66bb6a">mantissa</span> bits buy <em>precision</em> (how finely you can name
+      values in between). <strong>bf16</strong>'s whole trick is to keep fp32's 8-bit exponent — the full
+      range — and pay for it by throwing away mantissa. <strong>Integers</strong> spend every bit on
+      magnitude and recover the missing range from a single shared scale factor.
+    </figcaption>
+  </figure>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The 280-gigabyte problem</a></li>
+      <li><a href="#anatomy">1. How a computer stores a number</a></li>
+      <li><a href="#zoo">2. The format zoo, and the one tradeoff</a></li>
+      <li><a href="#grid">3. Quantization is snapping to a grid</a></li>
+      <li><a href="#integers">4. Integers, a scale, and a zero-point</a></li>
+      <li><a href="#outliers">5. The villain: outliers</a></li>
+      <li><a href="#methods">6. The menagerie of techniques</a></li>
+      <li><a href="#results">7. What you actually save</a></li>
+      <li><a href="#why">8. Why it works at all</a></li>
+      <li><a href="#what-it-means">9. What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      Here is a fact that drives a surprising amount of modern machine-learning engineering: <em>the
+      numbers are the cost.</em> A neural network is, in the end, a giant pile of numbers — the weights —
+      and to run it you must shuttle every one of them out of memory and through an arithmetic unit. How
+      many bits you spend per weight decides how much memory the model occupies, how much bandwidth you
+      burn reading it, and on many chips how fast the math runs. For a large language model, weights so
+      dominate the budget that the format you store them in is one of the highest-leverage choices in the
+      whole system.
+    </p>
+    <p>
+      The default in training is 32-bit or 16-bit floating point. But once a model is trained, those bits
+      are wildly overspecified. The network has learned a function; it turns out that function barely
+      notices if you describe each weight with 8 bits instead of 16, or even 4 instead of 32. The catch
+      is the word <em>barely</em>. Round the numbers carelessly and the errors compound through a hundred
+      layers until the output is garbage. The entire field of quantization is the study of how to throw
+      away bits <em>on purpose</em>, in exactly the way the network won't mind.
+    </p>
+    <p>
+      We'll build it from the ground up. First: what a number even <em>is</em> inside the machine — the
+      bit-level anatomy of <code>fp32</code>, <code>fp16</code>, <code>bf16</code>, and the new
+      8- and 4-bit floats. Then the one tradeoff that governs all of them. Then the mechanics of
+      <em>converting</em> a real number into a low-bit code and back, the villain that makes it hard
+      (outliers), and the menagerie of named techniques — GPTQ, AWQ, SmoothQuant, LLM.int8(), QLoRA —
+      that are all, underneath, answers to the same question. Five widgets and one animation along the
+      way. No prerequisites beyond knowing what a neural-network weight is.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="anatomy">
+    <h2>1. How a computer stores a number</h2>
+    <p>
+      A computer cannot store $\pi$. It cannot store $1/3$. It has a fixed number of bits, so it can only
+      store a <em>finite set</em> of values, and every other real number gets rounded to the nearest one
+      it can represent. The question of <em>which</em> finite set is exactly the question of number
+      formats. Floating point is the cleverest answer we have, and it's worth understanding precisely,
+      because every quantization scheme is a variation on it.
+    </p>
+    <p>
+      A floating-point number is scientific notation in binary. You split the available bits into three
+      fields: one <strong>sign</strong> bit $s$, a block of <strong>exponent</strong> bits $e$, and a
+      block of <strong>mantissa</strong> (or "fraction") bits $m$. The value they encode, for a normal
+      number, is
+    </p>
+    <p class="eq">$$ x \;=\; (-1)^{s}\;\times\;2^{\,e-b}\;\times\;\Big(1+\tfrac{m}{2^{M}}\Big), $$</p>
+    <p>
+      where $M$ is the number of mantissa bits and $b$ is a fixed <em>bias</em> (so the exponent can be
+      negative). Read it as: the sign flips it, the exponent slides the value up or down by powers of two
+      — that's the "floating" point — and the mantissa, a number between $1$ and just under $2$, fills in
+      the detail within that power-of-two window. The leading $1$ is implicit and free: for a normal
+      number we never need to store it.
+    </p>
+    <p>
+      The consequence is the single most important fact about floats: <strong>the exponent controls how
+      big and small a number you can reach; the mantissa controls how finely you can resolve values once
+      you're there.</strong> Range and precision are bought with different bits. Toggle them yourself —
+      the widget below lets you flip individual bits of a real number across five formats and watch the
+      decoded value, and the $(-1)^s \cdot 2^{e-b} \cdot (1{+}m/2^M)$ breakdown, update live.
+    </p>
+
+    <div class="widget-frame" id="bit-widget">
+      <p class="widget-title">Float dissector — flip a bit, watch the number</p>
+      <p class="widget-sub">Pick a format, then click any bit to toggle it. The sign is red, the exponent
+        blue, the mantissa green. Presets load a few famous values; "nudge" walks to the next
+        representable number so you can feel the spacing.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>Where the formats come from.</strong> <code>fp32</code> (1 sign, 8 exponent, 23 mantissa)
+      is the IEEE-754 single-precision standard from 1985 — the workhorse of scientific computing.
+      <code>fp16</code> (1·5·10) was standardized for graphics and is precise but <em>narrow</em>: its
+      largest value is only $65{,}504$, so big gradients overflow to infinity.
+      <code>bf16</code> — "brain float," invented at Google for TPUs — keeps fp32's full 8-bit exponent
+      and amputates the mantissa to 7 bits. It is <em>less precise than fp16 but has the same range as
+      fp32</em>, and that trade turned out to be exactly what deep learning wants, which is why bf16 is
+      now the default training format almost everywhere.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="zoo">
+    <h2>2. The format zoo, and the one tradeoff</h2>
+    <p>
+      Once you internalize "exponent buys range, mantissa buys precision," the whole modern zoo of
+      low-bit formats reads as a single sentence repeated at different budgets. With only 8 bits to spend,
+      the hardware vendors standardized <em>two</em> floats, because there is no single right answer:
+    </p>
+    <ul>
+      <li><strong><code>fp8 E4M3</code></strong> — 4 exponent, 3 mantissa bits. More precise, narrower
+        range; its largest value is $448$. Used for <em>weights and activations</em> in the forward pass,
+        where precision matters more.</li>
+      <li><strong><code>fp8 E5M2</code></strong> — 5 exponent, 2 mantissa bits. Wider range (up to
+        $57{,}344$), coarser. Used for <em>gradients</em>, which span a huge dynamic range and need the
+        headroom more than the resolution.</li>
+    </ul>
+    <p>
+      Go down to 4 bits and the same fork appears: <code>fp4 E2M1</code> spends its bits on a little
+      range and a little precision, while a plain <code>int4</code> spends all four on a uniform integer
+      grid. The reason floats keep their charm at low bit-widths is visible the moment you plot the
+      values a format can actually represent. Integers are spaced <em>evenly</em>: the gap between
+      representable values is constant everywhere. Floats are spaced <em>logarithmically</em>: the gap
+      <em>doubles</em> every time the exponent ticks up, so representable values are packed densely near
+      zero and spread out far away.
+    </p>
+    <p>
+      That non-uniform spacing is a feature. Neural-network weights and activations cluster near zero,
+      with a long thin tail of large values — exactly the shape a float resolves well: fine detail where
+      the mass is, coarse-but-present coverage out in the tail. Drag the marker in the widget to see
+      where any target value lands, and how the rounding error changes as you move from the dense center
+      to the sparse tail.
+    </p>
+
+    <div class="widget-frame" id="numberline-widget">
+      <p class="widget-title">What can this format actually represent?</p>
+      <p class="widget-sub">Every value the chosen format can store, plotted on the line. Switch between
+        linear and log axes to see the float "staircase." Drag the blue target to snap it to the nearest
+        representable value and read off the rounding error.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>NF4: a grid shaped like the data.</strong> If floats win by matching the data's shape, why
+      not go all the way and build a grid from the data itself? <strong>NormalFloat-4</strong> (from the
+      QLoRA work) does exactly that: its 16 levels are the <em>quantiles</em> of a standard normal, so
+      each of the 16 codes is used about equally often when your weights are roughly Gaussian. It's an
+      information-theoretically motivated 4-bit format — no exponent or mantissa fields at all, just a
+      lookup table of 16 carefully chosen numbers.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="grid">
+    <h2>3. Quantization is snapping to a grid</h2>
+    <p>
+      Strip away the bit-fiddling and quantization is one geometric act: you have a continuous cloud of
+      real numbers, you lay down a discrete <em>grid</em> of representable values, and you snap every real
+      number to its nearest grid point. The leftover displacement — the distance from where a number
+      really was to the grid point it got rounded to — is the <strong>quantization error</strong>, and
+      essentially all of the field is about making that error small where it matters.
+    </p>
+    <p>
+      The animation makes the whole story move. A bell-shaped cloud of weights snaps first onto a
+      <em>uniform</em> grid (integer quantization): the rounding errors are the same size everywhere. Then
+      the grid morphs into a <em>non-uniform</em>, float-like grid that is dense near zero and sparse far
+      out: the same weights re-snap, the errors near the center shrink, and the errors in the tail grow.
+      That single picture is the entire range-versus-precision tradeoff.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/snap_grid.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      Continuous weights (blue) snapping onto a discrete grid (orange). Red arrows are the rounding
+      error. Uniform grid → equal error everywhere; float-like grid → tiny error where the data lives,
+      larger error in the sparse tail. Choosing a format is choosing the shape and spacing of this grid.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="integers">
+    <h2>4. Integers, a scale, and a zero-point</h2>
+    <p>
+      Floats are elegant, but the fastest, cheapest arithmetic on most chips is integer arithmetic — and
+      an 8-bit integer holds only the values $-128 \ldots 127$. To store a weight of $0.0123$ as an
+      integer you obviously can't just round it to $0$. You need a <strong>scale</strong>: a single
+      floating-point number $s$, shared across a whole tensor, that says "one integer step equals
+      $s$ real units." Optionally you add a <strong>zero-point</strong> $z$, an integer offset that lets
+      the value $0.0$ land exactly on a grid point even when your data isn't centered. This is
+      <em>affine</em> quantization:
+    </p>
+    <p class="eq">$$ q \;=\; \clip\!\Big(\round\!\big(\tfrac{x}{s}\big) + z,\; q_{\min},\; q_{\max}\Big),
+      \qquad \hat{x} \;=\; s\,(q - z). $$</p>
+    <p>
+      The first equation <em>quantizes</em>: divide by the scale, round to the nearest integer, shift by
+      the zero-point, and clip to the representable range. The second <em>dequantizes</em>: it
+      reconstructs an approximation $\hat{x}$ of the original. The round trip $x \to q \to \hat{x}$ is
+      lossy, and $\hat{x} - x$ is the quantization error. If you fix $z = 0$ the scheme is
+      <strong>symmetric</strong> (the grid is centered on zero); a nonzero $z$ makes it
+      <strong>asymmetric</strong>, which pays for itself when the data is one-sided, like the output of a
+      ReLU.
+    </p>
+    <p>
+      Everything now hinges on choosing $s$. Too large and you waste your 256 integer codes covering empty
+      range, so nearby weights collapse onto the same code — coarse. Too small and the grid doesn't reach
+      your largest values, so they <em>clip</em> (saturate) to the end of the range — and clipping a big
+      weight to a smaller one is a large, structured error. The textbook starting point is the
+      <strong>absmax</strong> scale, which sizes the grid to exactly span the biggest magnitude present:
+    </p>
+    <p class="eq">$$ s \;=\; \frac{\max_i |x_i|}{2^{\,b-1}-1}\qquad(\text{symmetric, } b\text{-bit}). $$</p>
+    <p>
+      Play with the trade in the widget. You control the bit-width, the scale (auto-absmax or manual),
+      symmetric versus asymmetric, and the spread of the data. Watch the integer grid, the clipped values,
+      and the reconstruction error — measured as RMSE and as a signal-to-noise ratio — respond.
+    </p>
+
+    <div class="widget-frame" id="affine-widget">
+      <p class="widget-title">Affine quantization playground</p>
+      <p class="widget-sub">A cloud of weights, an integer grid, and the quantize→dequantize round trip.
+        Push the scale too small and watch values clip; too large and watch them collapse. Add an outlier
+        and see one number wreck the whole tensor.</p>
+    </div>
+
+    <h3>Granularity: one scale, or many?</h3>
+    <p>
+      Nothing says the whole tensor must share <em>one</em> scale. The finer you slice, the better each
+      slice fits — at the cost of storing more scales. The standard ladder is: <strong>per-tensor</strong>
+      (one scale for the entire weight matrix — cheapest, crudest), <strong>per-channel</strong> /
+      per-row (one scale per output neuron — the workhorse for weights), and <strong>per-group</strong> /
+      block-wise (one scale per contiguous block of, say, 64 or 128 values — the standard for
+      aggressive 4-bit weight quantization). Finer granularity is the simplest, most reliable lever you
+      have for recovering accuracy, and it's why 4-bit weight quantization in practice almost always means
+      "4-bit values <em>plus</em> a 16-bit scale every 64 weights."
+    </p>
+
+    <aside class="callout">
+      <strong>Two axes you'll see named together.</strong> <em>What</em> you quantize: weights only
+      ("W4A16" = 4-bit weights, 16-bit activations) versus weights <em>and</em> activations ("W8A8").
+      Weight-only quantization shrinks the model on disk and in memory and is the easy win; activation
+      quantization is what unlocks fast low-precision matrix multiplies but is much harder, because
+      activations have outliers — the subject of the next section.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="outliers">
+    <h2>5. The villain: outliers</h2>
+    <p>
+      Here is the fact that shapes nearly every serious LLM quantization method. In a large transformer,
+      a <em>handful</em> of activation features — sometimes a fraction of a percent of the channels —
+      carry values tens or hundreds of times larger than everything else. They are not noise; they are
+      systematic and important. But for a per-tensor quantizer they are poison. The absmax scale is set
+      by the single largest value, so a lone outlier of $70$ stretches the grid until the ordinary values
+      near $0.5$ all fall between the same two grid points. You spent your 256 codes describing the
+      outlier and quantized the other 99.9% of the tensor to mush.
+    </p>
+    <p>
+      There are a few ways out, and the famous method names are mostly different answers to this one
+      problem:
+    </p>
+    <ul>
+      <li><strong>Keep the outliers in high precision.</strong> <code>LLM.int8()</code> splits each
+        matrix multiply: the few outlier feature-columns are computed in 16-bit, everyone else in int8,
+        and the results are summed. Exact for the hard part, cheap for the rest.</li>
+      <li><strong>Use finer granularity</strong> so an outlier only pollutes its own small group rather
+        than the whole tensor — the per-group trick from the last section.</li>
+      <li><strong>Move the difficulty somewhere it's harmless.</strong> This is <code>SmoothQuant</code>'s
+        idea, and it's elegant enough to deserve its own equation.</li>
+    </ul>
+    <p>
+      Activations are hard to quantize (spiky outliers); weights are easy (smooth, well-behaved). A
+      matrix multiply $Y = XW$ is unchanged if you divide each input channel by some factor and multiply
+      the corresponding weight row by the same factor. So <code>SmoothQuant</code> picks a per-channel
+      smoothing factor $s_j$ that <em>migrates</em> the outlier magnitude out of the activations and into
+      the weights, where the quantizer can cope:
+    </p>
+    <p class="eq">$$ Y \;=\; \big(X\,\diag(s)^{-1}\big)\,\big(\diag(s)\,W\big),
+      \qquad s_j \;=\; \frac{\big(\max_i |X_{ij}|\big)^{\alpha}}{\big(\max_i |W_{ij}|\big)^{1-\alpha}}. $$</p>
+    <p>
+      The knob $\alpha$ (typically $0.5$) decides how much of the pain to shift. The widget below makes
+      this concrete: one activation channel towers over the rest, the per-tensor error is dreadful, and
+      as you raise $\alpha$ the difficulty slides from activations onto weights until both are
+      quantizable at once.
+    </p>
+
+    <div class="widget-frame" id="outlier-widget">
+      <p class="widget-title">SmoothQuant: migrate the difficulty</p>
+      <p class="widget-sub">Activation channels (one is a huge outlier) and weight channels. Slide the
+        smoothing strength α and watch magnitude flow from activations to weights — and the worst-case
+        quantization error of both fall together.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>AWQ's variation.</strong> Activation-aware Weight Quantization makes the same observation —
+      that a small set of channels is special — but acts only on the <em>weights</em>. It identifies the
+      ≈1% of weight channels that multiply the large-activation features and scales them up before
+      quantizing (and back down after), protecting the weights that actually matter for the output. Same
+      villain, weight-only cure.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="methods">
+    <h2>6. The menagerie of techniques</h2>
+    <p>
+      With the mechanics and the villain in hand, the named methods fall into a small map. The first
+      split is <em>when</em> you quantize.
+    </p>
+
+    <h3>Post-training (PTQ) vs. quantization-aware training (QAT)</h3>
+    <p>
+      <strong>PTQ</strong> takes a finished model and quantizes it, using at most a few hundred unlabeled
+      calibration samples to choose scales — minutes of work, no gradient descent. It's the default for
+      LLMs because retraining a 70B model is out of reach for most people.
+      <strong>QAT</strong> instead simulates quantization <em>during</em> training: the forward pass
+      rounds the weights ("fake quantization") so the network feels the error and learns weights robust to
+      it. The gradient can't flow through a rounding step — its derivative is zero almost everywhere — so
+      QAT uses the <strong>straight-through estimator</strong>, which simply pretends the rounding was the
+      identity on the backward pass. QAT recovers more accuracy, especially at very low bit-widths, but
+      costs a training run.
+    </p>
+
+    <h3>GPTQ: round one weight, fix the rest</h3>
+    <p>
+      The strongest <em>weight-only</em> PTQ methods don't round every weight independently — they round
+      one at a time and <em>compensate</em>. <code>GPTQ</code> quantizes the weights of a layer column by
+      column; after it pins each weight to the grid, it updates all the not-yet-quantized weights in that
+      layer to absorb the error just introduced, using second-order (Hessian) information about how much
+      each weight affects the layer's output. The effect is that errors cancel instead of accumulate, and
+      it's good enough to push large models to 3–4 bits with little damage, in a single pass and no
+      retraining.
+    </p>
+
+    <h3>NF4 + QLoRA: quantize the frozen base, train a tiny float patch</h3>
+    <p>
+      <code>QLoRA</code> is the method that put fine-tuning of huge models on a single GPU. It freezes the
+      base model in 4-bit <strong>NF4</strong>, never dequantizing more than one block at a time, and
+      trains only a small pair of low-rank adapter matrices in 16-bit on top. It even quantizes the
+      <em>scales themselves</em> ("double quantization") to claw back the last fraction of a bit. The
+      frozen weights are 4-bit; the gradients only ever touch the tiny high-precision adapter.
+    </p>
+
+    <pre class="code"><code>def quantize_tensor(x, bits=8, symmetric=True, group_size=None):
+    # choose granularity: one scale, or one per group of `group_size`
+    blocks = x if group_size is None else x.reshape(-1, group_size)
+    qmax = 2**(bits - 1) - 1                      # e.g. 127 for int8
+
+    if symmetric:
+        s = blocks.abs().amax(dim=-1, keepdim=True) / qmax
+        z = 0
+    else:                                         # asymmetric / affine
+        lo, hi = blocks.amin(-1, True), blocks.amax(-1, True)
+        s = (hi - lo) / (2**bits - 1)
+        z = (-lo / s).round()                     # integer zero-point
+
+    q = (blocks / s).round() + z                  # quantize
+    q = q.clamp(-qmax - 1, qmax)                  # clip / saturate
+    x_hat = s * (q - z)                           # dequantize (lossy)
+    return q.to(int8), s, z, x_hat                # store q, s, z</code></pre>
+    <p>
+      That's the whole arithmetic core. Every method above is a smarter way of choosing $s$, the
+      granularity, which values to protect, and whether to compensate the survivors — wrapped around these
+      few lines.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. What you actually save</h2>
+    <p>
+      The payoff is blunt and large. Memory for the weights is just (number of parameters) × (bytes per
+      parameter), so halving the bits halves the footprint. Here is the same 70B model across formats —
+      and what it takes to fit it.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Format</th><th>Bits / weight</th><th>70B model size</th><th>Quality</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">fp32</td>
+          <td>32</td>
+          <td>280 GB</td>
+          <td>reference (training default, historically)</td>
+        </tr>
+        <tr>
+          <td class="cat">fp16 / bf16</td>
+          <td>16</td>
+          <td>140 GB</td>
+          <td><strong>lossless</strong> in practice — the inference default</td>
+        </tr>
+        <tr>
+          <td class="cat">int8 / fp8</td>
+          <td>8</td>
+          <td class="win">70 GB</td>
+          <td><strong>near-lossless</strong> with per-channel + outlier handling</td>
+        </tr>
+        <tr>
+          <td class="cat">int4 / NF4</td>
+          <td>~4.x</td>
+          <td class="win">≈ 35–40 GB</td>
+          <td>small, often acceptable hit with GPTQ/AWQ + groups</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      Sizes are weights only, at the nominal bit-width; real 4-bit checkpoints carry a 16-bit scale per
+      group (≈ 4.25–4.5 effective bits), and runtime also needs memory for activations and the KV cache.
+      "Quality" is a qualitative summary of the published consensus, not a single benchmark.
+    </p>
+    <p>
+      The headline: int4 turns a model that needs a five-figure 8-GPU server in fp16 into something that
+      fits on one 24&nbsp;GB consumer card. The widget lets you pick a model size and a format and see the
+      memory, the effective bits, and which class of GPU it lands on.
+    </p>
+
+    <div class="widget-frame" id="memory-widget">
+      <p class="widget-title">Memory &amp; quality calculator</p>
+      <p class="widget-sub">Choose a model size and a number format. See the footprint in GB, the
+        effective bits per weight (including 4-bit group scales), and drag the GPU-memory line to see
+        what fits.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why it works at all</h2>
+    <p>
+      It is genuinely surprising that you can throw away three-quarters of the bits in a trained network
+      and barely move its accuracy. A few reasons conspire.
+    </p>
+
+    <h3>Networks are trained to be robust to noise</h3>
+    <p>
+      Dropout, data augmentation, stochastic gradients — training is shot through with noise, and the
+      solutions it finds sit in wide, flat basins of the loss landscape where small perturbations to the
+      weights barely change the output. Quantization error is just one more small perturbation. A network
+      that wasn't robust to it would also have failed to generalize.
+    </p>
+
+    <h3>Errors average out more than they accumulate</h3>
+    <p>
+      Round-to-nearest makes the error on each weight roughly zero-mean and independent. When thousands of
+      them are summed inside a single neuron's dot product, the errors partially cancel rather than
+      reinforce — the sum's relative error shrinks with the square root of the number of terms. The
+      methods that compensate (GPTQ) or shape the grid to the data (NF4, floats) push this further by
+      making the residual error smaller and better-behaved.
+    </p>
+
+    <h3>Range matters more than precision</h3>
+    <p>
+      This is the deepest lesson, and it's why bf16 beat fp16 for training and why outliers dominate the
+      story. A weight rounded to slightly the wrong value is a small, survivable error. A weight that
+      <em>overflowed its range</em> — clipped to the max, or saturated to infinity — is a catastrophe that
+      no amount of mantissa precision can fix. Almost every design choice in the field, from bf16's wide
+      exponent to SmoothQuant's migration of outliers, is ultimately about protecting <em>range</em> so
+      the precision you do have is spent where the data actually lives.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>9. What it means</h2>
+    <p>
+      Quantization is the quiet reason the last few years of AI happened on the hardware we already had.
+      It decoupled <em>how capable a model is</em> from <em>how expensive it is to run</em>: a 4-bit
+      checkpoint on a laptop GPU is the same model that needed a server rack in fp16. That is what put
+      capable language models on phones, in browsers, and inside applications that could never afford a
+      data-center inference bill — and it's why "can it be quantized well" is now a first-class question
+      when a new architecture is designed.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Below 4 bits.</strong> 2- and 3-bit weights, and even 1-bit ("binary"/ternary) networks,
+        work in narrow regimes but generally need quantization-aware training or unusual architectures.
+        Closing the gap to 4-bit quality at 2 bits is an active frontier.</li>
+      <li><strong>Activations and the KV cache.</strong> Weight-only quantization is largely solved;
+        quantizing activations and the growing KV cache — both outlier-ridden — to 4 bits without quality
+        loss is much harder and increasingly where the memory actually goes for long contexts.</li>
+      <li><strong>Native low-precision training.</strong> The frontier is no longer just compressing a
+        finished model but <em>training</em> in fp8 (and experimentally fp4), where the same range-vs-
+        precision and outlier problems return, now coupled to the dynamics of optimization itself.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      Strip away the acronyms and there is one idea here, seen from many angles: you have a tiny budget of
+      bits, the real numbers are spread unevenly, and you must place a finite grid of representable values
+      where it does the most good and snap everything else onto it. Floats shape the grid logarithmically;
+      integers make it uniform and recover range with a scale; granularity slices it finer; GPTQ
+      compensates the survivors; SmoothQuant and AWQ defang the outliers; NF4 molds the grid to the data.
+      Once you see the grid, every method on the menu is just a different, clever way of deciding where to
+      put it.
+    </p>
+  </section>
+
+  <footer>
+    <p>An interactive explainer on number formats and quantization. Built with vanilla JS, Canvas, and KaTeX.</p>
+    <p class="tiny">Method names (GPTQ, AWQ, SmoothQuant, LLM.int8, QLoRA/NF4) refer to their respective original works, cited here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mixture of Experts: from a 1991 committee to trillion-parameter LLMs</title>
+  <meta name="description" content="An interactive walk from the 1991 mixture of experts to sparsely-gated MoE, Switch Transformers, Mixtral, and DeepSeek — the idea that parameters need not equal compute."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\Softmax': '{\\mathrm{Softmax}}',
+        '\\KeepTopK': '{\\mathrm{KeepTopK}}',
+        '\\TopK': '{\\mathrm{TopK}}',
+        '\\Top': '{\\mathrm{Top}}',
+        '\\CV': '{\\mathrm{CV}}',
+        '\\Softplus': '{\\mathrm{Softplus}}',
+        '\\SwiGLU': '{\\mathrm{SwiGLU}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Mixture of Experts: from a 1991 committee to trillion-parameter LLMs</h1>
+    <p class="byline">
+      A thread through <strong>Shazeer's Sparse MoE</strong>, <strong>Switch</strong>, <strong>Mixtral</strong> &amp; <strong>DeepSeek-MoE</strong> &middot;
+      Jacobs, Shazeer, Fedus, Jiang, Dai, and many more &middot; 1991–2024 &middot;
+      <a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">arXiv 1701.06538</a> ·
+      <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">2101.03961</a> ·
+      <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">2401.04088</a> ·
+      <a href="https://arxiv.org/abs/2401.06066" target="_blank" rel="noopener">2401.06066</a>
+    </p>
+    <p class="lede">
+      You don't ask one doctor every question — you go to a specialist. The largest language models
+      now work the same way: a <em>router</em> sends each token to a few <em>expert</em> sub-networks
+      and ignores the rest. This one idea lets a model hold <em>trillions</em> of parameters while
+      spending the compute of a small one. It is also <em>thirty years old</em>. This is the story of
+      how a 1991 statistical trick became the routing layer inside <strong>Mixtral</strong> and
+      <strong>DeepSeek</strong> — and why it quietly broke the link between <em>how big a model is</em>
+      and <em>how much it costs to run</em>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook: a committee of specialists</a></li>
+      <li><a href="#classical">1. The original mixture of experts</a></li>
+      <li><a href="#conditional">2. Parameters ≠ compute</a></li>
+      <li><a href="#sparse">3. Sparsely-gated MoE</a></li>
+      <li><a href="#balance">4. The load-balancing problem</a></li>
+      <li><a href="#switch">5. MoE meets the Transformer</a></li>
+      <li><a href="#modern">6. Mixtral &amp; DeepSeek</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#why">Why it works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/shazeer_moe_layer.png" alt="The sparsely-gated mixture-of-experts layer: a gating network selects a few experts"/>
+      <figcaption>
+        The mixture-of-experts layer. A <em>gating network</em> looks at the input and picks a small
+        subset of <em>expert</em> networks to run; their outputs are combined by weight. Thousands of
+        experts can sit in the layer while only a couple fire for any given input. (Shazeer et al., 2017.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Every neural network faces a tension. We know that <em>bigger models are smarter</em> — more
+      parameters mean more capacity to store knowledge and patterns. But bigger models are also slower
+      and costlier, because a dense network runs <em>every</em> one of its weights on <em>every</em>
+      input. Double the parameters, double the compute. That coupling is the wall that scaling keeps
+      running into.
+    </p>
+    <p>
+      Mixture of experts (MoE) is the oldest and most successful way around it. The idea: instead of one
+      giant network that does everything, build many smaller <em>expert</em> networks and a small
+      <em>router</em> that decides, per input, which handful of experts to consult. The model can then
+      carry an enormous number of parameters — but each input only touches a few of them. Knowledge
+      grows; cost per token barely moves.
+    </p>
+    <p>
+      We'll start in 1991, where this was a tidy idea in statistics, and follow it as it scales: through
+      the 2017 paper that made it <em>sparse</em> and gigantic, through the Switch Transformer that put it
+      inside the architecture that runs modern AI, to Mixtral and DeepSeek — the MoEs you can download today.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="classical">
+    <h2>1. The original mixture of experts (1991)</h2>
+    <p>
+      The idea is due to Jacobs, Jordan, Nowlan, and Hinton, in a paper with a wonderfully blunt title:
+      <em>Adaptive Mixtures of Local Experts</em>. Their motivation was <em>divide and conquer</em>. If
+      a task has distinct regimes — different kinds of inputs needing different kinds of processing —
+      then forcing one network to handle all of them creates interference: learning one regime degrades
+      another. Better to let several networks each <em>specialize</em>, and learn a manager that routes
+      each input to the right one.
+    </p>
+    <p>
+      Concretely: keep $n$ expert networks $E_1,\dots,E_n$ and a <strong>gating network</strong> $G$.
+      The gate looks at the input $x$ and produces a set of weights — how much to trust each expert —
+      and the output is their weighted sum:
+    </p>
+    <p class="eq">$$ y \;=\; \sum_{i=1}^{n} G(x)_i \, E_i(x), \qquad G(x) = \Softmax(x \cdot W_g). $$</p>
+    <p>
+      The gate is just a softmax: a learnable linear map from the input to a probability distribution
+      over experts. Crucially, the experts and the gate are trained <em>together</em>, end to end. As
+      training proceeds, a beautiful division of labor emerges on its own. If expert 3 happens to do well
+      on a certain input, the gradient pushes the gate to send similar inputs to expert 3 — which makes
+      expert 3 better at them still. The experts <em>compete</em> for inputs, and the gate learns to
+      partition the input space into regions of specialization.
+    </p>
+    <p>
+      You can watch that partition form below. Each expert "owns" a region of the input space; the gating
+      softmax blends smoothly between them at the borders. Drag the experts around and watch the territory
+      redraw — this soft, learned partitioning is the entire conceptual seed of everything that follows.
+    </p>
+
+    <div class="widget-frame" id="gate-partition">
+      <p class="widget-title">The gating network partitions the input space</p>
+      <p class="widget-sub">Each colored region is where one expert dominates the softmax gate $G(x)$. Drag the experts; the output $y=\sum_i G(x)_i E_i(x)$ blends them, sharply or softly depending on the gate's temperature.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>A familiar face.</strong> This is the same machinery as a Gaussian mixture model or a
+      decision tree's soft splits — a gate assigning responsibility, parts specializing. Jordan &amp;
+      Jacobs (1994) even stacked gates into a tree (<em>hierarchical</em> mixtures of experts). For
+      decades it stayed small and <em>dense</em>: every expert ran on every input, just weighted. That
+      density is exactly the limitation the next thirty years had to break.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="conditional">
+    <h2>2. The catch — and the dream of conditional computation</h2>
+    <p>
+      Look again at $y=\sum_i G(x)_i E_i(x)$. To compute that sum, the classical mixture runs
+      <em>all</em> $n$ experts and weights them. So a mixture of 1000 experts costs 1000 times as much as
+      one expert. It buys you specialization, but it buys you <em>nothing</em> on the compute wall — it
+      is still a dense model in disguise.
+    </p>
+    <p>
+      But stare at the equation and the escape hatch is right there. Wherever $G(x)_i = 0$, the term
+      vanishes — and <em>you never needed to compute $E_i(x)$ at all</em>. If the gate could output mostly
+      zeros, picking only a few experts per input, you would run only those few. The model could hold a
+      thousand experts' worth of parameters but spend the compute of two.
+    </p>
+    <p>
+      This is <strong>conditional computation</strong>: making the network's own activations decide which
+      parts of the network to execute. It decouples the two things we always assumed were welded together
+      — the <em>number of parameters</em> (capacity, knowledge) and the <em>amount of compute per input</em>
+      (cost). The widget below makes the decoupling concrete: add experts and watch total parameters
+      climb, while the compute per token — set by how many experts you actually fire, $k$ — stays flat.
+    </p>
+
+    <div class="widget-frame" id="topk-compute">
+      <p class="widget-title">Parameters grow, compute stays flat</p>
+      <p class="widget-sub">A router scores $N$ experts; only the top-$k$ run. Slide $N$ (more experts = more parameters) and $k$ (experts fired per token). Watch total params rise while active params / FLOPs track only $k$.</p>
+    </div>
+
+    <p>
+      The catch — and it is the catch that took years to tame — is that a hard top-$k$ choice is a
+      discontinuous, combinatorial decision sitting in the middle of a model you want to train with smooth
+      gradients. Making that work at scale is what the next paper cracked.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="sparse">
+    <h2>3. Sparsely-gated MoE: outrageously large networks</h2>
+    <p>
+      In 2017, Shazeer and colleagues at Google delivered the breakthrough in a paper titled
+      <em>Outrageously Large Neural Networks</em>. They took the classical mixture, made the gate
+      <strong>sparse</strong>, and scaled the expert count into the thousands — building a layer with up
+      to <strong>137 billion parameters</strong> at a time when large models had a few hundred million.
+    </p>
+    <p>
+      The mechanism is <strong>noisy top-$k$ gating</strong>. Score the experts, keep only the top $k$,
+      send the rest to $-\infty$ so the softmax zeroes them out, and add a little learned Gaussian noise
+      to the scores to help exploration and balancing:
+    </p>
+    <p class="eq">$$ G(x) = \Softmax\big(\KeepTopK(H(x),\,k)\big), $$</p>
+    <p class="eq">$$ H(x)_i = (x \cdot W_g)_i + \mathcal{N}(0,1)\cdot \Softplus\big((x \cdot W_{\text{noise}})_i\big). $$</p>
+    <p class="eq">$$ \KeepTopK(v,k)_i = \begin{cases} v_i & \text{if } v_i \text{ is among the top } k \text{ of } v, \\ -\infty & \text{otherwise.} \end{cases} $$</p>
+    <p>
+      Only the chosen $k$ experts (the paper used $k=4$, sometimes $2$) are ever evaluated, so a forward
+      pass through a 137-billion-parameter layer costs about the same as a forward pass through a few
+      hundred million. The experts were inserted between stacked LSTM layers, and called once per word —
+      so a sentence threads through a different little committee at every position. The animation below is
+      the whole idea moving: a token reaches the layer, the router lights up its top experts, their outputs
+      combine, and — the punchline — adding experts grows the parameters without growing the cost per token.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/moe_routing.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      Routing, then scaling. A token is scored by the router and sent through only its top-2 experts; the
+      rest stay dark. Then the expert count explodes from 8 to 2048 (parameters from ~47B to ~1.6T) while
+      the compute per token — fixed at top-2 — never moves. Parameters and compute, finally unwelded.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="balance">
+    <h2>4. The load-balancing problem</h2>
+    <p>
+      Sparse routing has a failure mode baked into it, and it is the single most important practical
+      problem in all of MoE. Remember how specialization is self-reinforcing: an expert that gets chosen
+      gets trained, which makes it better, which makes it get chosen more. In the dense 1991 setting that
+      was a feature. In the sparse setting it is a <strong>death spiral</strong>. A few experts win early,
+      grab all the traffic, and improve; the rest are starved of gradient, never improve, and are never
+      picked again. The model <em>collapses</em> onto a handful of experts and all the rest are dead weight.
+    </p>
+    <p>
+      The fix is an <strong>auxiliary load-balancing loss</strong> added to the training objective, whose
+      only job is to push traffic to spread out evenly. Shazeer's version penalizes the <em>imbalance</em>
+      in how much total gate weight each expert receives across a batch — using the squared coefficient of
+      variation (standard deviation over mean), which is zero exactly when all experts are used equally:
+    </p>
+    <p class="eq">$$ \text{Importance}(X) = \sum_{x \in X} G(x), \qquad L_{\text{importance}} = w \cdot \CV\big(\text{Importance}(X)\big)^2. $$</p>
+    <p>
+      Toggle that loss on and off below. Without it, you'll watch the rich-get-richer collapse happen in
+      real time — a couple of bars shoot up, the rest flatline. With it, the router is gently forced to
+      keep every expert busy. Every MoE since has carried some descendant of this loss; it is the price of
+      admission for sparse routing.
+    </p>
+
+    <div class="widget-frame" id="load-balance">
+      <p class="widget-title">Expert collapse vs. a balanced router</p>
+      <p class="widget-sub">Tokens stream through a router; the histogram shows how many each expert receives. Toggle the load-balancing loss to see collapse (a few experts hog everything) turn into even utilization.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="switch">
+    <h2>5. MoE meets the Transformer: Switch &amp; GShard</h2>
+    <p>
+      The sparse MoE layer was powerful but fiddly. The Switch Transformer (Fedus, Zoph &amp; Shazeer, 2021)
+      simplified it and married it to the architecture that now runs everything. The move is clean: inside a
+      Transformer block, replace the dense feed-forward network (FFN) with an MoE layer of expert FFNs, and
+      route each token to it. Most of a Transformer's parameters live in those FFNs, so this is where the
+      capacity-vs-compute trade has the most leverage.
+    </p>
+    <p>
+      Switch's headline simplification: route each token to exactly <strong>one</strong> expert — top-1.
+      Prior wisdom held you needed $k \ge 2$ for the router to get useful gradients (you need to compare
+      experts to learn to choose). Switch showed top-1 works fine, halves the routing and communication
+      cost, and trains more stably. The output keeps the gate value as a multiplier so gradients still flow
+      to the router:
+    </p>
+    <p class="eq">$$ y = p_i(x)\, E_i(x), \qquad i = \arg\max_j p_j(x), \qquad p(x) = \Softmax(W_r\, x). $$</p>
+    <p>
+      With hard routing on real batches, experts need a fixed-size buffer. Switch defines an
+      <strong>expert capacity</strong>, and any tokens beyond it are <em>dropped</em> — passed to the next
+      layer untouched through the residual connection:
+    </p>
+    <p class="eq">$$ \text{expert capacity} = \frac{\text{tokens per batch}}{\text{number of experts}} \times \text{capacity factor}. $$</p>
+    <p>
+      The capacity factor is a dial: higher means fewer dropped tokens but more wasted compute on
+      half-empty buffers; lower means tighter buffers but more drops. Play with it below — it is the core
+      efficiency knob of token-routed MoE.
+    </p>
+
+    <div class="widget-frame" id="capacity">
+      <p class="widget-title">Expert capacity &amp; token dropping</p>
+      <p class="widget-sub">Each expert has a buffer sized by the capacity factor. Stream tokens in; when an expert fills up, extra tokens are dropped (skip the layer). Trade the factor against the drop rate and wasted slots.</p>
+    </div>
+
+    <p>
+      Switch also swapped Shazeer's two-part balancing loss for a single differentiable one — minimized
+      when tokens and router probability are both spread evenly across the $N$ experts:
+    </p>
+    <p class="eq">$$ L = \alpha\,N \sum_{i=1}^{N} f_i \, P_i, \qquad \alpha = 10^{-2}, $$</p>
+    <p>
+      where $f_i$ is the fraction of tokens sent to expert $i$ and $P_i$ is the average router probability
+      assigned to it. With a few more stabilizers — running the router in float32, smaller initialization —
+      Switch scaled to <strong>1.6 trillion parameters</strong> (the 2048-expert Switch-C) and trained up to
+      <strong>7× faster</strong> than a compute-matched dense T5. MoE had gone from a curiosity to a scaling
+      strategy.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/switch_routing.png" alt="The Switch Transformer routing layer"/>
+      <img src="assets/figures/switch_scaling.png" alt="Switch Transformer scaling: loss vs parameters"/>
+      <figcaption>
+        Left: a Switch layer routes each token to a single expert FFN. Right: with the number of experts
+        (and thus parameters) growing, loss keeps falling at fixed compute per token. (Fedus et al., 2021.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="modern">
+    <h2>6. The models you can download: Mixtral &amp; DeepSeek</h2>
+    <p>
+      By 2024, MoE was the open-weights state of the art. <strong>Mixtral 8&times;7B</strong> (Mistral AI)
+      put <strong>8 expert FFNs</strong> in every Transformer block and routed each token to the
+      <strong>top 2</strong>. The arithmetic is the whole pitch: 8 experts make ~47B total parameters, but
+      only 2 fire per token, so ~13B are active — the speed of a 13B model with much of the knowledge of a
+      far larger one. It matched or beat the dense Llama-2-70B while doing roughly a fifth of the work:
+    </p>
+    <p class="eq">$$ y = \sum_{i \in \Top\text{-}2} \Softmax\big(\Top\text{-}2(x \cdot W_g)\big)_i \cdot \SwiGLU_i(x). $$</p>
+    <p>
+      A surprise lived in Mixtral's routing. You might expect experts to specialize by <em>topic</em> — a
+      biology expert, a code expert. They don't. The routing is nearly identical across wildly different
+      domains; what specialization exists is <em>syntactic and positional</em> — the router tends to send
+      structural tokens (indentation, keywords) and runs of consecutive tokens to the same expert. The
+      experts are specialists of <em>form</em>, not subject.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/mixtral_routing.png" alt="Mixtral expert assignment colored by token"/>
+      <figcaption>
+        Mixtral's routing, with each token colored by its chosen expert. The pattern tracks syntax and
+        position — code indentation, keywords, consecutive tokens — far more than topic. (Jiang et al., 2024.)
+      </figcaption>
+    </figure>
+
+    <p>
+      <strong>DeepSeek-MoE</strong> pushed expert specialization further with two ideas. First,
+      <strong>fine-grained experts</strong>: chop each expert into several smaller ones and route to more of
+      them. Routing 6-of-64 small experts instead of 2-of-8 large ones keeps the compute identical but
+      explodes the number of expert <em>combinations</em> the router can compose — from a handful to
+      billions — letting knowledge be carved up far more precisely. Second, <strong>shared experts</strong>:
+      set aside a few experts that are <em>always</em> on, for every token, to absorb the common knowledge
+      every token needs — so the routed experts don't each waste capacity re-learning the basics:
+    </p>
+    <p class="eq">$$ y = \underbrace{\sum_{i=1}^{K_s} E_i(x)}_{\text{shared, always on}} \;+\; \underbrace{\sum_{i=K_s+1}^{mN} g_i\, E_i(x)}_{\text{routed, top-}k} \;+\; x. $$</p>
+    <p>
+      DeepSeek-MoE 16B uses 2 shared plus 6-of-64 routed experts — 16.4B parameters, but only 2.8B active
+      per token — and matches dense 7B models at roughly <strong>40% of the compute</strong>. This
+      shared-plus-fine-grained recipe became the template for the DeepSeek-V2/V3 frontier models.
+    </p>
+    <p>
+      One more idea worth meeting: <em>who picks whom</em>. Everything so far is <strong>token-choice</strong> —
+      each token picks its top experts — which is exactly why load can pile onto a few experts and why we
+      need the balancing loss. <strong>Expert-choice</strong> routing flips it: each expert picks its top
+      tokens, up to its capacity. Balance becomes <em>automatic</em> — every expert takes exactly its share —
+      at the cost that some tokens may get many experts and some none. Toggle between the two below.
+    </p>
+
+    <div class="widget-frame" id="routing-modes">
+      <p class="widget-title">Token-choice vs. expert-choice routing</p>
+      <p class="widget-sub">The same token–expert affinity grid, routed two ways. Token-choice (top-k per token) can overload an expert; expert-choice (top-k tokens per expert) guarantees balance but may leave some tokens unrouted.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. Results: more model, same bill</h2>
+    <p>
+      Across two decades and three orders of magnitude, the same trade keeps paying off: spend parameters,
+      not FLOPs. A few representative numbers from the line of work:
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Model</th><th>What it shows</th><th>MoE</th><th>Dense comparison</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Sparse MoE (2017)</td>
+          <td>1B Word perplexity (↓)</td>
+          <td class="win"><strong>28.0</strong></td>
+          <td>30.6 <em>(best published dense)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Switch-C (2021)</td>
+          <td>params · pretrain speed (↑)</td>
+          <td class="win"><strong>1.6T · ~7×</strong></td>
+          <td>T5 dense (compute-matched)</td>
+        </tr>
+        <tr>
+          <td rowspan="2" class="cat">Mixtral 8×7B (2024)</td>
+          <td>MMLU (↑)</td>
+          <td class="win"><strong>70.6%</strong></td>
+          <td>69.9% <em>(Llama-2-70B, 5× active)</em></td>
+        </tr>
+        <tr>
+          <td>HumanEval / GSM8K (↑)</td>
+          <td class="win"><strong>40.2% / 74.4%</strong></td>
+          <td>29.3% / 69.6% <em>(Llama-2-70B)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">DeepSeek-MoE 16B</td>
+          <td>compute vs dense 7B (↓)</td>
+          <td class="win"><strong>~40%</strong></td>
+          <td>100% <em>(matches quality)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      Sources: Shazeer et al. 2017; Fedus et al. 2021; Jiang et al. 2024; Dai et al. 2024. "Active"
+      parameters are those touched per token; Mixtral is 47B total / 13B active, DeepSeek-MoE 16.4B / 2.8B.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/mixtral_smoe.png" alt="Mixtral sparse mixture-of-experts layer"/>
+      <img src="assets/figures/deepseek_arch.png" alt="DeepSeek-MoE: conventional vs fine-grained vs shared experts"/>
+      <figcaption>
+        Left: Mixtral's sparse MoE layer — a router picks 2 of 8 expert FFNs per token. Right: DeepSeek-MoE's
+        recipe — many fine-grained routed experts plus a couple of always-on shared experts. (Jiang et al.,
+        2024; Dai et al., 2024.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why it works</h2>
+    <p>
+      Three forces, stacked, explain why MoE is everywhere now.
+    </p>
+
+    <h3>It breaks the parameters–compute link</h3>
+    <p>
+      A dense model spends compute proportional to its size. MoE spends compute proportional to the
+      <em>active</em> size — the experts actually fired — while capacity scales with the <em>total</em> size.
+      Since much of what a large model knows is sparse, niche facts that most tokens never need, storing them
+      in experts you rarely touch is exactly the right shape for the problem.
+    </p>
+
+    <h3>Specialization reduces interference</h3>
+    <p>
+      The original 1991 motivation never went away. Different inputs want different processing; making them
+      share every weight forces compromises. Routing lets experts carve up the work — even if, as Mixtral
+      showed, the carving is more about syntactic structure than tidy human topics. DeepSeek's fine-grained
+      and shared experts are a direct attempt to make that division of labor cleaner: shared experts hold the
+      common core, fine-grained routed experts hold the specifics.
+    </p>
+
+    <h3>The hard part is routing, and we learned to tame it</h3>
+    <p>
+      Every gain rides on a discrete decision — which experts? — that fights smooth training. The history of
+      MoE is really the history of taming that decision: noisy gates to explore, load-balancing losses to
+      prevent collapse, capacity factors to bound the buffers, top-1 to simplify, expert-choice to guarantee
+      balance. None of the scaling would have mattered if the router kept collapsing.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>9. What it means</h2>
+    <p>
+      Mixture of experts is the clearest example in deep learning of an old, simple idea winning at a scale
+      its inventors could not have imagined. "Route the input to specialists and combine their answers" was a
+      tidy bit of 1991 statistics. Sparsify the routing and it becomes the only known way to keep growing a
+      model's knowledge without growing its per-token cost in lockstep — which is why the largest models you
+      can name are now, almost all of them, mixtures of experts.
+    </p>
+    <p>
+      It is not free. You pay in memory (all those parameters must be <em>stored</em> and moved, even if not
+      computed), in the all-to-all communication of shuffling tokens to their experts across devices, and in
+      the perennial fragility of routing. But the central bet — that a model can be enormous in what it knows
+      and modest in what it spends per token — has been validated at every scale from a 1991 toy to a
+      trillion parameters.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Memory, not compute, is the new wall.</strong> MoE trades FLOPs for parameters, but those
+        parameters still have to fit in (and move through) hardware. Serving a sparse trillion-parameter model
+        is a systems problem as much as a modeling one.</li>
+      <li><strong>Routing is still brittle.</strong> Load balancing, token dropping, and training instability
+        remain active research. Expert-choice and loss-free balancing schemes are recent attempts to do better.</li>
+      <li><strong>What should an expert be?</strong> Mixtral's syntactic routing suggests experts don't
+        specialize the way we'd hope. Fine-grained and shared experts help; the ideal granularity is open.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      For thirty years the size of a model and the cost of running it rose together, locked. Mixture of experts
+      pried them apart: let the input choose a few specialists, ignore the rest, and a model can be a trillion
+      parameters wide while costing a few billion to run. The committee of experts you met in 1991 is now,
+      quietly, doing the routing inside the models at the frontier.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Papers: <a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">Sparse MoE (1701.06538)</a> ·
+      <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Switch (2101.03961)</a> ·
+      <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">Mixtral (2401.04088)</a> ·
+      <a href="https://arxiv.org/abs/2401.06066" target="_blank" rel="noopener">DeepSeek-MoE (2401.06066)</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

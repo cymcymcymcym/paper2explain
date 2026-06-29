@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SLAM: how a robot maps a place and finds itself at once — an interactive explainer</title>
+  <meta name="description" content="An interactive, beginner-friendly tour of SLAM (Simultaneous Localization and Mapping): odometry and drift, filtering vs factor-graph smoothing, SLAM as nonlinear least squares, loop closure, the visual front-end and scale, and how the UMI handheld data collector uses visual-inertial SLAM to turn GoPro demos into robot actions."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\argmin': '\\operatorname*{arg\\,min}',
+        '\\argmax': '\\operatorname*{arg\\,max}',
+        '\\SE': '\\mathrm{SE}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>SLAM: mapping a place and finding yourself at the same time</h1>
+    <p class="byline">
+      A field guide &middot; visual &amp; graph-based SLAM, with a look at UMI &middot; June 2026
+    </p>
+    <p class="lede">
+      Drop a robot — or a phone, or a drone — into a room it has never seen, with no GPS and no map. To
+      do anything useful it must answer two questions at once: <em>what does this place look like</em>
+      (build a map), and <em>where am I in it</em> (localize). The catch is that each answer needs the
+      other: you can't place yourself without a map, and you can't build a map without knowing where you
+      are. <strong>SLAM — Simultaneous Localization and Mapping</strong> — is the family of algorithms that
+      cracks this chicken-and-egg problem by solving both together. It's what lets a robot vacuum cover
+      your floor, a headset anchor a hologram to your desk, and — as we'll see — a cheap handheld gripper
+      called <strong>UMI</strong> turn a GoPro video of someone doing the dishes into training data a robot
+      arm can learn from.
+    </p>
+  </header>
+
+  <figure class="teaser">
+    <svg viewBox="0 0 760 300" role="img" aria-label="A drifted robot trajectory closed into a consistent loop by a loop-closure constraint" style="width:100%;height:auto;">
+      <style>
+        .cap { font: 400 12px var(--sans, system-ui); fill: var(--fg-mute, #888); }
+        .lc  { font: 600 12px var(--sans, system-ui); fill: #66bb6a; }
+        .dr  { font: 600 12px var(--sans, system-ui); fill: #e8554e; }
+      </style>
+      <!-- observation rays -->
+      <g stroke="#5fa9ff" stroke-width="1" opacity="0.4">
+        <line x1="338.3" y1="51.5" x2="320" y2="110"/>
+        <line x1="338.3" y1="51.5" x2="450" y2="110"/>
+        <line x1="196" y1="214.3" x2="320" y2="195"/>
+        <line x1="500" y1="236.6" x2="460" y2="190"/>
+      </g>
+      <!-- trajectory (open loop, drifted) -->
+      <path d="M605.5,115.8 L500,63.4 L338.3,51.5 L196,85.7 L140,150 L196,214.3 L338.3,248.5 L500,236.6 L605.5,184.2"
+            fill="none" stroke="#ff9b6a" stroke-width="3"/>
+      <!-- pose nodes -->
+      <g fill="#ff9b6a">
+        <circle cx="605.5" cy="115.8" r="5"/><circle cx="500" cy="63.4" r="5"/>
+        <circle cx="338.3" cy="51.5" r="5"/><circle cx="196" cy="85.7" r="5"/>
+        <circle cx="140" cy="150" r="5"/><circle cx="196" cy="214.3" r="5"/>
+        <circle cx="338.3" cy="248.5" r="5"/><circle cx="500" cy="236.6" r="5"/>
+        <circle cx="605.5" cy="184.2" r="5"/>
+      </g>
+      <!-- landmarks -->
+      <g fill="#5fa9ff">
+        <rect x="314" y="104" width="11" height="11" transform="rotate(45 320 110)"/>
+        <rect x="444" y="104" width="11" height="11" transform="rotate(45 450 110)"/>
+        <rect x="314" y="189" width="11" height="11" transform="rotate(45 320 195)"/>
+        <rect x="454" y="184" width="11" height="11" transform="rotate(45 460 190)"/>
+      </g>
+      <!-- drift gap -->
+      <path d="M598,119 q-12,31 0,62" fill="none" stroke="#e8554e" stroke-width="2" stroke-dasharray="3 3"/>
+      <text x="560" y="154" text-anchor="end" class="dr">drift</text>
+      <!-- loop-closure constraint -->
+      <path d="M605.5,184.2 Q672,150 605.5,115.8" fill="none" stroke="#66bb6a" stroke-width="2.5" stroke-dasharray="6 4"/>
+      <text x="690" y="153" text-anchor="middle" class="lc" transform="rotate(90 690 150)">loop closure</text>
+      <!-- legend -->
+      <circle cx="150" cy="278" r="5" fill="#ff9b6a"/><text x="162" y="282" class="cap">poses (where I was)</text>
+      <rect x="320" y="273" width="10" height="10" transform="rotate(45 325 278)" fill="#5fa9ff"/><text x="338" y="282" class="cap">landmarks (the map)</text>
+    </svg>
+    <figcaption>
+      The whole story in one picture. A robot drives a loop, estimating its
+      <span style="color:#ff9b6a">trajectory</span> step by step and observing
+      <span style="color:#5fa9ff">landmarks</span> along the way. Small errors accumulate, so by the time
+      it returns home the estimated loop has <span style="color:#e8554e">drifted</span> and doesn't quite
+      close. Recognizing the starting place adds a <span style="color:#66bb6a">loop-closure constraint</span>
+      — and re-optimizing the whole graph snaps the trajectory and map back into global consistency. Build
+      and run this exact process in the widgets below.
+    </figcaption>
+  </figure>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The chicken-and-egg problem</a></li>
+      <li><a href="#problem">1. What SLAM actually estimates</a></li>
+      <li><a href="#drift">2. Odometry, and why it drifts</a></li>
+      <li><a href="#paradigms">3. Two ways to solve it</a></li>
+      <li><a href="#leastsquares">4. SLAM as one big least-squares problem</a></li>
+      <li><a href="#loop">5. Loop closure: the move that works</a></li>
+      <li><a href="#frontend">6. The front-end: pixels to constraints</a></li>
+      <li><a href="#umi">7. UMI: SLAM as a data factory</a></li>
+      <li><a href="#why">8. Why it works</a></li>
+      <li><a href="#what-it-means">9. What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      The word <em>simultaneous</em> is doing a lot of work. If someone handed you an accurate map, finding
+      your place in it would be a solved problem — that's just <em>localization</em>, the thing your phone's
+      GPS does outdoors. And if a surveyor told you exactly where the camera was at every instant, stitching
+      its views into a map would be straightforward — that's <em>mapping</em>. SLAM is hard precisely because
+      you get neither for free. You have a stream of noisy sensor readings, and from that alone you must
+      conjure both the map and the path through it, each bootstrapping the other.
+    </p>
+    <p>
+      Remarkably, this works, and it works well enough to be invisible infrastructure. The same core ideas
+      power autonomous-car localization, drone navigation, augmented-reality headsets, planetary rovers, and
+      the robot learning systems that are reshaping manipulation. We'll build the concepts in order: the
+      state SLAM estimates, why naive dead-reckoning drifts, the two historical paradigms (filtering and
+      smoothing), the modern view of SLAM as a sparse least-squares problem on a factor graph, the magic of
+      loop closure, and the visual front-end that feeds it. Then we'll ground all of it in a real, recent
+      system — <strong>UMI</strong> — where SLAM is the quiet engine that converts cheap human demonstrations
+      into robot actions. Five interactive widgets and one animation along the way; no robotics background
+      assumed.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="problem">
+    <h2>1. What SLAM actually estimates</h2>
+    <p>
+      Strip SLAM to its variables and there are just two kinds. The first is the robot's
+      <strong>pose</strong> over time — not just position but orientation, because a camera pointed north
+      sees a completely different world than one pointed east. In the plane a pose is three numbers
+      $(x, y, \theta)$; in 3D it's six — a position and a 3D rotation — an element of the group $\SE(3)$.
+      A robot's whole <em>trajectory</em> is a sequence of poses $x_0, x_1, x_2, \ldots$
+    </p>
+    <p>
+      The second kind is the <strong>map</strong>. In the simplest and most classic form, the map is a set
+      of <em>landmarks</em> — distinctive points in the world at unknown positions $l_1, l_2, \ldots$ (a
+      corner, a textured patch, a tree). Richer maps exist — dense surfaces, occupancy grids, neural fields
+      — but the landmark view exposes the core problem cleanly. SLAM's job is to estimate <em>all</em> of
+      it jointly: every pose and every landmark, from nothing but the sensor stream and the knowledge of how
+      the robot moves and senses.
+    </p>
+    <aside class="callout">
+      <strong>Why orientation makes it hard.</strong> Position errors add up linearly, but a small error in
+      <em>heading</em> rotates everything you do afterward. Mis-estimate your turn by two degrees and ten
+      meters later you're a third of a meter off — and it only grows. That coupling between rotation and
+      position is exactly why drift is so vicious, and why the math lives on rotation groups rather than in
+      flat vector space.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="drift">
+    <h2>2. Odometry, and why it drifts</h2>
+    <p>
+      The cheapest way to track where you are is <strong>dead reckoning</strong>: start at a known pose and
+      keep adding up your motion. Wheel encoders count rotations; <em>visual odometry</em> estimates how the
+      camera moved between frames; an IMU integrates acceleration and angular velocity. Each gives you an
+      incremental motion $u_i$, and you chain them: $x_{i} = f(x_{i-1}, u_i)$.
+    </p>
+    <p>
+      The problem is that every $u_i$ is a little wrong, and the errors <em>accumulate</em>. There's no
+      reference to correct against, so the estimate wanders away from reality — slowly at first, then
+      inexorably. This is <strong>drift</strong>, and it's the antagonist of the whole field. Drive a loop
+      in the widget below and watch the estimated path peel away from the true one; turn up the per-step
+      noise and watch it get worse. Pure odometry alone can never come home.
+    </p>
+
+    <div class="widget-frame" id="drift-widget">
+      <p class="widget-title">Watch odometry drift</p>
+      <p class="widget-sub">The robot drives the same true loop (grey) over and over, but it only knows its
+        noisy step-by-step motion, so its <em>estimate</em> (orange) drifts away. Adjust the per-step
+        sensor noise and re-drive. Notice the estimate never returns to where it started.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="paradigms">
+    <h2>3. Two ways to solve it</h2>
+    <p>
+      Historically, SLAM split into two camps over a single question: do you keep only the <em>current</em>
+      estimate, or do you remember and re-optimize the <em>whole history</em>?
+    </p>
+    <h3>Filtering — keep only now</h3>
+    <p>
+      The classic <strong>EKF-SLAM</strong> maintains one big Gaussian over the current robot pose and every
+      landmark, updating it recursively: a <em>predict</em> step rolls the estimate forward with the motion
+      model, and an <em>update</em> step corrects it with each new measurement. It's online and memory-light
+      in trajectory length — but its covariance matrix grows with the number of landmarks, costing
+      $\mathcal{O}(N^2)$ per update, and once a measurement is folded in, its linearization is frozen for
+      good. <strong>FastSLAM</strong> made this scale with a clever particle filter, but the deeper issue
+      remained: throwing away the past means you can't revisit and fix old mistakes.
+    </p>
+    <h3>Smoothing — remember everything</h3>
+    <p>
+      Modern SLAM keeps the entire trajectory and map as free variables and finds the configuration that
+      best explains <em>all</em> measurements at once. This is <strong>graph-based</strong> or
+      <strong>factor-graph</strong> SLAM, and it won — because the problem turns out to be enormously
+      <em>sparse</em> (each pose touches only its neighbors and the few landmarks it saw), and sparse
+      nonlinear least squares can be solved astonishingly fast. It's also what makes loop closure natural:
+      a new constraint between old poses simply gets added to the graph and the whole thing re-optimizes.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="leastsquares">
+    <h2>4. SLAM as one big least-squares problem</h2>
+    <p>
+      Here is the modern formulation in full. Collect all unknowns — poses and landmarks — into one big
+      vector $X$. We want the most probable $X$ given all measurements $Z$, the maximum-a-posteriori
+      estimate:
+    </p>
+    <p class="eq">$$ X^\star \;=\; \argmax_X\ p(X \mid Z) \;\propto\; p(x_0)\,\prod_i p\big(x_i \mid x_{i-1}, u_i\big)\,\prod_k p\big(z_k \mid x_{i_k}, l_{j_k}\big). $$</p>
+    <p>
+      That product has one factor for the prior, one <em>motion</em> factor per odometry step (how
+      consistent are consecutive poses with the measured motion $u_i$?), and one <em>observation</em> factor
+      per measurement (how consistent is the predicted view of landmark $l_{j_k}$ from pose $x_{i_k}$ with
+      what was actually seen, $z_k$?). Drawn out, variables and factors form a <strong>factor graph</strong>.
+    </p>
+    <p>
+      Assume the noise on each factor is Gaussian. Taking the negative log turns the product into a sum and
+      each Gaussian into a squared error, so MAP estimation becomes <strong>nonlinear least squares</strong>:
+    </p>
+    <p class="eq">$$ X^\star \;=\; \argmin_X\ \sum_i \big\lVert f(x_{i-1}, u_i) \ominus x_i \big\rVert^2_{\Lambda_i} \;+\; \sum_k \big\lVert h(x_{i_k}, l_{j_k}) - z_k \big\rVert^2_{\Sigma_k}, $$</p>
+    <p>
+      where each term is a <em>Mahalanobis</em> norm $\lVert e\rVert^2_\Sigma = e^\top \Sigma^{-1} e$ that
+      weights an error by how certain that measurement is. You minimize it by repeated linearization —
+      <strong>Gauss-Newton</strong> or Levenberg-Marquardt — solving a linear system at each step:
+    </p>
+    <p class="eq">$$ \big(J^\top \Sigma^{-1} J\big)\,\Delta X \;=\; -\,J^\top \Sigma^{-1}\, e. $$</p>
+    <p>
+      The matrix on the left is the <em>information matrix</em>, and because the factor graph is sparse — most
+      pairs of variables share no factor — it is sparse too. Exploiting that sparsity (with sparse Cholesky
+      factorization, and incrementally in systems like iSAM/GTSAM) is what makes optimizing thousands of
+      poses and landmarks feasible in real time. This least-squares-on-a-graph view is the backbone under
+      essentially every modern SLAM and structure-from-motion system.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="loop">
+    <h2>5. Loop closure: the move that works</h2>
+    <p>
+      Everything so far still drifts — the factor graph of pure odometry is just a chain, and a chain of
+      noisy links sags away from the truth. <strong>Loop closure</strong> is what changes everything. When
+      the robot recognizes that it is seeing a place it has visited before, it can add a brand-new factor
+      directly connecting two poses that are far apart <em>in time</em> but close <em>in space</em>. That
+      single constraint says "these two moments are at the same place," and when the graph re-optimizes, the
+      accumulated drift gets distributed backward around the entire loop. The map snaps into global
+      consistency.
+    </p>
+    <p>
+      It is genuinely dramatic to watch. The animation shows a drifted loop — the trajectory wandering, each
+      landmark smeared into two sightings — the instant a loop closure is recognized, and the optimization
+      pulling the whole structure into a single coherent map.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/loopclose.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      A drifted estimate (orange trajectory, blue landmarks with ghostly second sightings) the moment a
+      loop closure links the end of the loop back to its start — and the global optimization that snaps
+      trajectory and map into consistency. This is the single most important event in a SLAM run.
+    </p>
+
+    <p>
+      Now run it yourself. The widget builds a pose graph from a drifting drive; press <em>close the loop</em>
+      to add the loop-closure constraint and run the optimizer, and watch the trajectory and the total error
+      collapse toward consistency over a few iterations.
+    </p>
+
+    <div class="widget-frame" id="posegraph-widget">
+      <p class="widget-title">Close the loop, optimize the graph</p>
+      <p class="widget-sub">A drifted pose graph: nodes are poses, edges are odometry constraints. Add the
+        loop-closure constraint and step the Gauss-Newton optimizer. Watch the drifted loop pull shut and
+        the total squared error drop — that's SLAM correcting itself.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>How does it know it's been here before?</strong> That's <em>place recognition</em>, a
+      front-end job: summarize each image as a bag of visual words and look for a past image that matches.
+      A false loop closure is catastrophic — it welds together two places that aren't the same — so systems
+      verify a geometric consistency check before trusting one.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="frontend">
+    <h2>6. The front-end: turning pixels into constraints</h2>
+    <p>
+      The least-squares back-end assumes someone has already produced the measurements and told it which
+      measurement corresponds to which landmark. Producing those is the <strong>front-end</strong>, and for
+      cameras it's most of the practical work: detect distinctive features (corners, blobs — ORB, SIFT),
+      match them across frames (<em>data association</em>), and reject outliers. Get the association wrong
+      and the back-end optimizes a fiction.
+    </p>
+
+    <h3>Triangulation and why baseline matters</h3>
+    <p>
+      A single camera sees only a <em>direction</em> to a landmark — a ray, not a distance. See the same
+      landmark from two poses and the two rays intersect, fixing its 3D position by
+      <strong>triangulation</strong>. The wider the <em>baseline</em> between the views (and the more views),
+      the sharper that intersection: the landmark's uncertainty ellipse shrinks. Move the camera in the
+      widget and watch a landmark's estimate tighten as the rays cross at a healthier angle.
+    </p>
+
+    <div class="widget-frame" id="triangulation-widget">
+      <p class="widget-title">Triangulate a landmark</p>
+      <p class="widget-sub">Each camera pose contributes a noisy bearing ray to the landmark. Drag the
+        camera baseline and add views; the rays intersect to estimate the landmark, and its uncertainty
+        ellipse shrinks as the geometry improves. A narrow baseline gives a long, uncertain ellipse.</p>
+    </div>
+
+    <h3>The scale problem</h3>
+    <p>
+      A single moving camera has a famous blind spot: it cannot recover <em>absolute scale</em>. A small
+      object seen up close and a large object seen far away project to the very same pixels. Formally, scaling
+      the whole world and the camera's translation by any factor $s$ leaves every image identical:
+    </p>
+    <p class="eq">$$ \pi\big(K(R\,p + t)\big) \;=\; \pi\big(K(R\,(s\,p) + s\,t)\big)\qquad\text{for any } s > 0, $$</p>
+    <p>
+      where $\pi$ is the perspective divide and $K$ the camera intrinsics. So monocular SLAM reconstructs the
+      world only up to an unknown scale. To pin it down you need a metric reference: a <em>stereo</em> pair
+      with a known baseline, a depth (RGB-D) sensor, an object of known size — or an <strong>IMU</strong>,
+      whose accelerometer feels true gravity and acceleration in metric units. Toggle the scale anchor in the
+      widget and watch the ambiguous world lock to a real size.
+    </p>
+
+    <div class="widget-frame" id="scale-widget">
+      <p class="widget-title">Monocular scale ambiguity</p>
+      <p class="widget-sub">The same camera images are consistent with a small-and-near world or a
+        large-and-far one — slide the scale and the picture in the camera doesn't change. Switch on a metric
+        anchor (stereo / depth / IMU) and the true scale gets fixed.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="umi">
+    <h2>7. UMI: SLAM as a data factory</h2>
+    <p>
+      Here's where it gets concrete and a little surprising. One of the biggest bottlenecks in robot learning
+      is <em>data</em>: teaching a robot to manipulate objects usually means painstaking teleoperation on real
+      hardware. The <strong>Universal Manipulation Interface (UMI)</strong> sidesteps this with a beautifully
+      simple device — a cheap handheld gripper with a <strong>GoPro</strong> bolted on — that anyone can pick
+      up and use to demonstrate a task <em>in the wild</em>, no robot required. Wash a cup, open a drawer,
+      arrange flowers; the GoPro just records.
+    </p>
+    <p>
+      But a video isn't an action. To train a policy, you need the gripper's full <strong>6-DoF trajectory</strong>
+      — where it was and how it was oriented at every instant — plus how open its fingers were. UMI recovers
+      all of this from the GoPro footage alone, and the engine that does it is <strong>visual-inertial SLAM</strong>
+      (UMI runs ORB-SLAM3 on the fisheye video and the GoPro's IMU). SLAM turns "a phone-quality video of a
+      hand" into a metric, time-stamped path the robot can replay.
+    </p>
+
+    <figure class="paper-figure">
+      <svg viewBox="0 0 760 230" role="img" aria-label="UMI pipeline: handheld gripper to SLAM trajectory to robot action" style="width:100%;height:auto;">
+        <style>
+          .ul { font: 600 12px var(--sans, system-ui); fill: var(--fg, #e8e8ee); }
+          .us { font: 400 11px var(--sans, system-ui); fill: var(--fg-mute, #888); }
+        </style>
+        <!-- stage 1: handheld rig -->
+        <text x="120" y="20" text-anchor="middle" class="ul">1 · handheld demo</text>
+        <!-- gripper fingers -->
+        <path d="M70,150 L70,110 M170,150 L170,110" stroke="#ff9b6a" stroke-width="4" fill="none"/>
+        <path d="M70,150 Q120,170 170,150" stroke="#ff9b6a" stroke-width="4" fill="none"/>
+        <!-- camera -->
+        <rect x="100" y="70" width="40" height="26" rx="4" fill="#5fa9ff"/>
+        <circle cx="120" cy="83" r="7" fill="#0e0f12"/>
+        <!-- frustum to object -->
+        <path d="M108,96 L70,150 M132,96 L170,150" stroke="#5fa9ff" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>
+        <circle cx="120" cy="150" r="9" fill="#66bb6a"/>
+        <text x="120" y="200" text-anchor="middle" class="us">GoPro fisheye + IMU</text>
+        <text x="120" y="214" text-anchor="middle" class="us">on a low-cost gripper</text>
+
+        <path d="M205,120 L250,120" stroke="var(--fg-mute,#888)" stroke-width="2" marker-end="url(#ar)"/>
+        <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="var(--fg-mute,#888)"/></marker></defs>
+
+        <!-- stage 2: SLAM -->
+        <text x="380" y="20" text-anchor="middle" class="ul">2 · visual-inertial SLAM</text>
+        <path d="M280,150 C320,80 420,80 480,140" fill="none" stroke="#ff9b6a" stroke-width="2.5"/>
+        <g stroke="#5fa9ff" stroke-width="2">
+          <line x1="300" y1="120" x2="312" y2="108"/><line x1="300" y1="120" x2="288" y2="112"/>
+          <line x1="360" y1="92" x2="372" y2="80"/><line x1="360" y1="92" x2="348" y2="84"/>
+          <line x1="430" y1="98" x2="442" y2="86"/><line x1="430" y1="98" x2="418" y2="90"/>
+        </g>
+        <g fill="#ff9b6a"><circle cx="300" cy="120" r="4"/><circle cx="360" cy="92" r="4"/><circle cx="430" cy="98" r="4"/></g>
+        <text x="380" y="200" text-anchor="middle" class="us">ORB-SLAM3 → 6-DoF camera path</text>
+        <text x="380" y="214" text-anchor="middle" class="us">(IMU fixes metric scale)</text>
+
+        <path d="M505,120 L550,120" stroke="var(--fg-mute,#888)" stroke-width="2" marker-end="url(#ar)"/>
+
+        <!-- stage 3: robot -->
+        <text x="640" y="20" text-anchor="middle" class="ul">3 · robot action</text>
+        <path d="M600,150 L630,120 L660,135 L690,100" fill="none" stroke="#66bb6a" stroke-width="2.5"/>
+        <rect x="612" y="150" width="56" height="14" rx="3" fill="var(--bg-card,#222)" stroke="var(--fg-mute,#888)"/>
+        <path d="M640,150 L640,135 M634,120 L646,120" stroke="#66bb6a" stroke-width="3"/>
+        <text x="645" y="200" text-anchor="middle" class="us">hand-eye transform →</text>
+        <text x="645" y="214" text-anchor="middle" class="us">end-effector trajectory</text>
+      </svg>
+      <figcaption>
+        UMI's pipeline. A handheld GoPro-on-a-gripper records an in-the-wild demonstration; visual-inertial
+        SLAM recovers the camera's metric 6-DoF trajectory; a fixed, calibrated hand-eye transform converts
+        the camera path into the gripper's path — an action sequence a robot arm can directly execute and a
+        policy can be trained on.
+      </figcaption>
+    </figure>
+
+    <p>
+      The last link is a rigid <strong>hand-eye transform</strong>: the GoPro is bolted to the gripper, so
+      the constant transform $T^{\text{cam}}_{\text{gripper}}$ from camera frame to gripper-tip frame is
+      known by calibration. Compose it with the SLAM pose and you get the end-effector pose in the world:
+    </p>
+    <p class="eq">$$ T^{\text{world}}_{\text{gripper}} \;=\; T^{\text{world}}_{\text{cam}} \cdot T^{\text{cam}}_{\text{gripper}}. $$</p>
+    <p>
+      Two SLAM-specific details make UMI work in practice, and both are themes from earlier. First,
+      <strong>scale</strong>: a lone GoPro is monocular and scale-blind, so UMI leans on the IMU (and a
+      known scene/​gripper geometry) to recover <em>metric</em> trajectories — a robot needs centimeters, not
+      arbitrary units. Second, a wide <strong>fisheye</strong> lens gives the tracker lots of stable
+      features and robustness to the fast, jerky motions of a human hand. Scrub the recovered trajectory in
+      the widget to see the camera pose become a gripper action.
+    </p>
+
+    <div class="widget-frame" id="umi-widget">
+      <p class="widget-title">From SLAM pose to robot action</p>
+      <p class="widget-sub">Scrub along a SLAM-recovered camera trajectory. At each instant the camera frame
+        (blue) is converted, through the fixed hand-eye transform, into the gripper-tip frame (green) — the
+        actual action the robot will execute. Toggle the offset to feel what the calibration buys you.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why it works</h2>
+    <p>
+      Three ideas carry the whole edifice, and they're worth holding onto.
+    </p>
+    <h3>Sparsity makes the impossible cheap</h3>
+    <p>
+      Jointly optimizing thousands of poses and landmarks sounds hopeless, but almost every pair of variables
+      is unrelated — a pose constrains only its time-neighbors and the handful of landmarks it saw. The
+      information matrix is therefore mostly zeros, and sparse linear algebra solves it in roughly linear
+      time. SLAM scales because the world is local.
+    </p>
+    <h3>Loop closure beats drift</h3>
+    <p>
+      Odometry's error grows without bound; a single global constraint resets it. The reason SLAM produces
+      consistent maps over kilometers, while raw odometry smears, is that revisiting places injects
+      information that no amount of careful dead-reckoning can. Mapping isn't just integration — it's
+      integration plus correction.
+    </p>
+    <h3>Fuse complementary senses</h3>
+    <p>
+      No single sensor is enough: cameras are rich but scale-blind and slow; IMUs are fast and metric but
+      drift quickly; LiDAR is precise but sparse in texture. SLAM's least-squares core is, at heart, a
+      principled way to fuse them — each becomes a factor with its own uncertainty, and the optimizer lets
+      the confident measurements dominate where they should. UMI's camera-plus-IMU is exactly this bargain.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>9. What it means</h2>
+    <p>
+      SLAM is one of those rare ideas that graduated from research problem to invisible infrastructure. It's
+      in your vacuum, your headset, every self-driving stack, and — the part most people miss — increasingly
+      in the <em>data pipeline</em> of modern robot learning. UMI is the tell: by making 6-DoF tracking
+      cheap and portable, SLAM turns the entire physical world into a place where manipulation data can be
+      collected, by anyone, with a gripper and a GoPro. The algorithm that lets a robot know where it is has
+      quietly become the algorithm that lets robots learn what to do.
+    </p>
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Dynamic and changing scenes.</strong> Classic SLAM assumes a static world; people, cars,
+        and moving objects break that assumption, and robustly mapping places that change over time is far
+        from solved.</li>
+      <li><strong>Dense and semantic maps.</strong> Landmarks localize well but don't tell you that a
+        surface is a table or a door. Fusing SLAM with dense reconstruction (including neural and
+        Gaussian-splat maps) and semantics is an active frontier.</li>
+      <li><strong>Lifelong, multi-session mapping.</strong> Merging maps across days, devices, and lighting,
+        and keeping them consistent and compact forever, remains genuinely hard — and is exactly what
+        large-scale data collection à la UMI will demand.</li>
+    </ul>
+    <h3>The bottom line</h3>
+    <p>
+      Underneath the acronyms, SLAM is a single, elegant bargain: write every noisy thing you know — each
+      motion step, each sighting, each "I've been here before" — as a weighted constraint in one big sparse
+      graph, then find the trajectory and map that bend to satisfy all of them at once. Odometry guesses;
+      loop closure corrects; least squares reconciles. The result is a machine that, dropped into an unknown
+      place, can answer both <em>where am I</em> and <em>what is this place</em> — and, increasingly, hand
+      that answer to a robot as something to learn from.
+    </p>
+  </section>
+
+  <footer>
+    <p>An interactive explainer on SLAM and the UMI data collector. Built with vanilla JS, Canvas, and KaTeX.</p>
+    <p class="tiny">System and method names (EKF-SLAM, FastSLAM, ORB-SLAM3, iSAM/GTSAM, UMI) refer to their respective original works, cited here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

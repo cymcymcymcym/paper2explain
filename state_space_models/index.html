@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>State Space Models: from a swinging pendulum to Mamba</title>
+  <meta name="description" content="An interactive walk from classical linear systems theory to HiPPO, S4, and Mamba — the same equation, three readings of its state."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\Abar': '{\\bar{A}}', '\\Bbar': '{\\bar{B}}', '\\Cbar': '{\\bar{C}}',
+        '\\Kbar': '{\\bar{K}}', '\\half': '{\\tfrac{\\Delta}{2}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>State Space Models: from a swinging pendulum to Mamba</h1>
+    <p class="byline">
+      A thread through <strong>HiPPO</strong>, <strong>S4</strong>, and <strong>Mamba</strong> &middot;
+      Gu, Dao, Ré, and collaborators &middot; Stanford &amp; CMU &middot; 2020–2024 &middot;
+      <a href="https://arxiv.org/abs/2008.07669" target="_blank" rel="noopener">arXiv 2008.07669</a> ·
+      <a href="https://arxiv.org/abs/2111.00396" target="_blank" rel="noopener">2111.00396</a> ·
+      <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">2312.00752</a>
+    </p>
+    <p class="lede">
+      There is one little equation that describes a swinging pendulum, an electrical circuit, the
+      autopilot in a plane — and, it turns out, a modern sequence model that rivals the Transformer.
+      It is <em>$\dot{x} = Ax + Bu$</em>. This is the story of how a 60-year-old idea from control
+      theory became <strong>Mamba</strong>, a language model that runs in linear time and keeps
+      improving on contexts up to a <em>million tokens long</em>. The whole journey is really one
+      idea — the <em>state</em> — read three different ways.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook: memory is a state</a></li>
+      <li><a href="#state">1. What is a state?</a></li>
+      <li><a href="#solve">2. Solving the system</a></li>
+      <li><a href="#discrete">3. From continuous to discrete</a></li>
+      <li><a href="#learn">4. Learn the system</a></li>
+      <li><a href="#hippo">5. HiPPO: principled memory</a></li>
+      <li><a href="#s4">6. S4: making it work</a></li>
+      <li><a href="#mamba">7. Mamba: selection</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#why">Why it works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/s4_properties.png" alt="Three views of a state space model: continuous, recurrent, convolutional"/>
+      <figcaption>
+        One object, several faces. A state space model is a continuous system $\dot{x}=Ax+Bu$
+        (left), a way of carrying long-range information through a hidden state (middle), and a
+        discrete model that can be run either as a recurrence or as a single convolution $y=\bar K * u$
+        (right). Holding these views in your head at once is the key to everything below. (Gu et al., S4, 2021.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Any model that processes a sequence — words, audio samples, sensor readings — faces the same
+      fundamental problem: it cannot keep the entire past around. By the time you reach token number
+      ten thousand, you cannot afford to re-read tokens one through nine thousand nine hundred and
+      ninety-nine. You have to <em>compress</em> the past into a small summary, and update that
+      summary as each new token arrives. That summary is called the <strong>state</strong>.
+    </p>
+    <p>
+      This is not a deep-learning idea. It is the founding idea of <em>dynamical systems</em> and
+      <em>control theory</em>, worked out decades before anyone trained a neural network. A physicist
+      describing a pendulum, an engineer stabilizing a rocket, and a language model predicting the
+      next word are all doing the same thing: maintaining a compact state that captures everything
+      about the past that matters for the future.
+    </p>
+    <p>
+      We will start where the math started — with continuous physical systems — and derive the core
+      results (the solution, the eigenvalues, the discretization) with interactive widgets to build
+      intuition. Then we will do something audacious: stop treating $A$, $B$, $C$ as physics and
+      start <em>learning</em> them. That single move takes us, in a few careful steps, all the way to
+      Mamba.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="state">
+    <h2>1. What is a state?</h2>
+    <p>
+      Picture a mass hanging from a spring, bobbing up and down. To predict where it will be a moment
+      from now, what do you need to know? Not its entire history of motion — just two numbers right
+      now: its <strong>position</strong> and its <strong>velocity</strong>. Given those, Newton's laws
+      determine the entire future. Position and velocity are a <em>sufficient summary</em> of the
+      past. That is the state.
+    </p>
+    <p>
+      This is the <em>Markov property</em> in its original, physical form: the future depends on the
+      past <em>only through the present state</em>. Stack the position and velocity into a vector
+      $x(t)\in\mathbb{R}^2$, and the laws of motion become a single linear differential equation:
+    </p>
+    <p class="eq">$$ \dot{x}(t) \;=\; A\,x(t) \;+\; B\,u(t), \qquad y(t) \;=\; C\,x(t) \;+\; D\,u(t). $$</p>
+    <p>
+      Read it slowly, because every piece comes back later. $x(t)$ is the hidden state. $A$ is the
+      <strong>state matrix</strong>: it says how the state evolves on its own — the internal physics,
+      the spring pulling back, the damping bleeding off energy. $u(t)$ is the <strong>input</strong>
+      you push in (a force on the mass, a token in a sequence), and $B$ says how that input enters the
+      state. $C$ reads a visible <strong>output</strong> $y(t)$ back out of the hidden state, and $D$
+      is a direct input-to-output shortcut (a skip connection — so unimportant that S4 and Mamba just
+      set $D=0$ and fold it in elsewhere).
+    </p>
+    <p>
+      Everything interesting lives in $A$. Its eigenvalues decide whether the system decays to rest,
+      blows up, or oscillates forever. Drag them around in the complex plane below and watch the
+      pendulum's fate change. This single 2&times;2 matrix is the seed of the entire field.
+    </p>
+
+    <div class="widget-frame" id="eig-lab">
+      <p class="widget-title">The eigenvalue lab</p>
+      <p class="widget-sub">Move the eigenvalues of $A$ in the complex plane. Watch the state trajectory (phase portrait) and the physical motion respond. Real part = decay/growth; imaginary part = oscillation.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>The reframe to keep in your pocket.</strong> In a language model the "physics" is gone —
+      there is no real spring. But the <em>shape</em> of the equation is exactly what we want: a hidden
+      state that carries information forward, nudged by each new input. The whole game of the next
+      decade is: <em>what if we keep this equation but learn $A$, $B$, $C$ from data?</em>
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="solve">
+    <h2>2. Solving the system — and the convolution hiding inside</h2>
+    <p>
+      A differential equation tells you the <em>rate of change</em> of the state; to actually predict
+      the future we need to solve it. For the scalar equation $\dot{x}=ax$ you already know the answer:
+      $x(t)=e^{at}x(0)$. The beautiful fact is that the <em>matrix</em> version is identical, with the
+      <strong>matrix exponential</strong> $e^{At}$ standing in for $e^{at}$. With an input driving the
+      system, the full solution is:
+    </p>
+    <p class="eq">$$ x(t) \;=\; e^{At}\,x(0) \;+\; \int_0^t e^{A(t-\tau)}\,B\,u(\tau)\,d\tau. $$</p>
+    <p>
+      The first term is the system coasting on its initial state; the second is the accumulated effect
+      of every input pushed in between time $0$ and now. Read the output through $C$:
+    </p>
+    <p class="eq">$$ y(t) \;=\; \underbrace{C e^{At} x(0)}_{\text{initial condition}} \;+\; \int_0^t \underbrace{C e^{A(t-\tau)} B}_{\text{impulse response } h(t-\tau)} \, u(\tau)\, d\tau. $$</p>
+    <p>
+      Stop and stare at that integral, because it is the secret of the whole field. The output is the
+      input $u$ <strong>convolved</strong> with a fixed function $h(t)=Ce^{At}B$ — the system's
+      <em>impulse response</em>. A linear state space model <em>is</em> a convolution; we just have not
+      computed the kernel yet. Hold that thought — it becomes the trick that lets these models train as
+      fast as a CNN.
+    </p>
+
+    <h3>Eigenvalues are the system's personality</h3>
+    <p>
+      Why does $e^{At}$ control everything? Diagonalize $A = V\Lambda V^{-1}$, where $\Lambda$ holds the
+      eigenvalues $\lambda_i$. Then $e^{At} = V e^{\Lambda t} V^{-1}$, and along each eigen-direction the
+      state simply evolves as $e^{\lambda_i t}$. Write $\lambda = \sigma + i\omega$ and the behavior reads
+      straight off: the real part $\sigma$ sets exponential <em>decay</em> ($\sigma<0$, stable) or
+      <em>growth</em> ($\sigma>0$, unstable); the imaginary part $\omega$ sets the <em>oscillation</em>
+      frequency. A pendulum that loses energy has eigenvalues just left of the imaginary axis spiraling
+      inward — exactly what you saw in the widget above. Stability, memory, resonance: all of it is the
+      geometry of where the eigenvalues sit.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="discrete">
+    <h2>3. From continuous to discrete</h2>
+    <p>
+      Physics happens in continuous time, but data arrives in discrete steps: audio samples every
+      $1/16000$ of a second, one word at a time. To run our system on a computer we must
+      <strong>discretize</strong> it — turn the differential equation into a step-by-step recurrence with
+      a step size $\Delta$ (the time between samples). The standard tool is the <em>bilinear transform</em>,
+      which approximates the matrix exponential with a well-behaved rational map. S4 uses exactly this:
+    </p>
+    <p class="eq">$$ \Abar = \Big(I - \half A\Big)^{-1}\Big(I + \half A\Big), \qquad \Bbar = \Big(I - \half A\Big)^{-1} \Delta\, B. $$</p>
+    <p>
+      (Mamba instead uses the zero-order hold, $\Abar=\exp(\Delta A)$ — same idea, a cleaner exponential.)
+      The continuous system collapses into a discrete <strong>linear recurrence</strong>:
+    </p>
+    <p class="eq">$$ x_k \;=\; \Abar\, x_{k-1} \;+\; \Bbar\, u_k, \qquad y_k \;=\; C\,x_k. $$</p>
+    <p>
+      That is it — that is the workhorse equation of every model in this post. At each step, decay the
+      old state by $\Abar$, add the new input through $\Bbar$, and read out through $C$. The step size
+      $\Delta$ is not a throwaway detail: too large and the discrete system lurches past the true
+      trajectory and can go unstable; too small and you waste resolution. Slide $\Delta$ below and watch
+      the discrete samples track — or peel away from — the smooth continuous curve.
+    </p>
+
+    <div class="widget-frame" id="discretize">
+      <p class="widget-title">Continuous → discrete</p>
+      <p class="widget-sub">A continuous system $\dot x = Ax$ and its discretization at step size $\Delta$. Small $\Delta$: the samples hug the true curve. Large $\Delta$: they overshoot and can blow up.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="learn">
+    <h2>4. Learn the system — and the two faces of one model</h2>
+    <p>
+      Here is the leap. Forget springs and circuits. Take that discrete recurrence, make $\Abar$,
+      $\Bbar$, $C$ into <strong>learnable parameters</strong>, and you have a neural network layer that
+      maps an input sequence $u_1,\dots,u_L$ to an output sequence $y_1,\dots,y_L$. It is, structurally, a
+      <em>linear recurrent neural network</em>. So far this sounds unremarkable — RNNs are old news, and
+      famously slow and hard to train. Two things rescue it.
+    </p>
+    <p>
+      The first is a superpower the nonlinear RNN never had. Because the recurrence is <em>linear</em> and
+      <em>time-invariant</em> (the same $\Abar$ every step), we can unroll it in closed form. Expand
+      $x_k=\Abar x_{k-1}+\Bbar u_k$ all the way down and the output becomes a plain weighted sum of past
+      inputs:
+    </p>
+    <p class="eq">$$ y_k = C\Bbar\,u_k + C\Abar\Bbar\,u_{k-1} + C\Abar^2\Bbar\,u_{k-2} + \cdots = \sum_{j\ge 0} \big(C\Abar^{j}\Bbar\big)\, u_{k-j}. $$</p>
+    <p>
+      The coefficients depend only on the parameters, not on the data — so they form a single
+      <strong>fixed kernel</strong>, the SSM convolution kernel, and the whole layer is a convolution:
+    </p>
+    <p class="eq">$$ \Kbar = \big(\,C\Bbar,\; C\Abar\Bbar,\; C\Abar^2\Bbar,\; \dots,\; C\Abar^{L-1}\Bbar\,\big), \qquad y = \Kbar * u. $$</p>
+    <p>
+      This is the same impulse response we spotted in the continuous integral back in §2, now discretized.
+      And it hands us a remarkable gift: <strong>two computational faces of one model</strong>. During
+      <em>training</em>, run it as a convolution — compute the entire output sequence in parallel with an
+      FFT, just like a CNN, no slow step-by-step loop. During <em>inference</em>, run it as a recurrence —
+      generate one token at a time using only the small fixed-size state, with no growing cache. The
+      animation below is the heart of it: the recurrence unrolling into the kernel, and the kernel sliding
+      across the input.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/recurrence_to_convolution.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The duality that powers S4. The step-by-step recurrence (top) carries a state forward by repeated
+      multiplication by $\Abar$. Unroll it and the powers $C\Abar^{j}\Bbar$ snap into a single fixed
+      kernel $\Kbar$ — which then slides over the whole input at once as a convolution. Sequential to
+      train? No. Parallel.
+    </p>
+
+    <p>
+      Build both faces yourself below: set the system, watch the impulse-response kernel form, and confirm
+      that running it as a recurrence and as a convolution give the <em>same</em> output.
+    </p>
+
+    <div class="widget-frame" id="recur-conv">
+      <p class="widget-title">Recurrence ↔ convolution</p>
+      <p class="widget-sub">Tune the SSM. See the kernel $\bar K = (C\bar B, C\bar A\bar B, \dots)$ it induces, and check that the sequential recurrence and the parallel convolution produce identical outputs.</p>
+    </div>
+
+    <p>
+      So we have a layer that trains like a CNN and runs like an RNN. Why didn't this take over years
+      earlier? Because of the <em>second</em> problem, the one the convolution trick does not solve: a
+      randomly-initialized linear recurrence is a <strong>terrible memory</strong>. Repeatedly multiplying
+      by $\Abar$ either shrinks old information to nothing (vanishing) or amplifies it to garbage
+      (exploding). In practice, swapping a random $A$ for a carefully chosen one took a sequential-MNIST
+      model from <strong>60% to 98%</strong> accuracy. The matrix $A$ is not a free parameter you can
+      shrug at. It has to be <em>built</em> for memory. Which is exactly what HiPPO does.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="hippo">
+    <h2>5. HiPPO: memory as optimal approximation</h2>
+    <p>
+      HiPPO (<em>High-order Polynomial Projection Operators</em>) asks a startlingly clean question: of all
+      the possible $A$ matrices, which one makes the state the <em>best possible compressed memory</em> of
+      everything that has happened? To answer it, reframe memory as <strong>online function
+      approximation</strong>. Think of the input history as a function $f(x)$ for $x \le t$. We want to keep,
+      in our $N$-dimensional state $c(t)$, the coefficients of the best degree-$N$ polynomial approximation
+      of that whole history — and we want to keep it updated <em>online</em>, as new data streams in.
+    </p>
+    <p>
+      Choose a measure that says how much each past moment matters, project the history onto an orthogonal
+      polynomial basis (Legendre polynomials) under that measure, and ask how the optimal coefficients
+      evolve in time. The astonishing result is that they obey a linear ODE in <em>exactly</em> our state
+      space form — and it pins down a specific $A$ and $B$:
+    </p>
+    <p class="eq">$$ \frac{d}{dt}c(t) = -\frac{1}{t}\,A\,c(t) + \frac{1}{t}\,B\,f(t), \qquad B_n = \sqrt{2n+1}, $$</p>
+    <p class="eq">$$ A_{nk} = \begin{cases} \sqrt{(2n+1)(2k+1)} & n > k \\ n+1 & n = k \\ 0 & n < k. \end{cases} $$</p>
+    <p>
+      This is HiPPO-LegS, the "scaled Legendre" operator. The mysterious state matrix is no longer
+      mysterious: it is the unique operator that keeps your hidden state an optimal running summary of the
+      entire past. And because the window <em>scales</em> with time, it has no timescale hyperparameter at
+      all — it is provably <em>invariant</em> to how fast your data is sampled, and its gradients decay only
+      polynomially ($\Theta(1/\ell)$), dodging the vanishing-gradient curse that kills ordinary RNNs.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/hippo_reconstruction.png" alt="HiPPO-LegS reconstructing an input signal vs an LSTM"/>
+      <img src="assets/figures/hippo_measures.png" alt="Different HiPPO measures weighting the history"/>
+      <figcaption>
+        Left: from a compressed state, HiPPO-LegS (red) reconstructs a wildly varying input function (black)
+        almost perfectly, while an LSTM's memory (blue) collapses to mush. Right: the choice of
+        <em>measure</em> — how the past is weighted — is what distinguishes HiPPO variants. (Gu et al., HiPPO, 2020.)
+      </figcaption>
+    </figure>
+
+    <p>
+      You can feel this directly. In the widget below, a signal streams in and HiPPO maintains an
+      $N$-dimensional state; from that state alone it reconstructs the <em>entire history</em> as a sum of
+      Legendre polynomials. Turn $N$ up for sharper memory, down to see the compression blur the oldest
+      details first.
+    </p>
+
+    <div class="widget-frame" id="hippo-memory">
+      <p class="widget-title">HiPPO memory</p>
+      <p class="widget-sub">A signal streams left to right. The state holds $N$ Legendre coefficients; the curve is the history reconstructed from <em>only</em> those numbers. Slide $N$ to trade memory size against fidelity.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>A lovely unification.</strong> HiPPO is not just a clever trick — it derives the Legendre
+      Memory Unit from first principles and even recovers the gating mechanism of GRUs and LSTMs as a
+      special case. The heuristic "forget gates" people bolted onto RNNs for decades turn out to be
+      shadows of this one principled equation.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="s4">
+    <h2>6. S4: making it actually work at scale</h2>
+    <p>
+      HiPPO tells us <em>which</em> $A$ to use. S4 — <em>Structured State Spaces</em> — makes computing with
+      it fast enough to matter. The naive obstacle: forming the convolution kernel $\Kbar$ means taking
+      powers $\Abar, \Abar^2, \dots, \Abar^{L-1}$, an $O(N^2 L)$ slog that is hopeless for long sequences.
+    </p>
+    <p>
+      S4's insight is to never form those powers directly. It writes the HiPPO matrix in a
+      <strong>diagonal-plus-low-rank</strong> (DPLR) structure, $A = \Lambda - PQ^{*}$, and then computes the
+      kernel through its <em>generating function</em> evaluated at the roots of unity, which reduces to a
+      <em>Cauchy kernel</em> — an object with stable, near-linear algorithms. The intractable
+      $O(N^2 L)$ collapses to a near-linear $\tilde{O}(N+L)$. The details are a beautiful piece of numerical
+      linear algebra, but the moral is simple: <em>structure in $A$ buys speed</em>. Against the previous
+      SSM implementation, S4 was up to <strong>30× faster</strong> and <strong>400× more memory-efficient</strong>.
+    </p>
+    <p>
+      And it worked spectacularly. On the Long Range Arena benchmark — six tasks designed specifically to
+      torture models with long-range dependencies — S4 didn't just win, it <em>solved</em> the previously
+      impossible Path-X task (reasoning over sequences of length 16,384), where every prior model had been
+      stuck at random-guessing.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Long Range Arena</th><th>Sequence len</th><th>S4</th><th>Best prior / Transformer</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Average (6 tasks)</td>
+          <td>up to 16k</td>
+          <td class="win"><strong>86.1%</strong></td>
+          <td>59.4% <em>(prior best)</em> · 53.7% <em>(Transformer)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Path-X</td>
+          <td>16,384</td>
+          <td class="win"><strong>96.4%</strong></td>
+          <td>50% <em>(all prior: random guess)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Pathfinder</td>
+          <td>1,024</td>
+          <td class="win"><strong>94.2%</strong></td>
+          <td>77.1% <em>(prior best)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Raw audio (SC10)</td>
+          <td>16,000</td>
+          <td class="win"><strong>98.3%</strong></td>
+          <td>90.8% <em>(Transformer, 100× shorter features)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      Selected results from Gu, Goel &amp; Ré, S4 (2021). S4 was the first model in any class to score above
+      chance on Path-X. Follow-ups S4D (diagonal-only) and S5 (a multi-input variant computed with a parallel
+      scan instead of a convolution) simplified the machinery while keeping the performance.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="mamba">
+    <h2>7. Mamba: giving the memory a choice</h2>
+    <p>
+      S4 has a hidden weakness, and naming it points straight at the fix. Because $\Abar$, $\Bbar$, $C$, and
+      $\Delta$ are <em>fixed</em>, an S4 layer is <strong>linear time-invariant</strong>: it applies the same
+      convolution kernel to every input, treating the 5th token exactly like the 5,000th. That is wonderful
+      for audio, where the dynamics really are uniform — but it means the model <em>cannot make
+      content-dependent decisions</em>. It cannot look at a token and decide "this one matters, remember it"
+      or "this is filler, ignore it." Two toy tasks expose this cleanly: <em>selective copying</em> (copy only
+      the marked tokens, scattered at random positions) and <em>induction heads</em> (see "Harry … Potter"
+      once, then recall "Potter" after the next "Harry"). Both need the model to <em>select</em>. A fixed
+      kernel cannot.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/mamba_selection.png" alt="Mamba's selection mechanism: input-dependent parameters filter relevant from irrelevant tokens"/>
+      <figcaption>
+        The selection mechanism. The model must copy the colored tokens and ignore the white ones — but they
+        appear at random spacings, so no single fixed kernel can do it. Making the SSM parameters depend on the
+        input lets the model filter content as it goes. (Gu &amp; Dao, Mamba, 2023.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Mamba's move is almost embarrassingly direct: make the parameters <strong>functions of the input</strong>.
+      $B$, $C$, and the step size $\Delta$ stop being fixed weights and become projections of the current token
+      $x_t$ ($A$ stays fixed, only reshaped by the now-varying $\Delta$):
+    </p>
+    <p class="eq">$$ B_t = \mathrm{Linear}_N(x_t), \quad C_t = \mathrm{Linear}_N(x_t), \quad \Delta_t = \mathrm{softplus}\big(\text{param} + \mathrm{Linear}(x_t)\big). $$</p>
+    <p>
+      Now the recurrence $h_t = \Abar_t h_{t-1} + \Bbar_t x_t$ is <strong>time-varying</strong>: each token
+      sets its own dynamics. The step size $\Delta_t$ becomes a content-aware gate — a large $\Delta_t$ resets
+      the state and focuses on the current input ("this is important"), a small $\Delta_t$ lets the input slide
+      by untouched ("ignore this"). In fact, collapse the SSM to a single dimension and this <em>exactly</em>
+      reproduces the classic RNN gate, $h_t = (1-g_t)h_{t-1} + g_t x_t$ with $g_t = \sigma(\mathrm{Linear}(x_t))$ —
+      the same gating idea, now derived rather than guessed.
+    </p>
+    <p>
+      But there is a price, and it is the whole reason this wasn't done sooner. The instant the parameters vary
+      with the input, the model is no longer time-invariant — so the convolution view <em>dies</em>. There is no
+      single fixed kernel anymore; you are back to a sequential recurrence, seemingly giving up the parallel
+      training that made S4 fast. Mamba pays the price with a <strong>hardware-aware selective scan</strong>: a
+      parallel-scan algorithm (a recurrence can still be parallelized associatively, even when time-varying),
+      fused into a single GPU kernel that keeps the expanded state in fast SRAM and never writes it to slow HBM,
+      with recomputation in the backward pass. The result is <strong>linear time</strong> in sequence length with
+      a small constant — 20–40× faster than a naive implementation, and faster than FlashAttention beyond ~2k tokens.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/mamba_copying.png" alt="Selective copying task results"/>
+      <img src="assets/figures/mamba_induction.png" alt="Induction heads length extrapolation"/>
+      <figcaption>
+        Selection in action. Left: on selective copying, the time-invariant S4 layer manages 18.3% while the
+        selective layer hits 99.8%. Right: trained on induction sequences of length 256, Mamba stays at
+        <strong>100%</strong> accuracy out to a <em>million</em> tokens — a 4000× extrapolation — where attention
+        runs out of memory and other SSMs decay to noise. (Gu &amp; Dao, Mamba, 2023.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Wrap this selective SSM into a simple block (folding in the gated-MLP structure so you can homogeneously
+      stack it, no attention anywhere) and you get <strong>Mamba</strong>. Try the selection mechanism for
+      yourself below: stream a sequence past a layer and toggle between a fixed (time-invariant) kernel and a
+      selective gate, and watch which one can actually copy the marked tokens.
+    </p>
+
+    <div class="widget-frame" id="selective-scan">
+      <p class="widget-title">Selective scan</p>
+      <p class="widget-sub">A selective-copying stream. The fixed kernel applies the same rule everywhere and smears; the input-dependent gate keeps the marked tokens and drops the filler. This is what "selection" buys.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>8. Results: a Transformer rival in linear time</h2>
+    <p>
+      Selection did not just fix toy tasks — it made SSMs competitive with Transformers on real language, while
+      keeping their linear-time, constant-memory inference. Mamba was the first attention-free model to match the
+      strong "Transformer++" recipe (RoPE + SwiGLU + RMSNorm) on the Pile, and it punches well above its weight
+      class on downstream tasks.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Setting</th><th>Metric</th><th>Mamba</th><th>Comparison</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="2" class="cat">Language (zero-shot avg)</td>
+          <td>Mamba-2.8B (↑)</td>
+          <td class="win"><strong>63.3%</strong></td>
+          <td>59.1% <em>(Pythia-2.8B)</em></td>
+        </tr>
+        <tr>
+          <td>vs. 2.5× larger (↑)</td>
+          <td class="win"><strong>63.3%</strong></td>
+          <td>61.7% <em>(Pythia-6.9B)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Selective copying</td>
+          <td>accuracy (↑)</td>
+          <td class="win"><strong>99.8%</strong></td>
+          <td>18.3% <em>(S4, time-invariant)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Induction heads</td>
+          <td>extrapolation (↑)</td>
+          <td class="win"><strong>256 → 1M tokens</strong></td>
+          <td>attention: OOM past 16k</td>
+        </tr>
+        <tr>
+          <td class="cat">Inference</td>
+          <td>throughput (↑)</td>
+          <td class="win"><strong>5× Transformer</strong></td>
+          <td>+ no KV cache (constant memory)</td>
+        </tr>
+        <tr>
+          <td class="cat">Speech gen (SC09)</td>
+          <td>FID (↓)</td>
+          <td class="win"><strong>0.94</strong></td>
+          <td>1.99 <em>(SaShiMi, prior SOTA)</em></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Selected results from Gu &amp; Dao, Mamba (2023). Mamba also sets the pace on DNA and audio, and — unlike time-invariant models — keeps improving as the context grows to a million tokens.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/mamba_inference.png" alt="Mamba inference throughput vs Transformer"/>
+      <figcaption>
+        The inference payoff. With no attention and no KV cache, Mamba generates at multiples of a same-size
+        Transformer's throughput, at constant memory per step — the recurrent face of the model paying off exactly
+        as the duality promised. (Gu &amp; Dao, Mamba, 2023.)
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>9. Why it works</h2>
+    <p>
+      Step back and the arc is a single idea, reinterpreted three times. The progress was not a pile of unrelated
+      tricks — each step removed one specific weakness of the previous one.
+    </p>
+
+    <h3>HiPPO fixed the memory</h3>
+    <p>
+      A linear recurrence is only as good as its $A$ matrix, and a random one forgets. HiPPO derived the $A$ that
+      makes the state a provably optimal compression of the entire past, with polynomially-decaying gradients and
+      no timescale to tune. That is what turned "a linear RNN" from a toy into a long-range memory.
+    </p>
+
+    <h3>The duality made it fast</h3>
+    <p>
+      Linearity and time-invariance let the very same model be a parallel convolution for training and a
+      constant-memory recurrence for inference. You stop paying the Transformer's quadratic attention cost and its
+      ever-growing KV cache, and you stop paying the RNN's sequential training cost. S4's structured-matrix algebra
+      is what made the convolution view cheap enough to use.
+    </p>
+
+    <h3>Selection added the intelligence</h3>
+    <p>
+      Time-invariance is exactly what makes content-based reasoning impossible. Letting $\Delta$, $B$, $C$ depend on
+      the input restores it — the model can now choose what to store and what to skip — and the hardware-aware scan
+      keeps it linear-time even though the convolution shortcut is gone. The state stopped being a passive summary and
+      became an <em>active, selective</em> memory.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>10. What it means</h2>
+    <p>
+      The same five letters, $\dot x = Ax + Bu$, carried us from a swinging mass to a frontier language model. What
+      changed each time was how we <em>read the state</em>: first as a physical condition (position and velocity),
+      then as an optimal compressed memory of a sequence's past (HiPPO/S4), and finally as a memory that
+      <em>chooses</em> what to keep (Mamba). That reinterpretation — not a new equation, but a new meaning for an old
+      one — is the whole story.
+    </p>
+    <p>
+      It also reframes the Transformer. Attention keeps <em>every</em> token and pays $O(L^2)$ to compare them all;
+      an SSM keeps a <em>fixed-size state</em> and pays $O(L)$. The bet behind Mamba is that a state which is smart
+      about <em>what</em> it remembers can rival a model that remembers everything — and on long contexts, where
+      quadratic attention buckles, win outright.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Copying and exact recall.</strong> A fixed-size state is a compression; tasks needing verbatim
+        recall of arbitrary spans still favor attention. Hybrid Mamba-attention models are the pragmatic answer.</li>
+      <li><strong>The duality, recovered.</strong> Mamba-2 and the "state space duality" reconnect selective SSMs to a
+        form of linear attention — suggesting SSMs and Transformers are two ends of one design space, not rivals.</li>
+      <li><strong>Where the state shines.</strong> Genomics, audio, video, time series — wherever sequences run to
+        hundreds of thousands of steps, the linear-time state model is structurally advantaged.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      State space models are what happens when you take the oldest idea in dynamical systems — compress the past into a
+      state — and refuse to let go of it through six decades and a deep-learning revolution. Learn the system, give it a
+      principled memory, exploit the recurrence-convolution duality, and finally let the memory choose. The pendulum and
+      the language model were never different problems. They were always the same equation, waiting to be read the right way.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Papers: <a href="https://arxiv.org/abs/2008.07669" target="_blank" rel="noopener">HiPPO (2008.07669)</a> ·
+      <a href="https://arxiv.org/abs/2111.00396" target="_blank" rel="noopener">S4 (2111.00396)</a> ·
+      <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">Mamba (2312.00752)</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

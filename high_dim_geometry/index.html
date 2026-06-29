@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The strange geometry of high dimensions — an interactive tour</title>
+  <meta name="description" content="An interactive tour of nine ways high-dimensional geometry breaks our low-dim intuition: shells, spikes, orthogonality, concentration, and the silver lining of Johnson–Lindenstrauss."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\R': '{\\mathbb{R}}',
+        '\\E': '{\\mathbb{E}}',
+        '\\P': '{\\mathbb{P}}',
+        '\\Var':'{\\mathrm{Var}}',
+        '\\Vol':'{\\mathrm{Vol}}',
+        '\\Norm':'{\\|#1\\|}',
+        '\\indep':'{\\perp\\!\\!\\!\\perp}',
+        '\\Bn':'{B_{n}}',
+        '\\Sn':'{\\mathbb{S}^{n-1}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive tour</p>
+    <h1>The strange geometry of high dimensions</h1>
+    <p class="byline">
+      Built for ML practitioners who want intuition for what their tensors are actually doing &middot;
+      Math is gentle, but rigorous &middot; All widgets run live in your browser
+    </p>
+    <p class="lede">
+      Almost everything you know about geometry comes from living in three dimensions. In three dimensions, a ball is a fat lump. The volume sits near the center. Two random arrows usually point somewhere not perpendicular. The nearest neighbor of a point is meaningfully nearer than the farthest. <strong>None of this is true in a thousand dimensions.</strong> A high-dimensional Gaussian is a thin shell, not a blob. A cube has long spiky corners that contain almost all of its volume. Distances collapse onto a single number. Random directions are practically orthogonal. This tour walks through nine of these phenomena, derives each from the same underlying principle — <em>concentration of measure</em> — and gives you a live widget to feel each one bite as dimension grows. Each section ends with an <span style="color: var(--accent-blue, #5fa9ff); font-weight: 600;">ML callout</span> connecting the geometry to a specific deep-learning practice: weight initialization, diffusion noise schedules, contrastive learning, LoRA, superposition, sparse autoencoders, FAISS — all the way down.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">Why high-dim intuition fails</a></li>
+      <li><a href="#concentration">The master tool: concentration of measure</a></li>
+      <li><a href="#vanishing-ball">1. The unit ball vanishes</a></li>
+      <li><a href="#gaussian-shell">2. Gaussians live on a thin shell</a></li>
+      <li><a href="#orange-peel">3. Orange peel: all the volume is on the skin</a></li>
+      <li><a href="#spiky-cube">4. The cube is mostly spikes</a></li>
+      <li><a href="#orthogonality">5. Random vectors are nearly orthogonal</a></li>
+      <li><a href="#distance-collapse">6. Distances collapse onto one number</a></li>
+      <li><a href="#equator">7. The equator captures everything</a></li>
+      <li><a href="#l1-sparsity">8. L1 sparsity is a geometric fact</a></li>
+      <li><a href="#jl">9. Johnson–Lindenstrauss: the silver lining</a></li>
+      <li><a href="#cheatsheet">When to invoke each rule</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>If you train neural networks you spend all day with vectors in $\R^{768}$ or $\R^{4096}$ or higher. You picture them as arrows. You picture the loss landscape as a surface. You picture batches as clouds. <em>None of these mental pictures are correct.</em> Almost every visual analogy we use was forged in dimension two or three, and almost every one of them breaks somewhere between dimension ten and dimension a hundred.</p>
+
+    <p>This is not a small problem. A surprising amount of what we believe about high-dimensional data — that nearest neighbors are informative, that random initializations live in a typical place, that "small" Gaussian noise stays small — depends on geometry that simply isn't there. The good news: the geometry that <em>is</em> there is also extremely regular, in ways that are stranger but more useful than the low-dimensional picture. Once you know what to expect, high-dim space stops being mysterious and starts being a place with rules.</p>
+
+    <p>Below: the rules, the derivations, and a widget for each. By the end you'll have a working high-dim sense and a small library of mental images for what's really happening inside your tensors.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="concentration">
+    <h2>0. The master tool: concentration of measure</h2>
+    <p>One principle generates almost every phenomenon in this tour: a smooth function of many independent random variables is, with overwhelming probability, very close to its mean. This is <em>concentration of measure</em>, and the easiest way to see it is to play with the squared norm of a standard Gaussian.</p>
+
+    <p>Let $X = (X_1, \ldots, X_d)$ with $X_i \stackrel{\text{iid}}{\sim} \mathcal{N}(0,1)$. Then</p>
+    <p class="eq">$$ \|X\|^2 = \sum_{i=1}^d X_i^2, \qquad \E[X_i^2] = 1, \quad \Var(X_i^2) = 2. $$</p>
+    <p>So $\E[\|X\|^2] = d$ and $\Var(\|X\|^2) = 2d$. The standard deviation is $\sqrt{2d}$, but the mean is $d$. The <em>relative</em> fluctuation is $\sqrt{2d}/d = \sqrt{2/d} \to 0$. <strong>The squared norm hugs its mean tighter and tighter as $d$ grows.</strong> Taking a square root with the delta method,</p>
+    <p class="eq">$$ \|X\| \approx \sqrt{d} \cdot \sqrt{1 + O(1/\sqrt{d})} \approx \sqrt{d} + O(1/\sqrt{d}\,). $$</p>
+
+    <p>That's the whole story in microcosm. A quantity that <em>could</em> vary across the entire positive real line ends up wedged into a window of width $1/\sqrt{d}$ around $\sqrt{d}$. Worse: this isn't just for norms. Any 1-Lipschitz function $f$ of a standard Gaussian $X$ in $\R^d$ satisfies</p>
+    <p class="eq">$$ \P\big( |f(X) - \E[f(X)]| > t \big) \le 2 \exp(-t^2 / 2). $$</p>
+    <p>The bound doesn't depend on $d$ at all. The geometry of the Gaussian doesn't get more variable as dimension grows — it gets <em>more</em> rigid. Every well-behaved function of it loses essentially all its randomness.</p>
+
+    <aside class="callout">
+      <strong>Why this matters.</strong> Every phenomenon in this tour is an application of one rule: when you average over many independent dimensions, fluctuations cancel, and quantities pin to their means. The "weirdness" of high dimensions is mostly a consequence of <em>how rigid</em> things become, not how variable.
+    </aside>
+
+    <aside class="callout ml">
+      <strong>ML connection: weight initialization.</strong> Kaiming/Xavier init samples weights as $\mathcal{N}(0, 2/\text{fan\_in})$. Why the $1/\sqrt{n}$ scaling? Because each pre-activation $\sum_j w_j x_j$ is a sum over $n=\text{fan\_in}$ dimensions, and by exactly the concentration argument above, its variance is $n \cdot \text{Var}(w) \cdot \text{Var}(x)$. Without the $1/n$ scaling, the norm of activations would blow up by $\sqrt{n}$ at every layer. Init schemes are <em>concentration-of-measure compensators</em>.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="vanishing-ball">
+    <h2>1. The unit ball vanishes</h2>
+    <p>The first surprise is that the unit ball — the set $\{x \in \R^n : \|x\| \le 1\}$ — has volume going to zero as $n \to \infty$. Yes, zero. The unit ball in $\R^{100}$ takes up less space than a fingernail clipping.</p>
+
+    <p>The formula:</p>
+    <p class="eq">$$ V_n = \Vol(\Bn) = \frac{\pi^{n/2}}{\Gamma(\tfrac{n}{2} + 1)}. $$</p>
+    <p>Let's plug in some values. $V_1 = 2$ (interval of length 2). $V_2 = \pi \approx 3.14$ (disk area). $V_3 = \tfrac{4}{3}\pi \approx 4.19$. $V_4 \approx 4.93$. $V_5 \approx 5.26$. Then it starts dropping: $V_6 \approx 5.17$, $V_{10} \approx 2.55$, $V_{20} \approx 0.026$, $V_{50} \approx 1.7 \times 10^{-13}$. By $n = 100$, the unit ball's volume is on the order of $10^{-40}$. By $n = 1000$, it's so small that no scientific notation we'd write down captures it.</p>
+
+    <p>Why? Stirling's approximation: $\Gamma(n/2 + 1) \sim \sqrt{\pi n}\, (n/(2e))^{n/2}$. So</p>
+    <p class="eq">$$ V_n \sim \frac{1}{\sqrt{\pi n}} \left( \frac{2\pi e}{n} \right)^{n/2}. $$</p>
+    <p>For large $n$, the base $2\pi e / n$ drops below 1, and then $V_n$ decays super-exponentially in $n$. Roughly: every time you add a dimension, the unit ball's volume gets multiplied by a factor that eventually becomes much less than one. The ball can't keep up.</p>
+
+    <p>This is the first lesson: <strong>volumes of "natural" shapes in high dimensions are nothing like volumes in low dimensions.</strong> A "small region" of $\R^{100}$ might be the unit ball; a "huge region" might be its complement. Volume comparisons in high-d almost always favor the bigger-looking shape by absurd margins.</p>
+
+    <div class="widget-frame" id="vol-of-ball">
+      <p class="widget-title">The volume of the unit ball, dimension by dimension</p>
+      <p class="widget-sub">Drag $n$ to see $V_n$ rise, peak around $n=5$, then crash. The y-axis is log; the bar plot lets you compare across many orders of magnitude. Notice that the unit ball "looks small" at $n=2$ ($V_2 = \pi$) but actually contains more volume than at $n=100$ by a factor of $10^{40}$.</p>
+    </div>
+
+    <aside class="callout ml">
+      <strong>ML connection: "the model is somewhere in this ball."</strong> Phrases like "the optimizer searched a small region of parameter space" or "we constrained the perturbation to $\|\delta\|_2 \le \varepsilon$" are easy to picture as a fat ball. They aren't. The ball of weight perturbations of radius $\varepsilon$ in $\R^{10^9}$ contains essentially no volume by absolute measure — but it does contain a huge surface of distinct directions. The thing constraining your search is not the <em>volume</em> of the ball; it's the <em>sphere of directions</em> it picks out.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="gaussian-shell">
+    <h2>2. Gaussians live on a thin shell</h2>
+    <p>Here is one that broke me when I first saw it. Sample $X \sim \mathcal{N}(0, I_d)$. Your 3-D intuition says: "the density peaks at the origin, so most samples are near zero." This is true in 1D. It is even mostly true in 2D and 3D. <em>It is catastrophically wrong in 100D.</em></p>
+
+    <p>From the concentration result above, $\|X\| \approx \sqrt{d}$ with fluctuation $O(1)$. For $d = 100$, that's a sample whose norm is essentially $10 \pm 1$. The probability of getting a sample within distance, say, 1 of the origin? Vanishingly small. <strong>The mode is at the origin but no sample is anywhere near it.</strong></p>
+
+    <p>What's actually going on: the density at radius $r$ is the Gaussian PDF $\propto e^{-r^2/2}$ multiplied by the <em>surface area</em> of the sphere of radius $r$ in $\R^d$, which scales as $r^{d-1}$. So the radial density is</p>
+    <p class="eq">$$ p(r) \propto r^{d-1} e^{-r^2/2}. $$</p>
+    <p>For small $d$ the first factor barely matters and the density is concentrated near zero. For $d = 100$ the $r^{99}$ factor pulls the density out enormously; the maximum of $r^{d-1} e^{-r^2/2}$ is at $r = \sqrt{d-1} \approx \sqrt{d}$, and the distribution becomes sharply peaked there with width $\sim 1$.</p>
+
+    <p>This has direct ML consequences. When someone says "perturb the weights with a small Gaussian noise of variance $\sigma^2$," the actual size of the perturbation is $\sigma \sqrt{d}$, not $\sigma$. Adversarial robustness studies and the design of noise schedules in diffusion models both turn on this fact. The "small" noise you imagined is, in a 1000-dimensional weight space, about 30× larger than you imagined.</p>
+
+    <section class="embed-video">
+      <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+        <source src="assets/videos/concentration.mp4" type="video/mp4"/>
+      </video>
+      <p class="video-caption">The 2-D shadow of a $d$-dimensional Gaussian looks like a perfectly ordinary 2-D Gaussian (it <em>is</em> a 2-D Gaussian — the marginals are always $\mathcal{N}(0, I_2)$). But the <em>full</em> $d$-dimensional norm sharply concentrates at $\sqrt{d}$. The histogram crystallizes from a wide blob into a thin spike as $d$ goes from 2 to 100.</p>
+    </section>
+
+    <div class="widget-frame" id="gaussian-norm">
+      <p class="widget-title">Sample a Gaussian, plot its norm</p>
+      <p class="widget-sub">Drag $d$ to sample 5000 fresh vectors $X \sim \mathcal{N}(0, I_d)$ and histogram $\|X\|$. The dashed line marks $\sqrt{d}$. As $d$ grows, the histogram glues itself to that line.</p>
+    </div>
+
+    <aside class="callout ml">
+      <strong>ML connections — this one is everywhere.</strong>
+      <ul style="margin: 8px 0 0; padding-left: 20px;">
+        <li><strong>Diffusion models.</strong> The forward process adds $\mathcal{N}(0, \sigma^2 I)$ noise — but the actual perturbation has norm $\sigma\sqrt{d}$. For ImageNet-64 (d ≈ 12,288), a "small" $\sigma=0.1$ pixel-space noise has magnitude $\sim 11$. This is why EDM (covered in another blog here) parameterizes by $\sigma$ on a scale up to 80, not 1.</li>
+        <li><strong>Adversarial robustness.</strong> A pixel-space attack constrained to $\|\delta\|_2 \le \varepsilon$ has every pixel moving by only $\sim \varepsilon/\sqrt{d}$ — invisible per-pixel, but operationally large. The $\ell_\infty$ threat model exists precisely because of this discrepancy.</li>
+        <li><strong>Dropout.</strong> Zeroing a fraction $p$ of activations rescales the norm by $\sqrt{1-p}$, not $1-p$. This is why dropout layers multiply outputs by $1/(1-p)$ at train time — to preserve the activation <em>shell radius</em>, not its componentwise scale.</li>
+        <li><strong>Latent noise scheduling.</strong> When you sample $z \sim \mathcal{N}(0, I)$ in a VAE or GAN's latent space, you are always sampling from the shell, never the interior. "Interpolating through latent space" is geodesic on a sphere, not linear in a ball.</li>
+      </ul>
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="orange-peel">
+    <h2>3. Orange peel: all the volume is on the skin</h2>
+    <p>The previous section was about Gaussians; this one is about uniform measure on the ball. Take the unit ball $\Bn$ and look at the shell $\{x : 1 - \varepsilon \le \|x\| \le 1\}$ — the outer rind of thickness $\varepsilon$. What fraction of the ball's volume is in that rind?</p>
+
+    <p>This is one of the easiest calculations in the tour. The smaller ball $\{x : \|x\| \le 1 - \varepsilon\}$ has volume $(1 - \varepsilon)^n V_n$ (everything scales). So the fraction outside it is</p>
+    <p class="eq">$$ \frac{\Vol(\text{shell})}{\Vol(\Bn)} = 1 - (1 - \varepsilon)^n. $$</p>
+
+    <p>For $n = 100$ and $\varepsilon = 0.01$ — the outer 1% of the radius — the fraction is $1 - 0.99^{100} \approx 0.634$. <strong>63% of the unit ball's volume in 100 dimensions lives in its outermost 1%-thick rind.</strong> For $n = 1000$ and $\varepsilon = 0.01$, the fraction is $1 - 0.99^{1000} \approx 0.99996$. Essentially the entire ball is its own peel.</p>
+
+    <p>The mental picture you want is not "ball" but "thin spherical shell." If you sample uniformly from the unit ball in high dimensions, you're effectively sampling from its boundary. This is why most analyses in high-d probability work with $\mathbb{S}^{n-1}$ instead of $\Bn$: in high dimensions, they're nearly the same set.</p>
+
+    <p>It also dovetails with the Gaussian shell. Recall that a Gaussian concentrates on radius $\sqrt{d}$. The reason is essentially the same: in high dimensions, the bulk of any "smooth blob" is at its surface, because the surface is enormous and the interior, by volume, is tiny.</p>
+
+    <div class="widget-frame" id="orange-peel">
+      <p class="widget-title">How thick is the peel?</p>
+      <p class="widget-sub">Drag $n$ (dimension) and $\varepsilon$ (peel thickness as a fraction of the radius) to see what fraction of the ball lives in the outer shell. The visualization shows a 2-D cross-section with the shell highlighted; the number on the right is the true high-dim fraction.</p>
+    </div>
+
+    <aside class="callout ml">
+      <strong>ML connection: why we L2-normalize embeddings.</strong> Modern retrieval and contrastive learning systems (CLIP, SimCLR, DINO, sentence-BERT) project embeddings to the unit sphere before computing similarity. This isn't an arbitrary convention — it acknowledges that <em>the magnitude carries almost no signal</em>. In a 768-d embedding space, every embedding is approximately at the same shell radius anyway; the geometry that matters lives entirely in directions. Normalizing turns this implicit fact into an explicit constraint, and lets you use cosine similarity (an inner product on the sphere) instead of distance.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="spiky-cube">
+    <h2>4. The cube is mostly spikes</h2>
+    <p>Take the cube $[-1, 1]^n$. It has $2^n$ corners, each at distance $\sqrt{n}$ from the center. The inscribed unit ball touches all $2n$ faces at distance 1. So the corners are $\sqrt{n}$ times farther out than the faces. As $n$ grows, the cube becomes a fat ball-like core with $2^n$ long sharp spikes — and the spikes contain essentially all the volume.</p>
+
+    <p>The volume ratio of the inscribed ball to the cube:</p>
+    <p class="eq">$$ \frac{\Vol(\Bn)}{\Vol([-1,1]^n)} = \frac{\pi^{n/2}}{\Gamma(\tfrac{n}{2}+1) \cdot 2^n}. $$</p>
+    <p>For $n=2$ this is $\pi/4 \approx 0.785$ — the disk takes up most of the square. For $n=3$, $\pi/6 \approx 0.524$ — half the cube is sphere. For $n = 10$ the ratio is already 0.0025. By $n = 20$ the inscribed ball is $2 \times 10^{-8}$ of the cube. The cube in 20 dimensions is, by volume, essentially "corners and edges."</p>
+
+    <p>This matters for box-shaped sampling. If you pick uniform random points from $[-1, 1]^{100}$ and ask "what fraction land inside the inscribed unit ball?" — the answer is on the order of $10^{-70}$. The "ball part" of a high-dim cube is invisible. If you generate latent vectors by sampling each coordinate uniformly in $[-1, 1]$, you're sampling almost entirely from spikes, not from anything resembling a sphere.</p>
+
+    <aside class="callout">
+      <strong>The cosmic ray analogy.</strong> Imagine a cube the size of the visible universe. Its inscribed ball would be the size of an atom. Now imagine that in 100 dimensions. The asymmetry is much, much more extreme. The corners aren't a small correction — the corners <em>are</em> the cube.
+    </aside>
+
+    <div class="widget-frame" id="spiky-cube">
+      <p class="widget-title">Inscribed ball as a fraction of cube</p>
+      <p class="widget-sub">Two views: a 2-D illustration of cube vs. inscribed disk (left), and the volume ratio $V(\Bn)/V([-1,1]^n)$ on a log axis as $n$ grows (right). The ratio crashes to numerical zero by about $n = 50$.</p>
+    </div>
+
+    <aside class="callout ml">
+      <strong>ML connection: image space is a spiky cube.</strong> Pixel values live in $[0, 255]^{H \times W \times 3}$ — a cube in $\R^{d}$ with $d \approx 200{,}000$ for a 256×256 RGB image. Any uniform random sample of pixels is a corner of that cube — a wash of high-contrast noise, never a "natural image." Natural images occupy a vanishingly thin manifold sitting near the <em>diagonal</em> of the cube. This is why generative modeling is hard: you're searching for a $10^{-\text{many}}$ fraction of pixel space that humans recognize. It's also why <em>uniform pixel noise</em> doesn't look like Gaussian noise — uniform noise is corners, Gaussian noise is a shell.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="orthogonality">
+    <h2>5. Random vectors are nearly orthogonal</h2>
+    <p>Take two vectors $u, v$ uniformly at random on the unit sphere $\Sn$. What's the angle between them?</p>
+
+    <p>In two dimensions, $u$ and $v$ are independent uniform angles, so the angle between them is uniform on $[0, \pi]$ and the cosine has a wide distribution. In three dimensions, the angle distribution is $\sin\theta/2$, peaked at $\pi/2$ but still broad. In 100 dimensions, <em>essentially every pair of vectors is at 90°.</em></p>
+
+    <p>The clean way to see it: by symmetry, you may fix $v = e_1$, so $\cos\theta = u_1$, the first coordinate of $u$. The first coordinate of a uniformly random unit vector in $\R^n$ has density</p>
+    <p class="eq">$$ p(u_1) = \frac{1}{B(\tfrac{1}{2}, \tfrac{n-1}{2})} (1 - u_1^2)^{(n-3)/2}, \quad u_1 \in [-1, 1], $$</p>
+    <p>which for large $n$ is essentially a Gaussian $\mathcal{N}(0, 1/n)$. So</p>
+    <p class="eq">$$ \E[\cos\theta] = 0, \qquad \Var(\cos\theta) = \frac{1}{n}, \qquad \cos\theta \approx \mathcal{N}\!\left(0, \tfrac{1}{n}\right). $$</p>
+    <p>The typical angle is $\pi/2 \pm O(1/\sqrt{n})$. <strong>In a thousand dimensions, two random unit vectors are within about 2° of being perpendicular, with probability 99.7%.</strong></p>
+
+    <p>This is why random Gaussian projections are great features: a random direction is almost orthogonal to whatever signal you already have, so you keep collecting new information instead of recapitulating old. It's also why pairs of randomly initialized neurons start out essentially uncorrelated — and why you can pack exponentially many "nearly orthogonal" directions into $\R^n$ (a fact that underlies the Johnson–Lindenstrauss lemma and the bilinear capacity of attention heads).</p>
+
+    <div class="widget-frame" id="orthogonality">
+      <p class="widget-title">Histogram of angles between random unit vectors</p>
+      <p class="widget-sub">Drag $n$ to sample 4000 fresh pairs of unit vectors in $\R^n$ and histogram their angles. The marker shows the typical width: $\pi/2 \pm 1/\sqrt{n}$ rad. By $n = 100$, the histogram is a thin spike at 90°.</p>
+    </div>
+
+    <aside class="callout ml">
+      <strong>ML connection: superposition, LoRA, and the capacity of attention.</strong> Near-orthogonality is generous — it means you can pack <em>exponentially many</em> "almost-orthogonal" directions into $\R^n$. Specifically, for any $\varepsilon > 0$, there are $2^{c \varepsilon^2 n}$ unit vectors with pairwise cosine $\le \varepsilon$ (Johnson–Lindenstrauss flavor). This single fact underlies:
+      <ul style="margin: 8px 0 0; padding-left: 20px;">
+        <li><strong>Superposition.</strong> The interpretability finding (Anthropic, 2022) that LLMs represent <em>more features than neurons</em>, packed as near-orthogonal directions in the residual stream. The geometry literally allows it; the model exploits it.</li>
+        <li><strong>LoRA.</strong> Low-rank perturbations $\Delta W = AB^\top$ work because a random rank-$r$ subspace is "almost orthogonal" to whatever the pretrained weights already span — so you can learn a new behavior without overwriting old ones.</li>
+        <li><strong>Multi-head attention.</strong> Each head projects to a $d/h$-dim subspace via a random-at-init matrix. The heads start nearly orthogonal and can specialize independently, with negligible interference at init.</li>
+        <li><strong>Random features (Rahimi–Recht).</strong> Why random Gaussian projections approximate a kernel: each random direction picks up "fresh" information because it's orthogonal to all previous ones.</li>
+      </ul>
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="distance-collapse">
+    <h2>6. Distances collapse onto one number</h2>
+    <p>This is the famous "curse of dimensionality" for nearest-neighbor methods. Sample points uniformly from $[0, 1]^n$. What does the distribution of pairwise distances look like?</p>
+
+    <p>For two such points $X, Y \in [0, 1]^n$ with independent uniform coordinates,</p>
+    <p class="eq">$$ \|X - Y\|^2 = \sum_{i=1}^n (X_i - Y_i)^2. $$</p>
+    <p>Each $(X_i - Y_i)^2$ has $\E = 1/6$ and $\Var = 7/180$. By the law of large numbers, $\|X-Y\|^2 / n \to 1/6$, so $\|X-Y\| \approx \sqrt{n/6}$, with relative fluctuation $\sim 1/\sqrt{n}$ around it.</p>
+
+    <p>Now consider $N$ points sampled uniformly. The maximum and minimum pairwise distances both concentrate at $\sqrt{n/6}$:</p>
+    <p class="eq">$$ \frac{\max_{i \ne j} \|X_i - X_j\| - \min_{i \ne j} \|X_i - X_j\|}{\min_{i \ne j} \|X_i - X_j\|} \xrightarrow{n \to \infty} 0. $$</p>
+    <p><strong>The nearest neighbor and the farthest neighbor are essentially the same distance away.</strong> In high dimensions, "nearest neighbor" is no longer a meaningful concept under uniform-on-the-cube data. Cosine similarity preserves more signal because it normalizes out the trivial concentration of magnitudes.</p>
+
+    <p>This is the geometric source of a thousand ML pathologies. Naive kNN classification fails in raw pixel space because every image is roughly equidistant from every other image. Anomaly detection by Euclidean distance fails for the same reason. The fix is always the same: learn or impose a representation in which the data lies on a low-dimensional manifold where distances are <em>not</em> concentrated.</p>
+
+    <div class="widget-frame" id="distance-concentration">
+      <p class="widget-title">All pairwise distances collapse to a single value</p>
+      <p class="widget-sub">Sample 200 points uniformly from $[0,1]^n$. The histogram shows all $\binom{200}{2}$ pairwise distances; the ratio max/min is plotted on the right. Drag $n$ to watch the histogram tighten and the ratio shrink toward 1.</p>
+    </div>
+
+    <aside class="callout ml">
+      <strong>ML connection: why cosine, why temperature, why representation learning.</strong>
+      <ul style="margin: 8px 0 0; padding-left: 20px;">
+        <li><strong>Cosine similarity beats Euclidean.</strong> Distances concentrate, but <em>angles</em> on the unit sphere don't have to — they depend on the actual structure of the data, not the norm. Every modern embedding system (CLIP, sentence-BERT, OpenAI's `text-embedding-3`) computes cosine, not L2.</li>
+        <li><strong>Contrastive learning's temperature.</strong> SimCLR/InfoNCE divides logits by a temperature $\tau$. The reason is exactly distance concentration on the sphere: all negatives sit at roughly the same cosine, so without sharpening (small $\tau$), the softmax sees a near-uniform distribution and gradients vanish.</li>
+        <li><strong>Manifold hypothesis.</strong> Raw data ($\R^{200k}$ pixels, $\R^{8k}$ token IDs) lives in catastrophically high dimensions where distances are useless. Representation learning's job is to find a low-dim manifold where geometry <em>works again</em> — where distance once more correlates with semantic similarity.</li>
+        <li><strong>kNN classifiers in feature space.</strong> kNN on ResNet-50 features works <em>beautifully</em>; kNN on raw pixels is a coin flip. The features live in a curated 2048-d space where the manifold is unwrinkled enough that distance concentration is broken in a useful way.</li>
+      </ul>
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="equator">
+    <h2>7. The equator captures everything</h2>
+    <p>Take the unit sphere $\Sn \subset \R^n$. Pick any equator — say, the set $\{x \in \Sn : x_1 = 0\}$. Look at the slab around this equator, $\{x \in \Sn : |x_1| \le \varepsilon\}$. How much of the sphere's surface area is in that slab?</p>
+
+    <p>Almost all of it. From the cosine analysis above, $x_1$ for a uniform random $x \in \Sn$ is approximately $\mathcal{N}(0, 1/n)$. So</p>
+    <p class="eq">$$ \P(|x_1| \le \varepsilon) \approx \P(|Z| \le \varepsilon \sqrt{n}\,) \quad \text{where } Z \sim \mathcal{N}(0, 1). $$</p>
+    <p>For $n = 100$ and $\varepsilon = 0.2$, this is $\P(|Z| \le 2) \approx 95\%$. The entire 95% of the sphere is within $x_1 \in [-0.2, 0.2]$. The "poles" of the sphere ($x_1$ near 1 or $-1$) contain a tiny fraction of the area.</p>
+
+    <p>The striking part: there is nothing special about $x_1$. We could have chosen the equator orthogonal to <em>any</em> direction $v$, and concentration would tell us the same thing — 95% of the sphere is within a thin slab around the equator orthogonal to $v$. Choose 100 different directions; <em>each one</em> captures 95% of the sphere in its equator. (No, this is not a contradiction: those slabs all heavily overlap.)</p>
+
+    <p>This is Paul Lévy's spherical concentration inequality, and it generalizes to any 1-Lipschitz function: the median value is taken on a set of measure essentially 1, and the function barely deviates from its median over almost the entire sphere. It's the geometric heart of why high-dimensional optimization works at all — the loss landscape, viewed at the right scale, is much more rigid than you'd expect.</p>
+
+    <aside class="callout">
+      <strong>The paradox of poles.</strong> If you visualize $\Sn$ as a beach ball, the "poles" at $\pm e_1$ feel like obvious destinations. In high dimensions, the poles are essentially empty: they contain a $2^{-O(n)}$ fraction of the sphere. The action is at the equator, but it's the equator with respect to <em>every</em> direction simultaneously.
+    </aside>
+
+    <aside class="callout ml">
+      <strong>ML connection: gradients, adversarial directions, and "flat" minima.</strong> A random direction at any point in weight space is nearly orthogonal to the gradient — by Lévy concentration. This is why <em>random</em> perturbations of a trained model rarely hurt it (you're moving along the equator orthogonal to the loss gradient), but <em>adversarial</em> perturbations along the gradient itself crater performance with the same magnitude. Loss-landscape papers talk about "flat minima" in the same language: most directions at a minimum are flat (equatorial) and the sharp directions (poles) are rare and structured.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="l1-sparsity">
+    <h2>8. L1 sparsity is a geometric fact</h2>
+    <p>Take the unit balls in different $\ell_p$ norms:</p>
+    <ul>
+      <li>$\ell_2$ ball: the round sphere. Symmetric in every direction.</li>
+      <li>$\ell_\infty$ ball: the cube $[-1,1]^n$. The spiky one from §4.</li>
+      <li>$\ell_1$ ball: the cross-polytope, with $2n$ corners at $\pm e_i$. Spikier than the cube, but pointed at the <em>axes</em>.</li>
+    </ul>
+
+    <p>This last point is the geometric content of "$\ell_1$ promotes sparsity." When you solve LASSO,</p>
+    <p class="eq">$$ \min_w \; \|y - Xw\|_2^2 \; + \; \lambda \|w\|_1, $$</p>
+    <p>you are intersecting an elliptical contour of the squared loss (from the data term) with a contour of the $\ell_1$ ball (the regularizer). In two dimensions, the $\ell_1$ ball is a diamond with corners on the axes. The first time an expanding contour of the loss touches the diamond, it almost always touches at a <em>corner</em> — and a corner is a sparse vector.</p>
+
+    <p>This goes wild in high dimensions. The $\ell_1$ ball in $\R^n$ has $2n$ corners (one per signed axis), but its "edges" connect every pair of corners — a fully connected combinatorial skeleton. Generic ellipsoid contours, hitting this skeleton, hit a corner almost surely. Sparse solutions are not just <em>possible</em> under $\ell_1$ regularization; geometrically, they are the <em>typical</em> solution. The $\ell_2$ ball has no corners — no preferred axes — so $\ell_2$-regularized solutions distribute weight smoothly across coordinates.</p>
+
+    <p>This intuition extends. The $\ell_p$ ball for $p < 1$ (not a true norm, but a useful regularizer) is even more star-shaped, with even sharper corners — sparser solutions, but harder optimization. Geometry is the design space.</p>
+
+    <aside class="callout ml">
+      <strong>ML connection: sparse autoencoders and the corner principle.</strong> Modern interpretability work uses sparse autoencoders (SAEs) to decompose a model's residual stream into a large dictionary of "features." The training objective is essentially MSE plus an $\ell_1$ penalty on the latent code — same LASSO geometry, applied to a 50,000-dim dictionary. The reason SAEs find <em>discrete, axis-aligned features</em> at all is the corner principle of this section: solutions of $\ell_1$-regularized problems live at the corners of the cross-polytope, and corners are sparse vectors with most coordinates zero. Pruning, structured sparsity in MoE routing, and quantization-aware training are all variants of the same geometric move.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="jl">
+    <h2>9. Johnson–Lindenstrauss: the silver lining</h2>
+    <p>You'd think all this concentration would be terrible news for working with high-dimensional data: distances collapse, intuition fails, volumes vanish. It turns out concentration is also the source of one of the most useful tools in the box.</p>
+
+    <p><strong>Johnson–Lindenstrauss (1984).</strong> For any $\varepsilon > 0$ and any set of $N$ points $x_1, \ldots, x_N \in \R^d$, there exists a linear map $f: \R^d \to \R^k$ with</p>
+    <p class="eq">$$ k = O\!\left( \frac{\log N}{\varepsilon^2} \right) $$</p>
+    <p>such that for all $i, j$, $\;(1 - \varepsilon) \|x_i - x_j\| \le \|f(x_i) - f(x_j)\| \le (1 + \varepsilon) \|x_i - x_j\|.$</p>
+
+    <p>Read that again. To preserve all pairwise distances among <em>a million</em> points up to 10% error, you need only $k = O(\log 10^6 / 0.01) \approx 1400$ output dimensions, <em>no matter how large $d$ is</em>. The target dimension depends only on $\log N$, not on the source dimension. You can project from $\R^{10000}$ to $\R^{1400}$ and lose almost no geometric information.</p>
+
+    <p>The proof is concentration of measure, again. Pick a random matrix $A \in \R^{k \times d}$ with iid $\mathcal{N}(0, 1/k)$ entries. For any fixed vector $u \in \R^d$, $\E\|Au\|^2 = \|u\|^2$. The fluctuation of $\|Au\|^2$ around its mean is controlled by Gaussian concentration with width $\sim 1/\sqrt{k}$. So for $k$ large enough, $\|Au\|^2$ is within $(1 \pm \varepsilon) \|u\|^2$ with very high probability — and a union bound over $\binom{N}{2}$ pairs of points gives the full lemma.</p>
+
+    <p>The lemma is why random projections work. It's why hashing-based nearest-neighbor methods work. It's the reason FAISS and Annoy and ScaNN can index a billion vectors. And it's the lemma that powers modern compressed sensing — the entire field is "concentration is so strong, you can recover a sparse signal from far fewer measurements than its ambient dimension."</p>
+
+    <aside class="callout">
+      <strong>The unifying lens.</strong> Phenomena 1–8 say "high-dim space is rigid in surprising ways." Johnson–Lindenstrauss says "this rigidity is a feature, not a bug — it means you can compress." The same concentration that kills naive Euclidean kNN gifts you efficient approximate nearest neighbors. The two views are the same theorem.
+    </aside>
+
+    <aside class="callout ml">
+      <strong>ML connection: every vector database you've used.</strong>
+      <ul style="margin: 8px 0 0; padding-left: 20px;">
+        <li><strong>FAISS, ScaNN, Annoy, hnswlib.</strong> All of them at some level use random projections or LSH (locality-sensitive hashing) to make billion-scale vector search tractable. JL is the theorem that says "the projected distances are still good enough."</li>
+        <li><strong>LSH for retrieval.</strong> SimHash, MinHash, and signed random projections all bucket vectors by the sign of random projections — exactly the JL setup, applied as a hash function.</li>
+        <li><strong>Latent dimensions in VAEs and Stable Diffusion.</strong> SD's VAE compresses images from $\R^{512 \times 512 \times 3}$ to $\R^{64 \times 64 \times 4}$ — a 48× dimension reduction. The fact that this can preserve perceptual content at all is a learned, structured cousin of JL: a nonlinear projection that respects perceptual distance.</li>
+        <li><strong>Compressed sensing & sparse recovery.</strong> If your signal $x \in \R^d$ has at most $k$ nonzero coordinates, you can recover it from $O(k \log(d/k))$ random linear measurements. JL plus L1 sparsity is the entire field of compressed sensing in one sentence.</li>
+        <li><strong>Attention is approximate compression.</strong> Performer/Linformer/Reformer all use random feature projections to approximate $\text{softmax}(QK^\top)$ with $O(n)$ instead of $O(n^2)$ memory. Each one is JL applied to attention.</li>
+      </ul>
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="cheatsheet">
+    <h2>10. When to invoke each rule</h2>
+    <p>A practitioner's cheat sheet. When you encounter the situation on the left, the geometric fact on the right is the one to reach for.</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Situation</th><th>The relevant rule</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>You add "$\sigma$ Gaussian noise" to a 1000-d weight vector or latent</td>
+          <td>Actual magnitude is $\sigma\sqrt{d}$, not $\sigma$ — Gaussians live on a $\sqrt{d}$ shell. (Why diffusion schedules go up to $\sigma=80$.)</td>
+        </tr>
+        <tr>
+          <td>You initialize a network with $\mathcal{N}(0, c)$ weights</td>
+          <td>The norm of any activation is $\sqrt{\text{fan\_in}}$ times bigger than the weight scale. Kaiming/Xavier fix this by setting $c = 2/\text{fan\_in}$.</td>
+        </tr>
+        <tr>
+          <td>You're picking a "typical" point of the unit cube</td>
+          <td>You're picking a corner — the inscribed ball is invisible. (Raw pixel sampling = high-contrast noise, not natural images.)</td>
+        </tr>
+        <tr>
+          <td>You wonder if two random initializations / heads / features are "close"</td>
+          <td>They're almost orthogonal: $\cos\theta \sim 1/\sqrt{d}$. (Why superposition, LoRA, and multi-head attention all work at init.)</td>
+        </tr>
+        <tr>
+          <td>You want to use nearest-neighbor in raw feature space</td>
+          <td>Don't — all distances collapse. Learn a representation first. (Why kNN works in feature space but not pixel space.)</td>
+        </tr>
+        <tr>
+          <td>You want similarity, not distance, between embeddings</td>
+          <td>L2-normalize and use cosine. The magnitude is concentrated and carries no signal. (Every modern retrieval system.)</td>
+        </tr>
+        <tr>
+          <td>You add an $\ell_1$ penalty to your loss</td>
+          <td>You're aiming for the corner of the cross-polytope, which lies on an axis (sparse). (LASSO, SAEs, pruning, structured MoE routing.)</td>
+        </tr>
+        <tr>
+          <td>You need to index a billion vectors / approximate $QK^\top$</td>
+          <td>Project to $O(\log N / \varepsilon^2)$ dimensions — Johnson–Lindenstrauss. (FAISS, LSH, Performer, compressed sensing.)</td>
+        </tr>
+        <tr>
+          <td>You train a contrastive loss with negatives on a sphere</td>
+          <td>Without a small temperature $\tau$, all negatives look equidistant and gradients vanish. The temperature is fighting distance concentration.</td>
+        </tr>
+        <tr>
+          <td>You want to estimate the integral of a smooth function on the sphere</td>
+          <td>Most of the sphere is in any equatorial slab — concentrate sample budget there.</td>
+        </tr>
+        <tr>
+          <td>You want to argue a loss is "flat" or a perturbation is "small"</td>
+          <td>Be careful: that ball is mostly its shell, not its interior. "Flat minimum" actually means "flat along most directions, sharp along a structured few."</td>
+        </tr>
+        <tr>
+          <td>You add random noise to a trained model and it still works</td>
+          <td>Random directions are nearly orthogonal to the gradient — you moved along the equator, not toward a pole. (Why dropout and noise injection are mild; why adversarial attacks are not.)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>The bottom line</h3>
+    <p>High-dimensional geometry is not "low-d geometry, but harder." It is its own geometry, with its own rules, and most of those rules come from a single principle: smooth quantities lose their variance when you average over many dimensions. The unit ball vanishes, Gaussians shell up, cubes spike out, vectors orthogonalize, distances collapse, equators dominate, $\ell_1$ corners attract — all of it is the same theorem applied to different shapes. The good news is that once you've internalized this principle, high-dim space stops being a fog and starts being a place with a few hard, useful rules.</p>
+
+    <p>The deeper good news is that <em>essentially every modern ML practice you can name is a response to one of these phenomena.</em> Kaiming init compensates for shell radius. Cosine similarity acknowledges magnitude concentration. LoRA exploits near-orthogonality. Diffusion noise scales by $\sqrt{d}$. SAEs harvest the cross-polytope's corners. FAISS lives off Johnson–Lindenstrauss. Contrastive temperatures fight distance collapse. The geometry isn't a curiosity — it's the substrate the field has been organized around, sometimes explicitly and often implicitly. The next time you write a <code>torch.randn(1024)</code>, picture a thin shell, not a blob — and notice how much of your code suddenly makes more sense.</p>
+
+    <h3>Further reading</h3>
+    <ul>
+      <li><strong>Roman Vershynin, <em>High-Dimensional Probability</em></strong> (Cambridge, 2018). The canonical modern textbook. Free PDF on the author's site. Chapters 2 (concentration) and 5 (geometric high-dim probability) are exactly this tour, formalized.</li>
+      <li><strong>Michel Talagrand, <em>The Generic Chaining</em></strong>. Deep dive on concentration of measure as an organizing principle.</li>
+      <li><strong>Avrim Blum, John Hopcroft, Ravindran Kannan, <em>Foundations of Data Science</em></strong>, Chapter 2 (free online). A friendly, ML-focused treatment of the same phenomena.</li>
+      <li><strong>3Blue1Brown's "But why is a sphere's surface area four times its shadow?"</strong> — for the low-d cousin of these ideas, beautifully animated.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Built as part of the <a href="../../">paper2explain</a> series. The math here is standard; the framing and widgets are this site's own.</p>
+    <p class="tiny">Concentration inequalities throughout: see Vershynin (2018), §2.6, §3.1, §5.1.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

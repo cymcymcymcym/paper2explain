@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Gaussian Splatting — theory, uses, and the field it spawned</title>
+  <meta name="description" content="An interactive deep dive into 3D Gaussian Splatting: the math of the primitive, the rasterizer that made it real-time, the key literature that grew around it, and how it compares to meshes, voxels, SDFs and NeRFs."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vmu':    '{\\boldsymbol{\\mu}}',
+        '\\vSigma': '{\\boldsymbol{\\Sigma}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>3D Gaussian Splatting: the primitive that ate 3D vision</h1>
+    <p class="byline">
+      Anchored on Kerbl, Kopanas, Leimkühler, Drettakis &middot; Inria / MPI &middot; SIGGRAPH 2023 &middot;
+      <a href="https://arxiv.org/abs/2308.04079" target="_blank" rel="noopener">arXiv 2308.04079</a>
+    </p>
+    <p class="lede">
+      In August 2023 a paper from Inria proposed representing a scene as a few million
+      fuzzy, colored, semi-transparent ellipsoids — and optimizing them directly with
+      gradient descent. No neural network in the renderer. No ray marching. The result
+      matched the best NeRF of the day on visual quality while rendering at
+      <strong>134&nbsp;fps instead of 0.06&nbsp;fps — roughly 2,000× faster</strong> —
+      and training in 40 minutes instead of 48 hours. Within eighteen months, Gaussian
+      splats had colonized SLAM, avatars, autonomous driving, volumetric video, and 3D
+      generation. This post explains the theory from scratch, maps the literature that
+      grew around it, and ends with an honest comparison against every other 3D
+      representation you might use instead.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#primitive">The primitive: an anisotropic Gaussian</a></li>
+      <li><a href="#projection">Project, sort, blend</a></li>
+      <li><a href="#rasterizer">The rasterizer that made it real-time</a></li>
+      <li><a href="#optimization">Optimization and densification</a></li>
+      <li><a href="#results">Results: the numbers that started it</a></li>
+      <li><a href="#timeline">The literature: how the field grew</a></li>
+      <li><a href="#applications">What splats are used for</a></li>
+      <li><a href="#representations">Splats vs. every other 3D representation</a></li>
+      <li><a href="#bottomline">The bottom line</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/teaser.png" alt="3DGS teaser: quality vs speed comparison against Mip-NeRF360, InstantNGP and Plenoxels"/>
+      <figcaption>Figure 1 of Kerbl et al. (2023). At comparable quality to Mip-NeRF360, 3D Gaussian Splatting renders three orders of magnitude faster; at comparable speed to InstantNGP, it is markedly higher quality.</figcaption>
+    </figure>
+
+    <p>
+      For three years after <a href="../nerf/index.html">NeRF</a> (2020), the recipe for photorealistic novel view
+      synthesis was fixed: encode the scene in the weights of a neural network, and
+      render by <em>ray marching</em> — firing a ray through each pixel, querying the
+      network at dozens to hundreds of sample points, and integrating. The quality was
+      stunning. The cost was brutal: even heavily-optimized variants like InstantNGP
+      ran at ~10&nbsp;fps on small scenes, and the quality leader, Mip-NeRF360, took
+      <em>seconds per frame</em> and 48 GPU-hours to train.
+    </p>
+    <p>
+      The 3D Gaussian Splatting paper asked a heretical question: what if the
+      representation were not a function you query but a <em>set of objects you
+      draw</em>? Take the sparse point cloud that camera calibration (SfM) gives you
+      for free, place a fuzzy 3D Gaussian on each point, then optimize every Gaussian's
+      position, shape, opacity, and color by differentiating through the rendering
+      itself — and render the whole thing with a GPU-friendly rasterizer rather than
+      ray marching. Explicit primitives, gradient-descent optimization, real-time
+      rasterization: each piece existed before, but the combination broke the
+      quality–speed trade-off that defined the field.
+    </p>
+    <p>
+      We'll build the method up from its one core object — the anisotropic 3D Gaussian
+      — then follow the field it created, and finish by placing splats in the full
+      design space of 3D representations: meshes, voxels, point clouds, SDFs, and
+      neural fields.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="primitive">
+    <h2>1. The primitive: an anisotropic 3D Gaussian</h2>
+    <p>
+      A scene is a set of $N$ primitives (typically 0.5–5 million for a real scene).
+      Each primitive $i$ is an unnormalized 3D Gaussian: a soft ellipsoidal blob of
+      density centered at a mean $\vmu_i \in \mathbb{R}^3$ with a full $3\times 3$
+      covariance matrix $\vSigma_i$:
+    </p>
+    <p class="eq">$$ G_i(x) = \exp\!\Big(\!-\tfrac{1}{2}(x-\vmu_i)^{T}\vSigma_i^{-1}(x-\vmu_i)\Big) $$</p>
+    <p>
+      Attached to each Gaussian are two more learnable things: an opacity
+      $\alpha_i \in [0,1)$ (how much light the blob absorbs), and a color $c_i$ stored
+      as <em>spherical harmonics</em> coefficients up to degree 3 — so the color can
+      change with viewing direction, which is what makes shiny floors and glass look
+      right.
+    </p>
+    <p>
+      Why a <em>full</em> covariance and not just a radius? Because real geometry is
+      locally flat or stringy, not spherical. A wall wants pancake-shaped Gaussians; a
+      bicycle spoke wants needle-shaped ones. The paper's ablation shows isotropic
+      (spherical) Gaussians visibly degrade quality at the same primitive count.
+      Anisotropy is what lets a few million blobs represent surfaces compactly.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/anisotropic_real.png" alt="Visualization of optimized anisotropic Gaussians, shrunk to reveal their shapes"/>
+      <figcaption>From the paper: optimized Gaussians shrunk by 60% to reveal their shapes. The optimizer discovers flat, elongated primitives that hug the geometry — leaf-shaped Gaussians for leaves, stripe-shaped ones for thin structures.</figcaption>
+    </figure>
+    <p>
+      There is one technical wrinkle that the paper handles elegantly. A covariance
+      matrix is only physically meaningful if it is positive semi-definite, and naive
+      gradient descent on the 6 free entries of $\vSigma$ will happily step outside
+      that set. So instead the paper parameterizes the covariance like an ellipsoid:
+      a rotation $R$ (stored as a unit quaternion $q$) and per-axis scales
+      $S = \mathrm{diag}(s_x, s_y, s_z)$:
+    </p>
+    <p class="eq">$$ \vSigma = R\,S\,S^{T}R^{T} $$</p>
+    <p>
+      Any $q$ and $s$ produce a valid covariance, so the optimizer can roam freely.
+      This trick — optimize in an unconstrained parameterization whose image is exactly
+      the valid set — is the same move as optimizing $\log\sigma$ instead of
+      $\sigma$, and it shows up everywhere in the follow-up literature.
+    </p>
+
+    <div class="widget-frame" id="splat-playground">
+      <p class="widget-title">Widget 1 · Build a scene out of Gaussians</p>
+      <p class="widget-sub">Click the canvas to place 2D Gaussians. Use the sliders to shape the <em>next</em> splat you place (or drag an existing one to move it; click it first to reshape it). Watch how few anisotropic splats it takes to paint a coherent picture — this is the whole representation.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="projection">
+    <h2>2. Project, sort, blend</h2>
+    <p>
+      To render, each 3D Gaussian must become a 2D shape on the screen. Here the paper
+      reaches back to a 2001 result by Zwicker et al. — <em>EWA splatting</em> — from
+      the era when point-based graphics was last fashionable. A 3D Gaussian viewed
+      through a camera is (approximately) a 2D Gaussian on the image plane. Given the
+      viewing transformation $W$ and the Jacobian $J$ of the affine approximation to
+      the projective transformation, the screen-space covariance is:
+    </p>
+    <p class="eq">$$ \vSigma' = J\,W\,\vSigma\,W^{T}J^{T} $$</p>
+    <p>
+      Drop the third row and column of $\vSigma'$ and you have a $2\times 2$
+      covariance — an ellipse on screen, the <em>splat</em>. This is the only place
+      perspective enters, and it is fully differentiable, so gradients flow from pixel
+      errors back through $J$, $W$ into each Gaussian's position, rotation, and scale.
+    </p>
+    <p>
+      Color is then accumulated exactly as in NeRF's volume rendering equation, except
+      the sum runs over <em>sorted primitives</em> instead of ray samples. With
+      Gaussians sorted front-to-back along the view direction, the pixel color is:
+    </p>
+    <p class="eq">$$ C = \sum_{i \in \mathcal{N}} c_i\,\alpha_i' \prod_{j=1}^{i-1}\big(1-\alpha_j'\big), \qquad \alpha_i' = \alpha_i \cdot G^{2D}_i(\text{pixel}) $$</p>
+    <p>
+      where $\alpha_i'$ is the Gaussian's learned opacity modulated by its 2D
+      footprint at this pixel. The product term is the <em>transmittance</em> — how
+      much light still survives after passing through the splats in front. When it
+      hits zero, everything behind is invisible and computation can stop. This is the
+      same physics as NeRF; the difference is purely <em>where the samples come
+      from</em>. NeRF samples blindly along the ray and asks a network what's there;
+      splatting already knows where the matter is, because the matter is the
+      representation.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/splat_pipeline.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The whole rendering pipeline in one loop: anisotropic 3D Gaussians are projected
+      onto the image plane via $\Sigma' = JW\Sigma W^T J^T$, depth-sorted, and
+      alpha-blended front-to-back. The transmittance bar $T$ drains as each splat
+      contributes; when it saturates, the pixel is done.
+    </p>
+
+    <div class="widget-frame" id="blend-ray">
+      <p class="widget-title">Widget 2 · Alpha blending along one ray</p>
+      <p class="widget-sub">Four splats sit in front-to-back order along a single pixel ray. Drag their opacities and watch the transmittance staircase and the final blended color. Notice how a near-opaque front splat starves everything behind it of both light <em>and gradient</em>.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>Where "splatting" comes from.</strong> The name is older than this paper
+      by 33 years — Lee Westover's 1990 volume-rendering technique "splatted" voxel
+      footprints onto the screen like snowballs hitting a window. Zwicker's 2001 EWA
+      (elliptical weighted average) splatting made the footprints proper anisotropic
+      Gaussians with correct filtering. The 2023 paper's contribution was not the
+      splat — it was making millions of splats <em>trainable</em> and <em>fast</em>.
+    </aside>
+
+    <h3>View-dependent color via spherical harmonics</h3>
+    <p>
+      Each Gaussian's color is not a fixed RGB but a function of viewing direction,
+      expressed in the spherical harmonics basis: degree 0 is a constant color, degree
+      1 adds a smooth front/back–left/right tilt, degrees 2 and 3 add increasingly
+      sharp lobes. Sixteen coefficients per channel (48 numbers) buy convincing
+      glossiness and sheen without any network evaluation — reading a polynomial is
+      almost free. This is also most of the memory bill: of the 59 floats per
+      Gaussian, 48 are SH coefficients, which is why nearly every compression paper
+      attacks the SH first.
+    </p>
+
+    <div class="widget-frame" id="sh-viewer">
+      <p class="widget-title">Widget 3 · Spherical harmonics: color that depends on where you stand</p>
+      <p class="widget-sub">Orbit the camera around a single splat and watch its color change. Toggle the maximum SH degree: at degree 0 the splat is matte (same color from everywhere); higher degrees add view-dependent sheen.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="rasterizer">
+    <h2>3. The rasterizer that made it real-time</h2>
+    <p>
+      The math above was known. The reason this paper changed the field is a CUDA
+      kernel: a tile-based, fully differentiable rasterizer that renders and
+      backpropagates through millions of sorted, blended splats in milliseconds.
+      Its design choices are worth understanding because they explain both the speed
+      and the artifacts.
+    </p>
+    <pre class="code"><code>render(gaussians, camera):
+  1. split screen into 16×16-pixel tiles
+  2. cull Gaussians outside the view frustum (99% confidence test)
+  3. instantiate one entry per (gaussian, tile-it-overlaps) pair
+     key = [ tile ID | view-space depth ]
+  4. ONE global GPU radix sort over all entries        # not per-pixel!
+  5. for each tile (one CUDA thread block):
+       walk its depth-sorted list front-to-back
+       each pixel accumulates  c·α·T  and updates  T
+       stop when T ≈ 0 (pixel saturated)</code></pre>
+    <p>
+      The crucial trade is in step 4. Exact alpha blending needs a per-pixel depth
+      sort, which is what made earlier point-based methods slow. Here, splats are
+      sorted <em>once per frame, per tile</em>, with a single radix sort — and the
+      ordering within a tile is shared by all 256 pixels. That ordering is
+      approximate (two overlapping splats can be in the "wrong" order for some pixels
+      in the tile), but the error vanishes as splats shrink toward pixel size — and
+      the optimizer, trained through this same renderer, learns to produce scenes
+      that look right <em>under this approximation</em>. The approximation is baked
+      into the training loss. This is also the origin of the well-known "popping"
+      artifact when the camera rotates: the global sort order changes discretely,
+      and later work (e.g. StopThePop, ray-traced Gaussians) addresses exactly this.
+    </p>
+    <p>
+      Equally important for training: the backward pass revisits the same sorted
+      lists back-to-front, so gradient flow has <em>no cap on the number of blended
+      primitives per pixel</em> — earlier differentiable point renderers truncated
+      gradients to the front few points, which the paper shows costs 11&nbsp;dB PSNR.
+      Memory stays bounded by a neat trick: instead of storing every intermediate
+      transmittance, only the final accumulated opacity is stored, and intermediate
+      values are recovered by division during the backward traversal.
+    </p>
+
+    <div class="widget-frame" id="render-race">
+      <p class="widget-title">Widget 4 · Why rasterization wins: the work per pixel</p>
+      <p class="widget-sub">A live race between NeRF-style ray marching (left: every pixel fires a ray, every ray queries an MLP at many sample points — most hitting empty space) and splatting (right: each primitive touches only the pixels it covers). The counters track work done. Same image, wildly different cost.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="optimization">
+    <h2>4. Optimization and adaptive densification</h2>
+    <p>
+      Training is plain stochastic gradient descent on rendered-vs-photo error. Pick a
+      training photo, render from its camera, compare, backpropagate into every
+      Gaussian parameter. The loss mixes a pixel term and a structural term:
+    </p>
+    <p class="eq">$$ \mathcal{L} = (1-\lambda)\,\mathcal{L}_1 + \lambda\,\mathcal{L}_{\text{D-SSIM}}, \qquad \lambda = 0.2 $$</p>
+    <p>
+      Opacity goes through a sigmoid and scales through an exponential — the same
+      "optimize in unconstrained space" trick as the quaternion-and-scale covariance.
+      But gradient descent can only adjust Gaussians that exist; it cannot conjure
+      one where the SfM point cloud had a hole, nor erase a useless one. The fix is
+      the paper's most distinctive mechanism: <strong>adaptive density control</strong>,
+      run every 100 iterations.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/density_control.png" alt="Clone and split densification scheme"/>
+      <figcaption>The two densification moves. Under-reconstruction (top): a small Gaussian that can't cover the geometry gets <em>cloned</em>, and the copy moves along the positional gradient. Over-reconstruction (bottom): one big Gaussian smearing over fine detail gets <em>split</em> into two smaller ones (scale ÷ 1.6).</figcaption>
+    </figure>
+    <p>
+      The signal that triggers both moves is the same and is beautifully simple: a
+      large view-space positional gradient (threshold $\tau_{\text{pos}} = 0.0002$).
+      Intuitively, if the optimizer keeps trying to drag a Gaussian around, the region
+      it lives in is badly explained — either there's too little matter there
+      (clone to add some) or one blob is being stretched over detail it can't
+      represent (split it). Meanwhile Gaussians whose opacity falls below a threshold
+      are deleted, and every 3,000 iterations <em>all</em> opacities are reset to
+      near zero — a "prove you're useful or die" event that kills floaters that
+      parked themselves near the camera. Population dynamics, not just parameter
+      updates: the representation grows from ~100K SfM seeds to a few million
+      Gaussians exactly where the scene needs them.
+    </p>
+    <aside class="callout">
+      <strong>Foreshadowing.</strong> These heuristics work startlingly well, but they
+      are heuristics — and the follow-up literature treats them as the method's soft
+      underbelly. 3DGS-MCMC (NeurIPS 2024) reinterprets the whole clone/split/prune
+      dance as approximate MCMC sampling and replaces it with principled
+      noise-injected updates; Scaffold-GS constrains where Gaussians may live with
+      anchor points. When you see "improves densification" in a 2024 title, this
+      paragraph is what it's improving.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>5. Results: the numbers that started a land rush</h2>
+    <p>
+      The headline table, averaged over the Mip-NeRF360 dataset (the hardest of the
+      three benchmarks — large unbounded outdoor/indoor scenes), tells the whole
+      story. Quality matches the reigning champion; speed and training time belong to
+      a different sport.
+    </p>
+    <table class="results">
+      <thead>
+        <tr><th>Method</th><th>PSNR ↑</th><th>SSIM ↑</th><th>LPIPS ↓</th><th>Train</th><th>FPS</th><th>Memory</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Plenoxels</td>
+          <td>23.08</td><td>0.626</td><td>0.463</td><td>25m 49s</td><td>6.8</td><td>2.1 GB</td>
+        </tr>
+        <tr>
+          <td class="cat">InstantNGP (Big)</td>
+          <td>25.59</td><td>0.699</td><td>0.331</td><td>7m 30s</td><td>9.4</td><td><strong>48 MB</strong></td>
+        </tr>
+        <tr>
+          <td class="cat">Mip-NeRF360</td>
+          <td class="win"><strong>27.69</strong></td><td>0.792</td><td>0.237</td><td>48 h</td><td>0.06</td><td><strong>8.6 MB</strong></td>
+        </tr>
+        <tr>
+          <td class="cat">3DGS — 7K iters</td>
+          <td>25.60</td><td>0.770</td><td>0.279</td><td class="win"><strong>6m 25s</strong></td><td class="win"><strong>160</strong></td><td>523 MB</td>
+        </tr>
+        <tr>
+          <td class="cat">3DGS — 30K iters</td>
+          <td>27.21</td><td class="win"><strong>0.815</strong></td><td class="win"><strong>0.214</strong></td><td>41m 33s</td><td>134</td><td>734 MB</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      Mip-NeRF360 dataset averages from Table 1 of the paper; all runs on an A6000.
+      Note the one column 3DGS loses badly: memory. 734 MB vs 8.6 MB is an 85×
+      penalty — the price of being explicit — and it spawned an entire compression
+      sub-literature.
+    </p>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/bicycle_ours.png" alt="3DGS render of the bicycle scene"/>
+      <img src="assets/figures/bicycle_gt.png" alt="Ground truth photo of the bicycle scene"/>
+      <figcaption>Left: 3DGS render of the <em>bicycle</em> scene (held-out view). Right: the ground-truth photo. Fine structures — spokes, grass blades — survive because needle-shaped Gaussians can align with them.</figcaption>
+    </figure>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/bicycle_mipnerf360.png" alt="Mip-NeRF360 render of the bicycle scene"/>
+      <img src="assets/figures/bicycle_plenoxels.png" alt="Plenoxels render of the bicycle scene"/>
+      <figcaption>The same view from Mip-NeRF360 (left — note the blur in vegetation, at 800,000× the render cost) and Plenoxels (right — voxel artifacts everywhere).</figcaption>
+    </figure>
+    <p>
+      Two honest caveats from the paper's own limitations section, both of which
+      defined research agendas: sparsely-observed regions grow elongated, blotchy
+      Gaussians ("floaters"), and the per-frame global sort causes popping when the
+      view rotates. Peak training memory exceeded 20 GB in the prototype — large-scene
+      training was genuinely hard until hierarchical and distributed follow-ups.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="timeline">
+    <h2>6. The literature: how the field grew</h2>
+    <p>
+      The 3DGS paper has accumulated citations at a pace matched by very few papers in
+      graphics history, and the follow-up literature organized itself into clear
+      tracks within months. The widget below is a filterable map of the works that
+      actually mattered — the ones that either fixed a fundamental flaw, opened a new
+      application, or changed how the community thinks about the representation. Click
+      any card for the one-paragraph version of what it did.
+    </p>
+
+    <div class="widget-frame" id="timeline-explorer">
+      <p class="widget-title">Widget 5 · The Gaussian splatting literature, 2001 → 2025</p>
+      <p class="widget-sub">Filter by track. Click a card to expand it. Roughly chronological within each track.</p>
+    </div>
+
+    <p>
+      A few arcs are worth narrating beyond the cards. The <strong>quality arc</strong>
+      runs from Mip-Splatting (fixing aliasing when you zoom — the original blows up
+      because splat size doesn't account for sampling rate) through Gaussian Opacity
+      Fields and ray-traced Gaussians (3DGRT), which replace the approximate tile-sorted
+      rasterizer with exact per-ray evaluation, eliminating popping at some speed cost.
+      The <strong>geometry arc</strong> — 2DGS, SuGaR, GOF — confronts the fact that
+      fuzzy volumetric blobs don't define a surface: flatten Gaussians into surfels, or
+      regularize them toward a mesh, and suddenly you can extract usable geometry, not
+      just pretty pixels. The <strong>principled-optimization arc</strong> (Scaffold-GS,
+      3DGS-MCMC) replaces the clone/split heuristics. And the
+      <strong>feed-forward arc</strong> (pixelSplat, MVSplat, and the large
+      reconstruction models that followed) may be the most consequential: instead of
+      optimizing splats per scene for minutes, a transformer <em>predicts</em>
+      Gaussians from a couple of images in one forward pass — turning a reconstruction
+      algorithm into an output format for generative models.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="applications">
+    <h2>7. What splats are actually used for</h2>
+    <p>
+      A representation earns its keep by what gets built on it. Splatting's
+      combination of real-time rendering, photographic fidelity, differentiability,
+      and explicit editability turned out to fit a remarkable range of applications —
+      and each one leans on a different subset of those properties.
+    </p>
+    <h3>Capture, VR/AR, and virtual production</h3>
+    <p>
+      The most direct use: photograph a real place, get a photorealistic walkthrough.
+      Because rendering is rasterization, splat scenes run on consumer GPUs, phones
+      (Niantic's Scaniverse, Polycam), and in WebGL/WebGPU viewers in a browser tab —
+      something no NeRF could honestly claim. VR demands ~90 fps in stereo, which 3DGS
+      meets and ray-marching methods never did. Film and broadcast use splat captures
+      as instantly-relightable-ish digital backlots; real-estate and e-commerce use
+      them as the successor to 360° photos.
+    </p>
+    <h3>SLAM and robotics</h3>
+    <p>
+      SplaTAM and MonoGS demonstrated dense SLAM with a splat map: a robot localizes
+      by rendering its current map and comparing against the camera feed —
+      differentiable rendering gives the pose gradient for free — while simultaneously
+      growing the map with new Gaussians. Compared to NeRF-based SLAM (iMAP, NICE-SLAM),
+      the explicit map renders fast enough for the real-time inner loop and can be
+      edited incrementally (a moved chair = moved Gaussians, no retraining). Navigation
+      planners like Splat-Nav read occupancy directly off the ellipsoids.
+    </p>
+    <h3>Autonomous driving simulation</h3>
+    <p>
+      DrivingGaussian and Street Gaussians reconstruct logged drives as editable splat
+      scenes: background static, each vehicle its own Gaussian set on a motion track.
+      Replay the scene, move the ego car, insert a cut-in — closed-loop simulation
+      from real sensor data, photorealistic enough to test perception stacks. This is
+      now one of the hottest commercial uses (Waymo, NVIDIA and Zoox have all published
+      splat-based reconstruction work for sensor simulation).
+    </p>
+    <h3>Avatars and telepresence</h3>
+    <p>
+      Rig Gaussians to a parametric face or body model (GaussianAvatars binds them to
+      FLAME mesh triangles; Animatable Gaussians to SMPL) and you get a photoreal
+      avatar that reenacts expression and pose in real time. Codec-avatar-style
+      telepresence needs exactly this combination — fidelity at 90+ fps — and Meta,
+      Apple-adjacent labs, and every avatar startup pivoted to Gaussians within a year.
+    </p>
+    <h3>Dynamic scenes and volumetric video</h3>
+    <p>
+      Dynamic 3D Gaussians track the same set of Gaussians through time (giving
+      long-range 3D motion trajectories almost for free); 4DGS and Deformable-3DGS
+      learn a deformation field over a canonical splat scene. The result is volumetric
+      video you can scrub and orbit in real time — the "watch a basketball game from
+      the court" demo that volumetric capture has promised for a decade, now actually
+      renderable on one GPU.
+    </p>
+    <h3>3D generation</h3>
+    <p>
+      DreamGaussian made text-to-3D fast by using splats as the canvas for score
+      distillation (minutes instead of hours), and the feed-forward models (LGM, GRM)
+      turn a single image or text prompt into Gaussians in seconds. Splats are an
+      attractive generative target precisely because they're a flat list of vectors —
+      no topology to get wrong, trivially differentiable, instantly viewable.
+    </p>
+    <h3>Everything else</h3>
+    <p>
+      Surgical scene reconstruction from endoscopy (deformable splats under tissue
+      motion), satellite and aerial mapping at city scale (hierarchical LODs),
+      XRay/CT-style tomographic variants, language-embedded splats (LangSplat) that
+      let you query a scene with text, and physics simulation directly on the
+      particles (PhysGaussian: Gaussians double as MPM material points — "what you see
+      is what you simulate"). The pattern in all of them: splats are the first
+      photoreal representation that is simultaneously <em>fast, differentiable, and an
+      explicit set of objects you can grab</em>.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="representations">
+    <h2>8. Splats vs. every other 3D representation</h2>
+    <p>
+      To see why splats won so much ground so fast — and where they genuinely lose —
+      put every major 3D representation on the same axes. Two axes organize the whole
+      space: <strong>explicit vs. implicit</strong> (is the geometry a list of
+      primitives you can index, or a function you must query?) and
+      <strong>surface vs. volume</strong> (does it model the boundary of objects, or
+      density everywhere in space?). Splats occupy a previously-empty corner:
+      explicit <em>and</em> volumetric <em>and</em> differentiable.
+    </p>
+    <table class="results">
+      <thead>
+        <tr><th>Representation</th><th>Type</th><th>Pros</th><th>Cons</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Triangle mesh</td>
+          <td>explicit · surface</td>
+          <td>40 years of tooling and hardware rasterization; compact for flat geometry; UV textures, rigging, physics, CAD all native; crisp silhouettes</td>
+          <td>fixed topology is hard to optimize from images; awful at fuzz, foliage, hair, transparency; quality capped by triangle budget; reconstruction from photos needs fragile surface extraction</td>
+        </tr>
+        <tr>
+          <td class="cat">Point cloud</td>
+          <td>explicit · surface samples</td>
+          <td>the raw output of LiDAR/depth sensors and SfM; trivially editable and streamable; no topology to maintain</td>
+          <td>holes between points — not renderable photorealistically without splatting/meshing on top; no view-dependent appearance; no notion of solid surface</td>
+        </tr>
+        <tr>
+          <td class="cat">Voxel grid</td>
+          <td>explicit · volume</td>
+          <td>regular structure → fast lookup, easy 3D convolution; natural for medical/scientific volume data; simple occupancy queries for planning</td>
+          <td>memory grows cubically with resolution; fine detail needs sparse octrees that complicate everything; axis-aligned blockiness (see the Plenoxels render above)</td>
+        </tr>
+        <tr>
+          <td class="cat">SDF / implicit surface</td>
+          <td>implicit · surface</td>
+          <td>watertight surfaces of arbitrary topology; exact normals and distances (great for physics, robotics collision, CSG); best-in-class geometry from images (NeuS, Neuralangelo)</td>
+          <td>needs sphere tracing or marching cubes to render/extract; slow to optimize; struggles with thin shells, fuzz, and semi-transparency; appearance usually bolted on separately</td>
+        </tr>
+        <tr>
+          <td class="cat">NeRF (MLP field)</td>
+          <td>implicit · volume</td>
+          <td>tiny (MBs); continuous — no resolution limit; principled volume rendering; superb view-dependent effects; graceful with fuzz and transparency</td>
+          <td>ray marching = hundreds of network queries per pixel → slow render and training; not editable (scene is entangled in weights); no direct geometry access</td>
+        </tr>
+        <tr>
+          <td class="cat">Hybrid grid NeRF (InstantNGP, Plenoxels)</td>
+          <td>hybrid · volume</td>
+          <td>minutes-fast training; small models (InstantNGP: 13–48 MB); keeps NeRF's volumetric strengths</td>
+          <td>still ray-marched → ~10 fps ceiling, far from VR-ready; hash collisions / grid resolution cap fine detail; still not editable</td>
+        </tr>
+        <tr>
+          <td class="cat">3D Gaussians</td>
+          <td>explicit · volume</td>
+          <td>real-time (100–1000+ fps) via rasterization; NeRF-level photorealism incl. view-dependence; fast training; explicit and editable (move/delete/animate primitives); differentiable end-to-end; runs on phones and in browsers</td>
+          <td>memory-hungry (100s of MB raw — 85× Mip-NeRF360); no well-defined surface → mediocre geometry without 2DGS/SuGaR-style fixes; approximate sorting → popping; floaters in under-observed regions; relighting hard (appearance baked in)</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Three readings of this table. First, <strong>splats did not dominate — they
+      filled a hole.</strong> If you need watertight geometry for machining, you still
+      want an SDF or mesh. If you need a 9 MB scene over a slow link, Mip-NeRF360's
+      compactness still wins. If you need relightable assets with materials, meshes
+      with PBR textures remain the only mature answer. Splats win when the question is
+      "photoreal, real-time, from photos, editable" — which happens to be the question
+      VR, robotics, simulation, and telepresence were all asking.
+    </p>
+    <p>
+      Second, <strong>the boundaries are dissolving.</strong> 2DGS makes splats
+      surface-like; SuGaR ties them to a mesh; feed-forward models make them an output
+      format; compressed splats (HAC, Self-Organizing Gaussians) close most of the
+      memory gap to within ~10× of NeRF. Each "con" in the splat row is an active
+      research front, and several have already been substantially mitigated.
+    </p>
+    <p>
+      Third, the deep lesson is about <strong>optimization-friendliness as the
+      selection pressure.</strong> Meshes lost the reconstruction race not because
+      they render worse — they render faster — but because their gradients are
+      terrible (topology is discrete). NeRF won 2020–2023 because an MLP is the
+      easiest thing in the world to differentiate. Splats won 2023+ because they kept
+      the differentiability <em>and</em> recovered explicitness and speed. The history
+      of 3D representations since 2020 is the history of "what can gradient descent
+      shape most easily while staying fast to render."
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottomline">
+    <h2>9. The bottom line</h2>
+    <p>
+      3D Gaussian Splatting is three old ideas — EWA point splatting (2001),
+      differentiable volumetric rendering (NeRF, 2020), and tile-based GPU software
+      rasterization — fused at exactly the right moment. The representation is just a
+      particle list: position, ellipsoid shape, opacity, view-dependent color, a few
+      million times. Everything else is an optimization loop that grows, splits, and
+      prunes the population until renders match photographs.
+    </p>
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Relighting and materials.</strong> Splat appearance bakes lighting
+        in. Decomposing into geometry × material × illumination (inverse rendering on
+        splats) works in papers, not yet robustly in products.</li>
+      <li><strong>Geometry without compromise.</strong> 2DGS-style surfels trade some
+        rendering quality for surfaces; nothing yet gives both mesh-grade geometry and
+        full splat fidelity in one representation.</li>
+      <li><strong>Sparse and casual capture.</strong> The method assumes dozens of
+        well-distributed photos and good SfM poses. Few-shot, single-video, and
+        pose-free splatting remain noticeably worse than dense capture.</li>
+      <li><strong>Principled probabilistic footing.</strong> 3DGS-MCMC opened the door
+        to treating splat optimization as sampling; a clean theory of what the
+        clone/split dynamics converge to is still missing.</li>
+      <li><strong>The feed-forward future.</strong> If transformers predicting
+        Gaussians keep improving, per-scene optimization may become a niche — and the
+        interesting question becomes what the right <em>generative prior</em> over
+        splat scenes is.</li>
+    </ul>
+    <h3>The mental model to keep</h3>
+    <p>
+      A Gaussian splat scene is a <em>point cloud that learned to render itself</em>.
+      Each point grew a shape, an opacity, and a view-dependent color, and the
+      population was shaped by gradient descent until projecting and blending it
+      reproduces reality. Once you see it that way, the entire follow-up literature
+      becomes predictable: anything you ever wanted to do with a point cloud
+      (compress, track, deform, segment, simulate, generate), someone has now done
+      with splats — at photographic quality, in real time.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Anchor paper: <a href="https://arxiv.org/abs/2308.04079" target="_blank" rel="noopener">arXiv:2308.04079</a>
+      &nbsp;·&nbsp; Code: <a href="https://github.com/graphdeco-inria/gaussian-splatting" target="_blank" rel="noopener">graphdeco-inria/gaussian-splatting</a>
+    </p>
+    <p class="tiny">All paper figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

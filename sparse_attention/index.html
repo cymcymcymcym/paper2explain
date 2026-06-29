@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sparse attention — the theory, the literature, and Native Sparse Attention</title>
+  <meta name="description" content="An interactive explainer of sparse attention: why O(n²) attention hurts, the sparsity patterns (local, strided, global, block, learned), the literature from Sparse Transformers to BigBird to NSA, and DeepSeek's hardware-aligned Native Sparse Attention as the modern anchor."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vq': '{\\mathbf{q}}', '\\vk': '{\\mathbf{k}}', '\\vv': '{\\mathbf{v}}',
+        '\\vo': '{\\mathbf{o}}', '\\softmax': '\\mathrm{softmax}',
+        '\\Attn': '\\mathrm{Attn}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Sparse attention: how to read a million tokens without reading them all</h1>
+    <p class="byline">
+      A topic explainer, anchored on <strong>Native Sparse Attention</strong> (Yuan et al., DeepSeek) &middot; ACL 2025 best paper &middot;
+      <a href="https://arxiv.org/abs/2502.11089" target="_blank" rel="noopener">arXiv 2502.11089</a>
+    </p>
+    <p class="lede">
+      A Transformer's attention compares every token to every other token. That
+      $O(n^2)$ scaling is the wall between today's models and the codebases, books,
+      and hour-long reasoning traces we want them to read — at a 64k context, attention
+      alone is <strong>70–80% of decoding latency</strong>. Sparse attention is the
+      decade-long effort to skip most of those comparisons without losing what
+      matters. This post builds the theory from the cost equation up, walks the
+      literature from 2019's Sparse Transformers to 2025's hardware-aligned designs,
+      and lands on DeepSeek's Native Sparse Attention — which is not only
+      <strong>11.6× faster to decode and 9× faster to train at 64k</strong>, but
+      actually <em>beats</em> full attention on accuracy. We finish with an honest
+      comparison of every major approach.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#cost">Why O(n²) hurts</a></li>
+      <li><a href="#patterns">The sparsity patterns</a></li>
+      <li><a href="#literature">The literature: 2019 → 2025</a></li>
+      <li><a href="#nsa">Native Sparse Attention: the three branches</a></li>
+      <li><a href="#kernel">Hardware-aligned: making sparsity actually fast</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#comparison">Comparing the approaches</a></li>
+      <li><a href="#why">Why native sparsity wins</a></li>
+      <li><a href="#bottomline">The bottom line</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/overview.png" alt="NSA vs full attention: accuracy and speed"/>
+      <figcaption>Figure 1 of Yuan et al. (2025). Left: despite being sparse, Native Sparse Attention matches or beats full attention across general, long-context, and reasoning benchmarks. Right: at 64k context it is dramatically faster in all three stages — decoding, forward, and backward.</figcaption>
+    </figure>
+
+    <p>
+      Recall what attention does. For each query token $\vq_t$, it computes a
+      similarity score against every preceding key $\vk_i$, softmaxes those scores
+      into weights, and returns the weighted sum of values:
+    </p>
+    <p class="eq">$$ \vo_t = \sum_{i=1}^{t} \frac{\alpha_{t,i}\,\vv_i}{\sum_j \alpha_{t,j}}, \qquad \alpha_{t,i} = \exp\!\Big(\tfrac{\vq_t^\top \vk_i}{\sqrt{d_k}}\Big) $$</p>
+    <p>
+      For a sequence of length $n$, that is $n$ scores per query and $n$ queries —
+      $O(n^2)$ work, and an $O(n)$ key-value cache that must be re-read on every
+      decoding step. Double the context, quadruple the attention compute. This is the
+      single biggest obstacle to long-context language models.
+    </p>
+    <p>
+      But here is the saving grace, observed again and again since 2019: the softmax
+      attention matrix is <em>overwhelmingly</em> sparse. A handful of keys soak up
+      almost all the weight; the rest contribute noise. If we could compute attention
+      against only the keys that matter, we would pay a fraction of the cost for nearly
+      all of the quality. The entire field is variations on one question:
+      <em>which keys matter, and how do we find them cheaply enough — and in a
+      hardware-friendly enough pattern — that the theoretical savings become real
+      wall-clock speedups?</em>
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="cost">
+    <h2>1. Why O(n²) hurts — and the two regimes</h2>
+    <p>
+      The cost of attention is not one number; it splits into two regimes that want
+      opposite optimizations, a distinction NSA makes central. The key idea is
+      <em>arithmetic intensity</em> — the ratio of compute operations to memory
+      accesses. Every GPU has a critical ratio; above it you are
+      <em>compute-bound</em> (limited by FLOPS), below it <em>memory-bound</em>
+      (limited by bandwidth).
+    </p>
+    <ul>
+      <li><strong>Training and prefilling</strong> process all tokens at once. The
+        matrix multiplies are dense and high-intensity, so these stages are
+        <em>compute-bound</em>. The goal: cut FLOPs.</li>
+      <li><strong>Autoregressive decoding</strong> generates one token per forward
+        pass while re-reading the <em>entire</em> KV cache. Low intensity → it is
+        <em>memory-bound</em>. The goal: cut bytes moved, not FLOPs.</li>
+    </ul>
+    <p>
+      This split is why so many sparse-attention papers that look good on paper
+      disappoint in practice: a method that cuts decoding FLOPs but still streams the
+      whole KV cache saves nothing on the memory-bound stage. Real speedup demands a
+      method that wins in <em>both</em> regimes. The widget below lets you feel the
+      quadratic wall and where sparse attention breaks it.
+    </p>
+
+    <div class="widget-frame" id="cost-curve">
+      <p class="widget-title">Widget 1 · The quadratic wall</p>
+      <p class="widget-sub">Slide the context length and watch full attention's cost grow as $n^2$ while a sparse scheme grows nearly linearly. Toggle between compute (FLOPs, the training/prefill regime) and KV-cache bytes loaded (the decoding regime). The gap is the whole motivation.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="patterns">
+    <h2>2. The sparsity patterns</h2>
+    <p>
+      Every sparse-attention method is, at heart, a rule for which cells of the
+      $n \times n$ attention matrix to compute and which to skip. Over the years a
+      small vocabulary of patterns emerged, and almost every method is a combination
+      of them:
+    </p>
+    <h3>Fixed patterns</h3>
+    <p>
+      <strong>Sliding window (local):</strong> each token attends to its $w$ nearest
+      neighbors — a diagonal band. Cheap and captures the fact that language is mostly
+      local, but a pure window can never see far back. <strong>Strided / dilated:</strong>
+      attend to every $k$-th token, giving long reach at coarse resolution (Sparse
+      Transformers). <strong>Global tokens:</strong> a few special tokens attend to —
+      and are attended by — everything, acting as a shared scratchpad (Longformer,
+      BigBird). Combine local + strided or local + global and you get most of the
+      early architectures.
+    </p>
+    <h3>Learned and dynamic patterns</h3>
+    <p>
+      Fixed patterns are blind to content. Learned methods choose which keys to attend
+      <em>per query, from the data</em>: cluster keys and attend within a cluster
+      (Routing Transformer), hash similar queries and keys into buckets (Reformer's
+      LSH), or score blocks of keys by importance and keep the top ones (Quest, NSA's
+      selection branch). More accurate, but the selection itself costs compute — and
+      if it is non-differentiable (k-means, hashing), you cannot train through it.
+    </p>
+    <h3>Block-sparse and IO-aware</h3>
+    <p>
+      The hardware twist: GPUs love contiguous, block-structured memory access and
+      hate scattered gathers. So modern methods operate on <em>blocks</em> of tokens,
+      not individual ones — this is what makes them fast in practice, and it is the
+      same insight that powers
+      <a href="../flash_attention/index.html">FlashAttention</a>'s exact, IO-aware
+      kernel. Sparse attention done right is block-sparse attention done right.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/attention_map.png" alt="Visualization of a real attention map showing block-wise structure"/>
+      <figcaption>A real attention map from a pretrained 27B model (NSA paper, appendix). Attention concentrates in <em>blocks</em> — neighboring keys share similar importance — which is exactly why blockwise selection both matches the data and suits the hardware.</figcaption>
+    </figure>
+
+    <div class="widget-frame" id="pattern-explorer">
+      <p class="widget-title">Widget 2 · The sparsity pattern zoo</p>
+      <p class="widget-sub">Toggle through the canonical patterns on a 32×32 causal attention matrix — full, sliding window, strided, global+local (BigBird-style), block-sparse, and NSA's combined pattern. Each shows which cells get computed and the resulting density. This is the entire design space in one picture.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="literature">
+    <h2>3. The literature: 2019 → 2025</h2>
+    <p>
+      Sparse attention has a clear arc: from hand-designed fixed patterns, through
+      learned selection, to the recognition that none of it matters unless it is both
+      <em>hardware-aligned</em> and <em>trainable end-to-end</em>. The map below is
+      filterable by track; click any card for what it actually contributed.
+    </p>
+
+    <div class="widget-frame" id="timeline-explorer">
+      <p class="widget-title">Widget 3 · The sparse-attention literature</p>
+      <p class="widget-sub">Filter by track. Click a card to expand. Roughly chronological within each track.</p>
+    </div>
+
+    <p>
+      Two themes recur. First, the <strong>fixed-then-learned</strong> drift: the 2019–2020
+      wave (Sparse Transformers, Longformer, BigBird) used patterns fixed by the
+      architect, with BigBird even proving that local+global+random attention is a
+      universal approximator and Turing-complete. The 2020–2021 wave (Reformer,
+      Routing Transformer) made the pattern depend on content. Second, the
+      <strong>theory-then-hardware</strong> correction: many methods cut asymptotic
+      complexity but ran no faster, because scattered memory access and per-head
+      selection defeat modern GPUs and GQA. NSA and its contemporary MoBA are the
+      synthesis — learned, block-structured, GQA-aware, and trainable from scratch.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="nsa">
+    <h2>4. Native Sparse Attention: the three branches</h2>
+    <p>
+      NSA's core move is to replace the full key-value set $\vk_{:t}, \vv_{:t}$ with a
+      compact, query-dependent set built from three parallel branches, then blend them
+      with learned gates:
+    </p>
+    <p class="eq">$$ \vo^*_t = \sum_{c \in \{\text{cmp},\,\text{slc},\,\text{win}\}} g_t^c \cdot \Attn\big(\vq_t,\, \tilde{K}_t^c,\, \tilde{V}_t^c\big), \qquad g_t^c \in [0,1] $$</p>
+    <p>
+      Each gate $g_t^c$ comes from a small MLP on the query, so the model learns how
+      much to trust each branch per token. The three branches divide the labor of
+      reading a long context:
+    </p>
+    <h3>Compression — coarse global scanning</h3>
+    <p>
+      Group keys into blocks of length $l$ (stride $d$) and map each block to a single
+      <em>compressed</em> token via a learnable MLP with intra-block position
+      encoding. This gives a cheap, low-resolution summary of the entire past —
+      enough to know roughly where the relevant information lives. NSA uses $l=32$,
+      $d=16$.
+    </p>
+    <h3>Selection — fine-grained where it counts</h3>
+    <p>
+      Compression alone loses detail, so NSA keeps the full tokens of a few important
+      blocks. The trick that makes this cheap: the importance scores come <em>for
+      free</em> from the compression branch's own attention scores — no separate
+      scoring pass. Keep the top-$n$ blocks (NSA: $l'=64$, $n=16$, always including
+      the first block and the local ones). Crucially, selection is <em>blockwise</em>
+      and <em>shared across a GQA group</em>, so the KV cache loads stay contiguous and
+      small.
+    </p>
+    <h3>Sliding window — local context, isolated</h3>
+    <p>
+      Local patterns learn fast and can dominate, starving the other branches of
+      gradient. So NSA gives local context its own branch (window $w=512$) with its
+      own keys and values, letting compression and selection specialize on long-range
+      structure without being shortcut. The gate then recombines all three.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/nsa_branches.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      One query, three branches. Full attention touches every key; NSA replaces them
+      with compressed coarse tokens, a few selected fine-grained blocks, and a local
+      window — then merges with learned gates. The KV-attended counter falls from the
+      full sequence to a small fraction.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/architecture.png" alt="NSA architecture: three branches and their attention patterns"/>
+      <figcaption>NSA's architecture (Figure 2). Left: the three branches process the same query in parallel. Right: each branch's attention pattern — green cells are computed, white cells skipped.</figcaption>
+    </figure>
+
+    <div class="widget-frame" id="branch-builder">
+      <p class="widget-title">Widget 4 · Build the NSA sparsity budget</p>
+      <p class="widget-sub">Set the compression block size, selected block count, and window. Move the query to change which blocks score as important. The readout shows total tokens attended $N_t$ versus the full length $t$ — the sparsity ratio you are buying.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="kernel">
+    <h2>5. Hardware-aligned: making sparsity actually fast</h2>
+    <p>
+      A recurring lesson in this field: a lower FLOP count on a slide does not mean a
+      faster model. NSA's headline speedups come from a Triton kernel co-designed with
+      the algorithm, in the same IO-aware spirit as
+      <a href="../flash_attention/index.html">FlashAttention</a> — but adapted for
+      sparse, grouped selection.
+    </p>
+    <pre class="code"><code>selection-attention kernel (per query position t):
+  # Group-centric load: all heads in a GQA group share the
+  # same selected KV blocks, so load them together.
+  load Q = queries of all h heads in the group at t  → SRAM
+  for each selected block index i in I_t:            # inner loop
+      load K_i, V_i  (contiguous block)              → SRAM
+      accumulate attention for every head in the group
+  write output for all heads
+  # query/output loop lives in Triton's grid scheduler</code></pre>
+    <p>
+      The insight is the GQA group. Naive sparse selection picks different keys per
+      head; in a GQA model that means the union of all heads' picks must be loaded
+      anyway, killing the memory savings during decoding. NSA forces every head in a
+      group to share the <em>same</em> selected blocks, so the cache load is small and
+      contiguous. Combined with putting the query loop on the grid (balanced because
+      every query selects the same number of blocks), this reaches near-optimal
+      arithmetic intensity — and turns the theoretical sparsity into the 9× / 6× /
+      11.6× wins below.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/kernel.png" alt="NSA kernel design: group-centric loading of sparse KV blocks"/>
+      <figcaption>The kernel (Figure 3). Queries are loaded by GQA group (grid loop); their shared sparse KV blocks are fetched contiguously (inner loop); attention runs on SRAM. Green = on-chip SRAM, blue = HBM.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>6. Results</h2>
+    <p>
+      NSA was pretrained from scratch as a 27B-parameter MoE model (3B active) on 270B
+      tokens — a genuinely native-sparse model, not a sparsified-after-the-fact one.
+      The striking result: the sparse model is not a lossy approximation of full
+      attention. It is <em>better</em>.
+    </p>
+    <table class="results">
+      <thead>
+        <tr><th>Benchmark</th><th>Metric</th><th>NSA</th><th>Full attention</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">General (avg of 9)</td>
+          <td>accuracy ↑</td>
+          <td class="win"><strong>0.456</strong></td>
+          <td>0.443</td>
+        </tr>
+        <tr>
+          <td class="cat">LongBench (avg)</td>
+          <td>score ↑</td>
+          <td class="win"><strong>0.469</strong></td>
+          <td>0.437</td>
+        </tr>
+        <tr>
+          <td class="cat">64k Needle-in-Haystack</td>
+          <td>retrieval ↑</td>
+          <td class="win"><strong>perfect</strong></td>
+          <td>perfect</td>
+        </tr>
+        <tr>
+          <td class="cat">AIME (after R1 distillation, 16k)</td>
+          <td>accuracy ↑</td>
+          <td class="win"><strong>0.146</strong></td>
+          <td>0.092</td>
+        </tr>
+        <tr>
+          <td rowspan="3" class="cat">Speed @ 64k</td>
+          <td>decode</td>
+          <td class="win"><strong>11.6×</strong></td>
+          <td>1×</td>
+        </tr>
+        <tr>
+          <td>forward (train/prefill)</td>
+          <td class="win"><strong>9.0×</strong></td>
+          <td>1×</td>
+        </tr>
+        <tr>
+          <td>backward (train)</td>
+          <td class="win"><strong>6.0×</strong></td>
+          <td>1×</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      From Tables 1–4 and Figures 5–6 of the paper. On LongBench, NSA beats every
+      sparse baseline too (Exact-Top 0.423, Quest 0.392, InfLLM 0.383, H2O 0.303).
+      Speedups grow with sequence length, so beyond 64k the gap widens further.
+    </p>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/niah.png" alt="Needle in a haystack: perfect retrieval"/>
+      <img src="assets/figures/train_speed.png" alt="Training speed vs context length"/>
+      <figcaption>Left: perfect needle-in-a-haystack retrieval across all positions at 64k — the compression branch scans globally, selection zooms in. Right: forward/backward training speedup growing with context length.</figcaption>
+    </figure>
+    <p>
+      Why would sparse <em>beat</em> dense? Two reasons. The selection acts as a
+      learned filter that removes distracting tokens — a form of inductive bias toward
+      the keys that matter, much like the retrieval heads found in pretrained models.
+      And because NSA is trained sparse from the start, the model's representations
+      adapt to the sparse pattern rather than fighting a mismatch imposed at inference
+      time.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="comparison">
+    <h2>7. Comparing the approaches</h2>
+    <p>
+      The families of sparse (and sub-quadratic) attention each make a different bet.
+      The table lays out the tradeoffs that actually decide which you reach for.
+    </p>
+    <table class="results">
+      <thead>
+        <tr><th>Approach</th><th>How it picks keys</th><th>Pros</th><th>Cons</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Full attention</td>
+          <td>all keys</td>
+          <td>exact; simplest; best quality per token at short context; FlashAttention makes it IO-optimal</td>
+          <td>$O(n^2)$ compute, $O(n)$ KV cache — the wall this whole post is about</td>
+        </tr>
+        <tr>
+          <td class="cat">Fixed patterns<br/><em>(Sparse Transformer, Longformer, BigBird)</em></td>
+          <td>hand-designed (local / strided / global)</td>
+          <td>simple, predictable, hardware-friendly; strong theory (BigBird is a universal approximator); linear in $n$</td>
+          <td>content-blind — can miss relevant far-away tokens; needs task-specific pattern tuning</td>
+        </tr>
+        <tr>
+          <td class="cat">Learned selection<br/><em>(Reformer, Routing Transformer)</em></td>
+          <td>hashing / clustering</td>
+          <td>content-aware; adapts pattern to data; sub-quadratic</td>
+          <td>selection (LSH, k-means) is often non-differentiable and scattered → hard to train, slow on GPU</td>
+        </tr>
+        <tr>
+          <td class="cat">KV-cache eviction<br/><em>(H2O, SnapKV, StreamingLLM)</em></td>
+          <td>drop low-scoring past tokens</td>
+          <td>shrinks the decode-time cache directly; drop-in at inference, no retraining</td>
+          <td>evicted tokens are gone forever (bad for retrieval); often needs costly prefill scoring; inference-only</td>
+        </tr>
+        <tr>
+          <td class="cat">Block selection<br/><em>(Quest, InfLLM)</em></td>
+          <td>score &amp; pick top blocks at inference</td>
+          <td>block-structured → hardware-friendly; keeps the full cache so nothing is lost</td>
+          <td>per-head selection breaks GQA savings; inference-only, so train/infer mismatch remains</td>
+        </tr>
+        <tr>
+          <td class="cat">Native sparse<br/><em>(NSA, MoBA)</em></td>
+          <td>learned blockwise, trained from scratch</td>
+          <td>fast in <em>all</em> stages; GQA-aware; fully trainable end-to-end; matches or beats full attention</td>
+          <td>more complex (three branches, custom kernel); must be designed in before pretraining, not bolted on</td>
+        </tr>
+        <tr>
+          <td class="cat">Linear / SSM alternatives<br/><em>(Mamba, linear attention)</em></td>
+          <td>no explicit attention matrix</td>
+          <td>truly $O(n)$, constant-size state, very fast decode</td>
+          <td>fixed-size state limits exact recall; weaker at precise long-range lookup than (sparse) attention</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      The arc of the table is the arc of the field. Fixed patterns traded quality for
+      simplicity; learned selection recovered quality but lost trainability and speed;
+      KV eviction and block selection made inference cheap but left a train/inference
+      gap; native sparse closes all of it at the cost of up-front architectural
+      commitment. Linear-attention and state-space models sit alongside as a more
+      radical bet — drop the attention matrix entirely — winning on speed but giving up
+      some of attention's exact recall.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why native sparsity wins</h2>
+    <h3>It wins in both cost regimes</h3>
+    <p>
+      Because compression and selection cut FLOPs (helping the compute-bound
+      training/prefill stage) <em>and</em> the blockwise, GQA-shared selection cuts
+      bytes moved (helping the memory-bound decode stage), NSA accelerates every phase.
+      Methods that only sparsify one stage leave the other at full cost — the
+      "illusion of efficient inference."
+    </p>
+    <h3>It is trainable, so the model adapts to the sparsity</h3>
+    <p>
+      Bolting sparsity onto a model pretrained dense forces it off its learned
+      trajectory; the top 20% of attention covers only ~70% of the mass, so pruning
+      damages structures like retrieval heads. Training sparse from scratch lets the
+      gates and the selection co-adapt with the rest of the network — which is why the
+      sparse model can come out <em>ahead</em>.
+    </p>
+    <h3>It respects the hardware</h3>
+    <p>
+      Blockwise, contiguous, group-shared memory access is what converts a smaller FLOP
+      count into a smaller wall-clock time. This is the same lesson as
+      <a href="../flash_attention/index.html">FlashAttention</a>: on modern GPUs the
+      algorithm and the memory hierarchy must be designed together, or the savings
+      evaporate.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottomline">
+    <h2>9. The bottom line</h2>
+    <p>
+      Sparse attention is the bet that you do not need to compare every token to every
+      other token — and a decade of evidence says the bet is sound, because softmax
+      attention is naturally sparse. The hard part was never finding sparsity; it was
+      finding sparsity that is <em>cheap to compute, friendly to the GPU, and
+      trainable end-to-end</em> all at once. Native Sparse Attention is the current
+      best answer: three branches (coarse compression, fine selection, local window),
+      gated together, run on a kernel built for the GQA memory hierarchy.
+    </p>
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Beyond 64k.</strong> The gains grow with length, but million-token
+        contexts stress even the compression branch; hierarchical compression is an
+        active direction.</li>
+      <li><strong>Sparsity vs. exact recall.</strong> Any selection can miss the one
+        token that mattered; bounding worst-case retrieval loss is unsolved.</li>
+      <li><strong>Native vs. retrofit.</strong> Native sparsity needs commitment
+        before pretraining. Cheaply converting existing dense models to native-quality
+        sparse ones is an open practical question.</li>
+      <li><strong>Sparse + linear hybrids.</strong> Combining block-sparse attention
+        with state-space backbones (Mamba-style) may capture both exact recall and
+        constant-state decoding.</li>
+    </ul>
+    <h3>The mental model to keep</h3>
+    <p>
+      Attention is a lookup over the past. Full attention reads the whole archive every
+      time; sparse attention learns to read the index first, pull only the relevant
+      folders, and keep the last few pages in hand. Do that in blocks the GPU can
+      stream, learn the index jointly with everything else, and you read a million
+      tokens for the price of a few thousand — without missing the ones that count.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Anchor paper: <a href="https://arxiv.org/abs/2502.11089" target="_blank" rel="noopener">arXiv:2502.11089</a>
+      &nbsp;·&nbsp; Related: <a href="../flash_attention/index.html">FlashAttention</a>
+    </p>
+    <p class="tiny">All paper figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

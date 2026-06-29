@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Feed the Beast: a GPU crash course for AI researchers</title>
+  <meta name="description" content="A crash course and roadmap for AI researchers who want to understand GPUs well enough to design better algorithms — throughput, the memory hierarchy, the roofline, and what to learn next."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">A crash course &amp; roadmap</p>
+    <h1>Feed the Beast: a GPU crash course for AI researchers</h1>
+    <p class="byline">
+      For the ML researcher who wants to design better algorithms &middot; no hardware background assumed &middot;
+      mental models · a roadmap · what to learn next, in what order, through what
+    </p>
+    <p class="lede">
+      You can train models for years and never need to know what a GPU <em>is</em>. But the moment you want to make
+      something <em>faster</em> — fuse a kernel, understand why FlashAttention is "free," design an algorithm that
+      actually flies — you hit a wall of words: warps, SMs, coalescing, occupancy, HBM. The good news: you do
+      <strong>not</strong> need to become a hardware engineer. You need about five mental models, and one master
+      idea — <em>the GPU's math is cheap; its bottleneck is moving data.</em> This post hands you those models, an
+      interactive feel for each, and a concrete path forward. The goal is <strong>momentum</strong>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">Why you (an AI person) should care</a></li>
+      <li><a href="#throughput">1. Throughput, not latency</a></li>
+      <li><a href="#hardware">2. The hardware, just enough</a></li>
+      <li><a href="#memory">3. The memory hierarchy</a></li>
+      <li><a href="#roofline">4. The compass: the roofline</a></li>
+      <li><a href="#levers">5. The four levers</a></li>
+      <li><a href="#flash">6. Worked example: FlashAttention</a></li>
+      <li><a href="#roadmap">7. The roadmap</a></li>
+      <li><a href="#intuitions">8. Insights to keep</a></li>
+      <li><a href="#bottom">The bottom line</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      Here is the situation you keep running into. You read that FlashAttention is "2–4× faster with the
+      <em>same</em> FLOPs," and it sounds like a contradiction — how is doing the same arithmetic faster? You
+      write a clean PyTorch model and it runs at 5% of the GPU's advertised TFLOPs, and you have no idea why. You
+      hear that a kernel is "memory-bound" and nod along without knowing what would change if it weren't.
+    </p>
+    <p>
+      All of these have the same root, and it is not arcane. A GPU is a machine with an almost comical imbalance:
+      it can do arithmetic far, far faster than it can fetch the numbers to do arithmetic <em>on</em>. Almost every
+      performance story in modern ML is a story about that imbalance. Once you internalize it, "memory-bound,"
+      "fusion," and "FlashAttention" stop being jargon and become obvious.
+    </p>
+    <p>
+      So this is not a hardware course. We will not count transistors. We will build the handful of mental models
+      that let an <em>algorithm designer</em> reason about a GPU — play with each one — and then lay out exactly
+      what to learn next and in what order. Let's start with the one idea everything else hangs from.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="throughput">
+    <h2>1. A GPU is a throughput machine, not a fast machine</h2>
+    <p>
+      A CPU and a GPU are built around opposite philosophies. A CPU is a <strong>latency</strong> machine: a few
+      very sophisticated cores, each engineered to finish <em>one</em> task as quickly as possible — deep pipelines,
+      branch prediction, big caches, out-of-order execution, all spent to minimize the time to a single answer.
+      Think of a sports car: one passenger, there in a flash.
+    </p>
+    <p>
+      A GPU is a <strong>throughput</strong> machine: thousands of simpler cores, none of them individually clever,
+      collectively doing an enormous amount of the <em>same</em> work per second. Any single operation might take
+      longer than on a CPU, but the total volume moved per second is staggering. Think of a fleet of buses: slow
+      per trip, but enormous people-per-hour.
+    </p>
+    <p>
+      The crucial trick is how a GPU deals with waiting. When one group of threads stalls waiting for data from
+      memory (which, as we'll see, is most of the time), the GPU doesn't sit idle — it instantly switches to
+      <em>another</em> group of threads that has work ready. With enough work in flight, the waiting is hidden
+      entirely behind useful computation. This is the whole game: a GPU is fast not because any part is fast, but
+      because it is <em>never idle</em> — as long as you give it enough to chew on.
+    </p>
+
+    <div class="widget-frame" id="lat-thru">
+      <p class="widget-title">Latency vs. throughput</p>
+      <p class="widget-sub">A batch of tasks runs on a few fast "CPU" lanes vs. many slow "GPU" lanes. The CPU finishes the <em>first</em> task sooner; the GPU finishes <em>all</em> of them sooner. Press run.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>The first reframe.</strong> "Is my code fast?" is the wrong question for a GPU. The right question is
+      <em>"am I keeping it busy?"</em> A GPU at 100% occupancy doing the wrong thing can still be slower than one at
+      40% doing the right thing — but a GPU you've left starving is the most common failure of all.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="hardware">
+    <h2>2. The hardware, just enough to be dangerous</h2>
+    <p>
+      You need a few nouns. Everything else can wait.
+    </p>
+    <p>
+      <strong>The SM (streaming multiprocessor).</strong> A GPU is a grid of these — an H100 has 132 of them. Each
+      SM is a little independent worker with its own arithmetic units, its own register file, and its own slice of
+      fast on-chip memory. When you launch work, the GPU sprays blocks of it across all the SMs. Your job, loosely,
+      is to keep all of them fed.
+    </p>
+    <p>
+      <strong>The warp (32 threads in lockstep).</strong> Threads on a GPU do not act individually. They march in
+      groups of <strong>32</strong> called a warp, and all 32 execute the <em>same instruction at the same time</em>,
+      just on different data. This is the <em>SIMT</em> model — Single Instruction, Multiple Threads. It is why GPUs
+      are so efficient at array math (everyone does <code>c[i] = a[i] + b[i]</code> together) and it has one sharp
+      consequence: if threads in a warp need to take <em>different</em> branches of an <code>if</code>, the warp
+      must execute <em>both</em> branches and mask off the threads that shouldn't run each one. Branch divergence is
+      a real cost. Try it:
+    </p>
+
+    <div class="widget-frame" id="simt">
+      <p class="widget-title">SIMT: a warp executes in lockstep</p>
+      <p class="widget-sub">32 threads run the same instruction together. Add a data-dependent branch and watch the warp <em>serialize</em> — it runs both sides, masking threads, so divergence costs you.</p>
+    </div>
+
+    <p>
+      <strong>The tensor core.</strong> Bolted onto each SM are specialized units that do one thing: small
+      matrix-multiply-and-accumulate, very fast, in low precision (BF16/FP8). Essentially all the FLOPs in modern
+      deep learning — every matmul in every attention and MLP layer — run on tensor cores. They are why an H100
+      quotes ~990 BF16 TFLOP/s: that number is a <em>tensor-core</em> number. The ordinary "CUDA cores" handle the
+      rest (the elementwise glue, the softmaxes, the reductions), and those are usually where time quietly leaks
+      away.
+    </p>
+    <p>
+      <strong>And how you actually launch work.</strong> You never address the 132 SMs by hand. You declare a
+      <em>grid</em> of <em>thread blocks</em>; the GPU schedules each block onto some SM, where its threads —
+      bundled into warps of 32 — share that SM's fast scratchpad and cooperate. <em>Grid → blocks → warps →
+      threads</em> is the hierarchy you actually program. Choosing the block size is your first tuning knob: too
+      small and there aren't enough warps resident to hide memory latency; too big and you run out of registers or
+      shared memory and the SM can't hold enough blocks at once. Most of "tuning a kernel" is finding the block
+      shape and tile size that keep both the math units and the memory system busy.
+    </p>
+    <aside class="callout">
+      <strong>Think in warps, not threads.</strong> When you reason about a GPU kernel, the unit is the warp of 32.
+      "How do 32 neighboring threads access memory together?" and "do they ever disagree on a branch?" are the two
+      questions that decide whether a kernel is good or terrible.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="memory">
+    <h2>3. The memory hierarchy — where the whole fight happens</h2>
+    <p>
+      Now the heart of it. The compute is fast; the problem is feeding it. A GPU has a steep hierarchy of memories,
+      and the difference between the top and the bottom is enormous — not just in size, but in how fast and how far
+      away each one is:
+    </p>
+    <ul>
+      <li><strong>Registers</strong> — per-thread, instantaneous (~1 cycle), but tiny.</li>
+      <li><strong>Shared memory / SRAM</strong> — per-SM scratchpad you control by hand, ~tens of cycles, ~up to 228&nbsp;KB per SM.</li>
+      <li><strong>L2 cache</strong> — shared across the chip, ~50&nbsp;MB, automatic.</li>
+      <li><strong>HBM (global memory)</strong> — the big pool, ~80&nbsp;GB at ~3.35&nbsp;TB/s, but <em>hundreds</em> of cycles away.</li>
+    </ul>
+    <p>
+      Read those last two lines together and the central tension jumps out. HBM bandwidth — 3.35 terabytes per
+      second — sounds astronomical. But the compute is hungrier. An H100 can do ~990 trillion BF16 operations per
+      second; to feed that at one byte per operation you'd need ~1000&nbsp;TB/s, and you have ~3.35. The arithmetic
+      units would starve, waiting hundreds of cycles for each trip to HBM. The fast memories (registers, SRAM) are
+      ~10–100× quicker — but small. So the entire craft of GPU programming is: <strong>get data into fast memory and
+      reuse it as much as possible before it has to go back.</strong> Feel the cliff:
+    </p>
+
+    <div class="widget-frame" id="mem-hier">
+      <p class="widget-title">The memory hierarchy</p>
+      <p class="widget-sub">Click a level to see its size, bandwidth, and latency — and watch a single value's round-trip time. The drop from SRAM to HBM is the cliff every fast kernel is built to avoid.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>Compute is free; memory is expensive.</strong> This inverts the instinct you brought from math and
+      CPUs, where you count operations. On a GPU, a fused multiply-add is essentially free, and the byte you fetched
+      to feed it is the expensive part. <em>Count bytes moved, not FLOPs.</em>
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="roofline">
+    <h2>4. The compass: the roofline and arithmetic intensity</h2>
+    <p>
+      Everything above becomes one quantitative tool — the single most useful thing on this page for someone who
+      wants to <em>design</em> algorithms. Watch the imbalance first, then we'll name it:
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/feed_the_beast.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      Feed the beast. When each byte from far-away HBM feeds only ~1 FLOP, the cores starve and utilization
+      collapses (memory-bound). Load a tile into nearby SRAM and reuse each byte for many FLOPs, and the cores stay
+      fed (compute-bound). The lever is <em>reuse</em>, not arithmetic.
+    </p>
+
+    <p>
+      Define a kernel's <strong>arithmetic intensity</strong> $I$ — how much math it does per byte it moves:
+    </p>
+    <p class="eq">$$ I \;=\; \frac{\text{FLOPs performed}}{\text{bytes moved to/from HBM}} \quad \left[\frac{\text{FLOP}}{\text{byte}}\right]. $$</p>
+    <p>
+      Now the performance you can actually achieve is whichever limit you hit first — the compute ceiling, or the
+      bandwidth you can sustain times your intensity:
+    </p>
+    <p class="eq">$$ \text{Performance} \;=\; \min\big(\,\underbrace{\pi}_{\text{peak FLOP/s}},\;\; \underbrace{I \times \beta}_{\text{intensity} \,\times\, \text{bandwidth}}\,\big). $$</p>
+    <p>
+      Plot that and you get the <strong>roofline</strong>: a slanted line (memory-bound, rising with intensity) that
+      bends into a flat line (compute-bound, capped at peak). The corner — the <em>ridge point</em> — sits at
+      $I^\star = \pi/\beta$. For an H100 that's about $990 / 3.35 \approx \mathbf{295}$ FLOP/byte: <em>you must do
+      roughly 300 operations on every byte you fetch just to stop being memory-bound.</em> A plain elementwise add
+      does about 0.1. A big matmul does hundreds. That gap is the whole story of which ML ops are slow. Find your op
+      on the roofline:
+    </p>
+
+    <div class="widget-frame" id="roofline">
+      <p class="widget-title">The roofline</p>
+      <p class="widget-sub">Drag arithmetic intensity, or click a real op (add, softmax, attention, GEMM). Left of the ridge you're <em>memory-bound</em> — the fix is moving less data. Right of it you're <em>compute-bound</em> — the fix is more/faster FLOPs.</p>
+    </div>
+
+    <p>
+      This is your compass. Before optimizing anything, ask: <em>which side of the ridge am I on?</em> Memory-bound
+      (almost all of ML's elementwise ops, normalizations, and attention)? Then chasing FLOPs is pointless — cut
+      data movement. Compute-bound (large matmuls)? Then feed the tensor cores better. The roofline tells you which
+      lever to pull before you waste a day pulling the wrong one.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="levers">
+    <h2>5. The four levers</h2>
+    <p>
+      Almost every GPU optimization you'll meet is one of four moves, and all four serve the roofline — either
+      moving less data, or keeping the machine busy.
+    </p>
+
+    <h3>① Coalesced memory access</h3>
+    <p>
+      When the 32 threads of a warp read memory, the hardware serves them in fixed-size transactions. If the threads
+      read <em>contiguous</em> addresses (thread $i$ reads element $i$), the whole warp is satisfied in one fat
+      transaction — <em>coalesced</em>. If they read scattered or strided addresses, it can take up to 32 separate
+      transactions for the same data. Same bytes, up to 32× the traffic. The fix is usually just laying out your
+      data so neighboring threads touch neighboring memory.
+    </p>
+
+    <h3>② Tiling (use the scratchpad)</h3>
+    <p>
+      This is how you raise arithmetic intensity on purpose. Instead of streaming data from HBM for every operation,
+      load a <em>tile</em> (a block) into shared memory once, then have the whole block of threads reuse it many
+      times before moving on. The classic tiled matmul does exactly this: each tile loaded from HBM is reused across
+      a whole strip of output, turning a memory-bound naïve loop into a compute-bound one.
+    </p>
+
+    <h3>③ Kernel fusion</h3>
+    <p>
+      Every separate GPU kernel reads its inputs from HBM and writes its outputs back. So a chain like
+      <code>y = relu(x @ w + b)</code> done as three kernels makes the data round-trip to HBM <em>three times</em>.
+      <strong>Fusing</strong> them into one kernel keeps the intermediates in registers/SRAM and touches HBM only
+      once — at the start and end. For memory-bound ops, fusion is often a near-free 2–3× win. See the bytes vanish:
+    </p>
+
+    <div class="widget-frame" id="fusion">
+      <p class="widget-title">Kernel fusion: stop round-tripping to HBM</p>
+      <p class="widget-sub">Run a chain of elementwise ops as separate kernels vs. one fused kernel. Each unfused stage pays a full read+write to HBM; fusion pays once. Watch the byte counter.</p>
+    </div>
+
+    <h3>④ Occupancy</h3>
+    <p>
+      Remember that the GPU hides memory latency by switching to other ready warps. <strong>Occupancy</strong> is how
+      many warps you have resident to switch among. Too few — because each thread hogs too many registers or too much
+      shared memory — and there's nothing to switch to, so the latency stops being hidden. Enough occupancy is
+      <em>necessary</em> to hide latency, though (a common trap) not <em>sufficient</em> for speed: a fully-occupied
+      kernel still loses if it's thrashing HBM.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="flash">
+    <h2>6. Worked example: why FlashAttention is "free"</h2>
+    <p>
+      Now the magic trick dissolves. Standard attention, for a sequence of length $N$, computes the scores
+      $S = QK^\top$ (an $N\times N$ matrix), softmaxes it, and multiplies by $V$. The naïve implementation
+      <em>materializes</em> that $N\times N$ matrix in HBM — writing $O(N^2)$ numbers out and reading them back to do
+      the softmax and the second matmul. For long sequences that is a colossal amount of memory traffic, and the
+      whole thing is brutally memory-bound. The FLOPs aren't the problem; the round-trips are.
+    </p>
+    <p>
+      FlashAttention changes the <em>algorithm</em> to respect the memory hierarchy. It never builds the full
+      $N\times N$ matrix. It tiles $Q$, $K$, $V$ into blocks, loads a block into SRAM, computes that block's partial
+      attention <em>there</em>, and accumulates the result using an <em>online softmax</em> — a running-normalizer
+      trick that lets you finish the softmax incrementally without ever seeing the whole row at once. The scores
+      live and die in SRAM; only the final output is written to HBM.
+    </p>
+    <p>
+      The payoff is exactly what the roofline predicts: <strong>identical FLOPs, a fraction of the HBM traffic</strong>
+      ($O(N^2)$ → roughly $O(N)$ memory), and as a bonus the $N\times N$ matrix never has to <em>fit</em> in memory at
+      all. That is the entire "2–4× faster with the same FLOPs" mystery — it was never about arithmetic. It was about
+      not walking to HBM and back for a matrix you didn't need to store. Every one of the four levers is in there:
+      tiling, fusion, coalesced blocks, and enough work to stay occupied.
+    </p>
+    <aside class="callout">
+      <strong>This is the template for "a better algorithm."</strong> FlashAttention isn't a new mathematical result —
+      it's the <em>same</em> attention, re-expressed so the data stays in fast memory. Most GPU-aware algorithm wins
+      look like this: find the HBM round-trips, and design them away.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="roadmap">
+    <h2>7. The roadmap — what to learn, in what order, through what</h2>
+    <p>
+      You now have the mental models. Here is how to turn them into skill, staged so each step pays off before the
+      next. Resist the urge to start at the bottom with CUDA C++ and pointer arithmetic — for an ML researcher, the
+      fastest momentum comes from writing a real kernel in <strong>Triton</strong> in an afternoon and seeing the
+      roofline move.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Stage</th><th>Goal</th><th>Do this</th><th>Through</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">0 · Models</td>
+          <td>The intuitions</td>
+          <td>Internalize throughput, the memory hierarchy, the roofline (this post)</td>
+          <td><em>you just did this</em></td>
+        </tr>
+        <tr>
+          <td class="cat">1 · First kernel</td>
+          <td>Write GPU code that runs</td>
+          <td>Vector add → fused softmax → tiled matmul, in Triton (Python-like, made for ML)</td>
+          <td><a href="https://triton-lang.org" target="_blank" rel="noopener">Triton tutorials</a>; <a href="https://github.com/srush/GPU-Puzzles" target="_blank" rel="noopener">Sasha Rush's GPU Puzzles</a></td>
+        </tr>
+        <tr>
+          <td class="cat">2 · Think in bytes</td>
+          <td>Profile; find the bound</td>
+          <td>Measure memory- vs compute-bound; read a profile; reason about HBM traffic</td>
+          <td>Horace He, <a href="https://horace.io/brrr_intro.html" target="_blank" rel="noopener">"Making Deep Learning Go Brrrr"</a>; PyTorch profiler / Nsight</td>
+        </tr>
+        <tr>
+          <td class="cat">3 · Foundations</td>
+          <td>Real parallel programming</td>
+          <td>The execution model, shared memory, tiling, from the ground up; one CUDA matmul by hand</td>
+          <td><em>PMPP</em> (Kirk, Hwu &amp; El&nbsp;Hajj); Simon Boehm, <a href="https://siboehm.com/articles/22/CUDA-MMM" target="_blank" rel="noopener">"How to Optimize a CUDA Matmul"</a></td>
+        </tr>
+        <tr>
+          <td class="cat">4 · ML systems</td>
+          <td>Read &amp; write real fused kernels</td>
+          <td>FlashAttention; study production kernels; join the community</td>
+          <td>FlashAttention (<a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv 2205.14135</a>); <a href="https://github.com/gpu-mode" target="_blank" rel="noopener">GPU MODE</a> lectures</td>
+        </tr>
+        <tr>
+          <td class="cat">5 · Frontier</td>
+          <td>Squeeze the hardware</td>
+          <td>Tensor-core programming, pipelining, warp specialization; then multi-GPU (NCCL, parallelism)</td>
+          <td><a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noopener">CUTLASS / CuTe</a>; vendor architecture guides</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      The order matters more than the speed. Each stage makes the next one legible: you can't appreciate CUTLASS
+      until you've felt a tiled matmul, and you can't feel tiling until you've watched the roofline move on something
+      you wrote yourself. Ship a Triton kernel before you open a textbook.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="intuitions">
+    <h2>8. Insights to keep in your pocket</h2>
+    <p>
+      The mental models, compressed to the lines worth memorizing:
+    </p>
+    <ul>
+      <li><strong>Compute is free; memory is expensive.</strong> Count bytes moved, not FLOPs.</li>
+      <li><strong>The GPU is always waiting on memory.</strong> Performance is the art of hiding the wait — with reuse and with enough work in flight.</li>
+      <li><strong>Think in warps of 32.</strong> Neighboring threads should read neighboring memory and agree on their branches.</li>
+      <li><strong>Most ML ops are memory-bound.</strong> So fusion and tiling — not cleverer arithmetic — are usually the win.</li>
+      <li><strong>Every HBM round-trip is a tax.</strong> Fuse to pay it once. FlashAttention is this idea taken seriously.</li>
+      <li><strong>The roofline is your compass.</strong> Know which side of the ridge you're on <em>before</em> you optimize.</li>
+      <li><strong>Occupancy is necessary, not sufficient.</strong> A busy GPU doing wasteful memory traffic is still slow.</li>
+    </ul>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottom">
+    <h2>The bottom line</h2>
+    <p>
+      You do not need to design hardware to design better algorithms on it. You need to think about <em>data
+      movement</em>. The entire modern toolkit of efficient ML — fused kernels, FlashAttention, paged attention,
+      quantization, all of it — is people who internalized a single sentence: <em>keep the beast fed.</em> The math
+      is cheap; the bytes are dear; the art is reuse.
+    </p>
+    <p>
+      That's the glimpse and the path. The momentum comes from doing: open Triton this week, write a vector add, then
+      a fused softmax, and profile it until you can say out loud whether it's memory-bound or compute-bound. The
+      first time you watch a number you wrote move along the roofline, the rest of this roadmap will stop looking
+      like a wall and start looking like a staircase.
+    </p>
+  </section>
+
+  <footer>
+    <p>A crash course for AI researchers — mental models, interactive intuitions, and a roadmap. Build something this week.</p>
+    <p class="tiny">Hardware figures are approximate, H100-class; the current generation pushes them further, but the ratios — and the lessons — hold.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

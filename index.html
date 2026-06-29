@@ -354,35 +354,47 @@
   })();
 
   // ----- render -----
-  const state = { query: '', tag: null };
+  // Broad categories for the filter bar. Keep in sync with `category` in blogs.js.
+  const CATEGORIES = [
+    "Diffusion & Generative",
+    "Attention & Sequence Models",
+    "Energy & Reasoning",
+    "3D, Vision & World Models",
+    "Embodiment & Interaction",
+    "Fundamentals & Theory",
+  ];
+  const state = { query: '', category: null };
 
   function pad(n) { return String(n).padStart(2, '0'); }
   function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
 
-  function renderTags() {
-    const tags = [...new Set(BLOGS.map(b => b.tag))].sort();
+  function renderCategories() {
+    const present = new Set(BLOGS.map(b => b.category));
+    const cats = CATEGORIES.filter(c => present.has(c));
+    // surface any category in the data that isn't in the canonical list (defensive)
+    [...present].sort().forEach(c => { if (!cats.includes(c)) cats.push(c); });
     const host = document.getElementById('tags');
     host.innerHTML = '';
     const mkChip = (label, value) => {
       const el = document.createElement('span');
-      el.className = 'tag-chip' + (state.tag === value ? ' active' : '');
+      el.className = 'tag-chip' + (state.category === value ? ' active' : '');
       el.textContent = label;
       el.addEventListener('click', () => {
-        state.tag = state.tag === value ? null : value;
-        renderTags();
+        state.category = state.category === value ? null : value;
+        renderCategories();
         renderCards();
       });
       return el;
     };
     host.appendChild(mkChip('all', null));
-    tags.forEach(t => host.appendChild(mkChip(t, t)));
+    cats.forEach(c => host.appendChild(mkChip(c, c)));
   }
 
   function matches(blog) {
-    if (state.tag && blog.tag !== state.tag) return false;
+    if (state.category && blog.category !== state.category) return false;
     if (!state.query) return true;
     const q = state.query.toLowerCase();
-    const hay = [blog.title, blog.tag, blog.authors, blog.venue, blog.date, blog.paper, blog.blurb]
+    const hay = [blog.title, blog.category, blog.tag, blog.authors, blog.venue, blog.date, blog.paper, blog.blurb]
       .join(' ').toLowerCase();
     return hay.includes(q);
   }
@@ -438,7 +450,7 @@
     }
   });
 
-  renderTags();
+  renderCategories();
   renderCards();
 </script>
 </body>

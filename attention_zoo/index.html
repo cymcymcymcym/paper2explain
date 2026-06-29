@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Attention Zoo — every escape from the quadratic curse</title>
+  <meta name="description" content="A field guide to efficient sequence mixing: sparse, low-rank, linear/kernel attention, state-space models (Mamba), linear RNNs (RWKV, RetNet), hardware/distributed (FlashAttention, Ring), and hybrids — with honest pros, cons, and real adoption."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vQ': '{\\mathbf{Q}}', '\\vK': '{\\mathbf{K}}', '\\vV': '{\\mathbf{V}}',
+        '\\vx': '{\\mathbf{x}}', '\\vh': '{\\mathbf{h}}', '\\softmax': '\\mathrm{softmax}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive field guide</p>
+    <h1>The Attention Zoo: every escape from the quadratic curse</h1>
+    <p class="byline">
+      A survey explainer &middot; sparse · low-rank · linear · state-space · linear-RNN · distributed · hybrid &middot;
+      2019 → 2025
+    </p>
+    <p class="lede">
+      Standard attention compares every token to every other token: $O(n^2)$ time and
+      an $O(n)$ memory cache that grows with context. For six years the field has thrown
+      everything at that wall — skip most of the comparisons, factorize the matrix,
+      swap softmax for a kernel, or abandon attention for a recurrent state entirely.
+      3Blue1Brown's recent video flashed a list of names —
+      <em>Sparse, Blockwise, Linformer, Reformer, Ring, Longformer, Adaptive Span</em> —
+      and that is only the opening. This guide organizes the whole zoo into
+      <strong>six families</strong>, gives a quick tutorial on each, walks the
+      state-space revival (Mamba, RWKV, RetNet) and the newest work from Chinese labs
+      (DeepSeek's NSA, Kimi's MoBA, MiniMax's lightning attention), and then asks the
+      question the hype usually skips: <strong>which of these are actually used in
+      production today — and which quietly didn't pan out?</strong>
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The quadratic curse</a></li>
+      <li><a href="#map">The map: six families of escape</a></li>
+      <li><a href="#sparse">1 · Sparse attention</a></li>
+      <li><a href="#lowrank">2 · Low-rank &amp; linear/kernel attention</a></li>
+      <li><a href="#ssm">3 · Recurrence reborn: SSMs &amp; linear RNNs</a></li>
+      <li><a href="#hardware">4 · Hardware &amp; distributed</a></li>
+      <li><a href="#newwave">5 · The new wave (and the Chinese labs)</a></li>
+      <li><a href="#compare">Comparing the families</a></li>
+      <li><a href="#adoption">How useful, really? Adoption in 2025</a></li>
+      <li><a href="#bottomline">The bottom line</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      Recall the core operation. For queries $\vQ$, keys $\vK$, values $\vV$ (each
+      $n \times d$), attention is:
+    </p>
+    <p class="eq">$$ \mathrm{Attn}(\vQ,\vK,\vV) = \softmax\!\Big(\tfrac{\vQ\vK^\top}{\sqrt{d}}\Big)\vV $$</p>
+    <p>
+      The trouble is $\vQ\vK^\top$: an $n \times n$ matrix. Every one of the $n$ queries
+      scores against all $n$ keys, so compute is $O(n^2 d)$ and the attention matrix
+      itself is $O(n^2)$ memory. Double the context and the cost quadruples. At
+      inference there is a second tax: autoregressive decoding re-reads the entire
+      key-value cache every step, and that cache grows linearly with the sequence —
+      a memory-bandwidth bottleneck, not a compute one.
+    </p>
+    <p>
+      Every method in this guide attacks one or both of those costs, and they fall into
+      a surprisingly small number of strategies. The animation below is the whole
+      taxonomy in one frame: start from the dense matrix, then watch the four
+      mathematical escape routes — <em>skip</em> cells (sparse), <em>factorize</em> the
+      matrix (low-rank), <em>reorder</em> the products (linear/kernel), or
+      <em>collapse</em> the past into a fixed-size state (recurrence). A fifth and
+      sixth family don't change the asymptotics at all — they change how the work maps
+      onto hardware, or they mix several escapes together.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/escapes.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The four mathematical escapes from $O(n^2)$. Sparse attention skips most cells;
+      low-rank factorizes the matrix into thin factors; linear/kernel attention reorders
+      $\vQ(\vK^\top\vV)$ to avoid ever forming the $n\times n$ matrix; recurrent/SSM
+      models compress the past into a constant-size state.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="map">
+    <h2>The map: six families of escape</h2>
+    <p>
+      Before the details, here is the organizing scheme. Almost every "efficient
+      attention" or "attention alternative" you will ever read about lands in one of
+      these six buckets — and the most successful modern systems combine two or three.
+      Explore the families in the widget; click any method for a one-paragraph
+      tutorial.
+    </p>
+    <div class="widget-frame" id="taxonomy">
+      <p class="widget-title">Widget 1 · The taxonomy of efficient sequence mixing</p>
+      <p class="widget-sub">Pick a family to see its members. Click a method card to expand its tutorial. The families are ordered roughly from "still attention" to "no longer attention."</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="sparse">
+    <h2>1 · Sparse attention — skip most of the cells</h2>
+    <p>
+      The softmax attention matrix is overwhelmingly sparse in practice: a few keys
+      hold almost all the weight. So compute only the cells that matter.
+      <strong>Fixed patterns</strong> hard-wire which cells: sliding windows (local),
+      strided/dilated reach, and a handful of global tokens. The 3b1b list's
+      <em>Longformer</em> (window + global), <em>Blockwise Attention</em>, and
+      <em>Adaptive Attention Span</em> (each head learns how far back to look) live
+      here, alongside Sparse Transformers and BigBird. <strong>Learned patterns</strong>
+      pick cells from the data — <em>Reformer</em> hashes similar queries and keys into
+      buckets (LSH). And the modern <strong>native-sparse</strong> methods (DeepSeek's
+      NSA, Kimi's MoBA) make blockwise selection trainable end-to-end and aligned to
+      the GPU.
+    </p>
+    <p>
+      Sparse attention keeps the exact attention machinery, just on a subset — so it
+      preserves attention's precise recall, which is its big advantage over the more
+      radical families below. The cost is the bookkeeping of <em>which</em> cells to
+      keep, and making that bookkeeping hardware-friendly.
+    </p>
+    <aside class="callout">
+      <strong>Go deeper.</strong> This family has its own full post:
+      <a href="../sparse_attention/index.html">Sparse attention — how to read a million
+      tokens without reading them all</a>, which builds NSA's three-branch design
+      (compression + selection + sliding window) in detail.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="lowrank">
+    <h2>2 · Low-rank &amp; linear/kernel attention — never form the matrix</h2>
+    <p>
+      A different observation: the $n \times n$ attention matrix is often approximately
+      <em>low-rank</em>. <strong>Linformer</strong> exploits this directly — it projects
+      the keys and values down from length $n$ to a small fixed length $k$ with learned
+      projections, so the matrix is $n \times k$ and cost is $O(nk) \approx O(n)$.
+      Simple and fast, but the fixed projection assumes a maximum sequence length and is
+      awkward for autoregressive (causal) decoding.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/linformer_model.png" alt="Linformer low-rank projection architecture"/>
+      <figcaption>Linformer (Wang et al., 2020) projects keys and values to a low fixed dimension $k$ before attention, turning the $n\times n$ matrix into $n\times k$ — linear in sequence length.</figcaption>
+    </figure>
+    <p>
+      <strong>Kernel / linear attention</strong> is the more general idea, and the most
+      elegant trick in the zoo. Softmax forces you to compute $\vQ\vK^\top$ first. But
+      if you replace the softmax similarity with a kernel feature map $\phi$, so that
+      $\mathrm{sim}(\vq,\vk) = \phi(\vq)^\top\phi(\vk)$, then attention becomes a plain
+      product — and matrix multiplication is <em>associative</em>:
+    </p>
+    <p class="eq">$$ \underbrace{\big(\phi(\vQ)\,\phi(\vK)^\top\big)\vV}_{O(n^2 d)} \;=\; \underbrace{\phi(\vQ)\,\big(\phi(\vK)^\top\vV\big)}_{O(n d^2)} $$</p>
+    <p>
+      Compute $\phi(\vK)^\top\vV$ first — a $d \times d$ matrix — and the $n^2$ term
+      vanishes. <em>Performer</em> picks $\phi$ as random features that provably
+      approximate softmax (FAVOR+); the original <em>Linear Transformers</em> use a
+      simple feature map and, crucially, observe that this form is a
+      <strong>recurrence</strong>: the $d\times d$ state $\phi(\vK)^\top\vV$ can be
+      updated one token at a time, giving $O(1)$-memory decoding. That observation is
+      the bridge to the next family. The catch: a $d\times d$ state is a fixed-size
+      summary of the entire past, so linear attention trades exact recall for speed —
+      it can forget specific tokens that a full attention lookup would have found.
+    </p>
+    <div class="widget-frame" id="reorder">
+      <p class="widget-title">Widget 2 · The associativity trick</p>
+      <p class="widget-sub">The single idea behind linear attention. Toggle the multiplication order and watch the cost: forming $\vQ\vK^\top$ first scales as $n^2$; multiplying $\vK^\top\vV$ first scales as $n$. Slide the sequence length to see the gap explode.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="ssm">
+    <h2>3 · Recurrence reborn — state-space models &amp; linear RNNs</h2>
+    <p>
+      If a fixed-size state can summarize the past (as linear attention showed), why not
+      design that recurrence directly? This is the most exciting line of the last two
+      years: a revival of RNNs that fixes their two historical flaws — they were slow to
+      train (inherently sequential) and forgot long-range information.
+    </p>
+    <h3>State-space models: S4 → Mamba</h3>
+    <p>
+      A state-space model evolves a hidden state $\vh_t$ through a linear recurrence and
+      reads out an output:
+    </p>
+    <p class="eq">$$ \vh_t = \mathbf{A}\,\vh_{t-1} + \mathbf{B}\,\vx_t, \qquad y_t = \mathbf{C}\,\vh_t $$</p>
+    <p>
+      Because the recurrence is <em>linear</em>, it can be unrolled as a global
+      convolution and trained in parallel across the whole sequence (S4's trick) — fast
+      like a Transformer — yet run as a constant-state recurrence at inference — cheap
+      like an RNN. <strong>Mamba</strong> (Gu &amp; Dao, 2023) made the SSM parameters
+      <em>input-dependent</em> (the "selective" S6 mechanism), so the model can choose
+      what to remember and what to ignore based on content — the thing fixed SSMs
+      couldn't do — and paired it with a hardware-aware parallel scan. The result
+      matches or beats Transformers of the same size on language, with $O(n)$ training
+      and $O(1)$-per-token generation.
+    </p>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/mamba_selection.png" alt="Mamba selective state space mechanism"/>
+      <img src="assets/figures/mamba_scan.png" alt="Mamba hardware-aware parallel scan"/>
+      <figcaption>Mamba (Gu &amp; Dao, 2023). Left: the selective SSM block with input-dependent parameters. Right: the hardware-aware selective scan that keeps the state in fast SRAM. Mamba-2 (2024) later showed SSMs and attention are two views of the same "structured" operation.</figcaption>
+    </figure>
+    <h3>Linear RNNs: RWKV and RetNet</h3>
+    <p>
+      <strong>RWKV</strong> ("Reinventing RNNs for the Transformer Era," Bo Peng and an
+      open community, 2023) reaches the same destination from the RNN side: a
+      time-mixing "WKV" operator that behaves like a continuously-decaying attention but
+      can be written as a recurrence, so it trains in parallel like a Transformer and
+      runs with constant memory like an RNN. It has iterated rapidly through versions 4,
+      5/6 (Eagle/Finch), and 7 (Goose), is fully open, strongly multilingual, and
+      popular for edge and embedded deployment. <strong>RetNet</strong> (Microsoft,
+      2023) offers a "retention" mechanism with three equivalent forms — parallel for
+      training, recurrent for decoding, and chunkwise for long sequences — chasing the
+      same "train parallel, infer recurrent" sweet spot.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/rwkv_arch.png" alt="RWKV architecture"/>
+      <figcaption>RWKV's block: time-mixing and channel-mixing modules that give RNN-style constant-memory inference with Transformer-style parallel training.</figcaption>
+    </figure>
+    <p>
+      All three share one bet and one risk. The bet: a well-designed fixed-size state is
+      enough for most of what language needs, and constant-memory decoding is worth a
+      lot. The risk: a fixed state fundamentally cannot store arbitrary detail, so these
+      models are weaker at tasks needing <em>exact</em> recall from deep in the context
+      (copying, precise retrieval) — exactly where attention shines. Which is why the
+      winning systems increasingly <em>combine</em> them.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="hardware">
+    <h2>4 · Hardware &amp; distributed — same math, better mapping</h2>
+    <p>
+      Not every escape changes the big-O. Some keep exact attention and just run it
+      dramatically better on real machines — and these are, in practice, the most
+      universally adopted of all.
+    </p>
+    <p>
+      <strong>FlashAttention</strong> computes exact attention without ever
+      materializing the $n\times n$ matrix, by tiling the computation to keep blocks in
+      fast on-chip SRAM. It doesn't reduce FLOPs; it removes the memory bottleneck, and
+      it is now the default in essentially every Transformer. <em>Blockwise Attention</em>
+      (from the 3b1b list) is the same tiling principle. <strong>Ring Attention</strong>
+      goes distributed: split a very long sequence across many GPUs arranged in a ring,
+      and pass key-value blocks around the ring while overlapping communication with
+      computation — letting context length scale with the number of devices, toward
+      millions of tokens. These don't beat the curse so much as <em>pay it across more
+      hardware</em>, which is how frontier labs reach giant context windows.
+    </p>
+    <aside class="callout">
+      <strong>Go deeper.</strong> The IO-aware idea has its own post:
+      <a href="../flash_attention/index.html">FlashAttention — fast, exact attention by
+      knowing your GPU</a>. It is the foundation the block-sparse and many linear kernels
+      build on.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="newwave">
+    <h2>5 · The new wave — and the Chinese labs</h2>
+    <p>
+      The 2024–2025 frontier is defined less by a single new mechanism than by
+      <strong>hybrids</strong> and by making efficient attention work
+      <em>at production scale</em> — much of it from Chinese labs pushing long context
+      hard.
+    </p>
+    <ul>
+      <li><strong>DeepSeek — NSA (Native Sparse Attention).</strong> Trainable blockwise
+        sparse attention (compression + selection + sliding window), hardware-aligned to
+        GQA, 11.6× faster decode at 64k and beating full attention on quality. The most
+        convincing recent evidence that sparse-from-scratch works. See the
+        <a href="../sparse_attention/index.html">dedicated post</a>.</li>
+      <li><strong>Moonshot / Kimi — MoBA (Mixture of Block Attention).</strong> Routes
+        each query to a few key blocks with an MoE-style top-k gate, switching between
+        full and sparse seamlessly. Deployed in the Kimi long-context assistant —
+        sparse attention in a real product.</li>
+      <li><strong>MiniMax — lightning attention (MiniMax-01).</strong> A linear-attention
+        variant scaled to a 456B-parameter MoE with a 4-million-token context, hybridized
+        with periodic full-attention layers. The boldest bet that linear attention can
+        anchor a frontier model — by not going all-in on it.</li>
+      <li><strong>RWKV.</strong> Community/open, with strong Chinese-language support and
+        an active foundation; the leading pure-recurrent open alternative.</li>
+      <li><strong>Hybrids elsewhere.</strong> AI21's <em>Jamba</em> interleaves Mamba,
+        attention, and MoE; DeepMind's <em>Griffin/Hawk</em> mixes gated linear
+        recurrence with local attention; NVIDIA, Codestral Mamba, Zamba, and Samba all
+        ship Mamba-attention hybrids. The pattern is consistent: a few full-attention
+        layers for exact recall, cheap recurrence or sparsity for the rest.</li>
+    </ul>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="compare">
+    <h2>Comparing the families</h2>
+    <p>
+      Each family makes a different trade among five things you actually care about:
+      training cost, decoding memory, parallelism, <em>recall</em> (can it find an exact
+      token deep in the context?), and engineering complexity. The widget lets you sort
+      and compare; the table spells out the headline pros and cons.
+    </p>
+    <div class="widget-frame" id="comparator">
+      <p class="widget-title">Widget 3 · Compare the families</p>
+      <p class="widget-sub">Each bar is a qualitative score (higher = better). Sort by any dimension. Notice the recurring tension: the families that win on speed and decode-memory tend to lose on exact recall — which is why attention refuses to die.</p>
+    </div>
+
+    <table class="results">
+      <thead>
+        <tr><th>Family</th><th>Key idea</th><th>Pros</th><th>Cons</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Full attention<br/>(+ FlashAttention)</td>
+          <td>compare all pairs, exactly</td>
+          <td>best quality &amp; exact recall; simple; FlashAttention makes it IO-optimal; universal tooling</td>
+          <td>$O(n^2)$ compute, $O(n)$ KV cache — the wall</td>
+        </tr>
+        <tr>
+          <td class="cat">Sparse</td>
+          <td>skip most cells</td>
+          <td>keeps exact attention on a subset → strong recall; native versions match full attention</td>
+          <td>selection bookkeeping; must be block/GPU-friendly to pay off; best when trained in</td>
+        </tr>
+        <tr>
+          <td class="cat">Low-rank / linear</td>
+          <td>factorize or reorder products</td>
+          <td>true $O(n)$; constant-state decode; elegant</td>
+          <td>fixed-size state → weak exact recall; softmax is hard to approximate well</td>
+        </tr>
+        <tr>
+          <td class="cat">SSM / linear-RNN<br/>(Mamba, RWKV, RetNet)</td>
+          <td>learned recurrent state</td>
+          <td>$O(n)$ train (parallel scan), $O(1)$ decode; excellent on long, smooth signals; tiny KV</td>
+          <td>fixed state limits precise long-range lookup; newer tooling; weaker in-context copying</td>
+        </tr>
+        <tr>
+          <td class="cat">Hardware / distributed<br/>(Flash, Ring, Blockwise)</td>
+          <td>same math, better IO</td>
+          <td>exact; huge real speedups; Ring scales context with devices</td>
+          <td>doesn't change asymptotics; Ring needs many GPUs &amp; fast interconnect</td>
+        </tr>
+        <tr>
+          <td class="cat">Hybrid<br/>(Jamba, MiniMax-01, Griffin)</td>
+          <td>mix attention + recurrence/sparse</td>
+          <td>recall of attention + cheap bulk from recurrence/sparsity; best practical long-context</td>
+          <td>more moving parts; ratios need tuning; harder to reason about</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="adoption">
+    <h2>How useful, really? Adoption in 2025</h2>
+    <p>
+      Here is the honest part the survey lists usually skip. Despite hundreds of papers,
+      the frontier of <em>general-purpose</em> LLMs — GPT, Claude, Gemini, Llama, Qwen,
+      DeepSeek-V3 — still runs on <strong>full attention</strong>, made practical by
+      FlashAttention, grouped-query attention, and RoPE-based context extension. The
+      exotic alternatives have mostly <em>not</em> displaced it head-on. But that flat
+      summary hides a more interesting reality, which the widget below visualizes:
+      research interest and production deployment are very different rankings.
+    </p>
+    <div class="widget-frame" id="adoption-bars">
+      <p class="widget-title">Widget 4 · Hype vs. real deployment</p>
+      <p class="widget-sub">Toggle between research attention (papers, citations, buzz) and actual production use in shipped models. The reorder is the whole story: what's studied isn't always what ships.</p>
+    </div>
+    <p>
+      Reading the landscape honestly:
+    </p>
+    <ul>
+      <li><strong>Universally adopted:</strong> FlashAttention and GQA. Nearly every
+        modern Transformer uses them. Not a way to escape $O(n^2)$ — a way to survive it.</li>
+      <li><strong>Real and growing:</strong> native sparse attention (NSA in DeepSeek,
+        MoBA in Kimi) for long context, and Mamba-attention <em>hybrids</em> (Jamba,
+        MiniMax-01, NVIDIA/Codestral) where a few attention layers keep recall while
+        recurrence carries the bulk. This is where the alternatives are actually
+        shipping.</li>
+      <li><strong>Strong in niches:</strong> pure SSMs/Mamba in genomics, audio, and
+        on-device; RWKV in open and edge deployments. Real users, not frontier-scale
+        chat.</li>
+      <li><strong>Mostly historical:</strong> Linformer, Performer, Reformer, and the
+        2020-era fixed-pattern encoders. Hugely influential as ideas, little direct use
+        in today's frontier models — the long-context problem moved to decoders, where
+        their assumptions (non-causal, fixed length) don't fit.</li>
+    </ul>
+    <p>
+      The throughline: <strong>nothing has killed attention.</strong> What works is
+      keeping attention for the exact-recall it uniquely provides, and offloading the
+      cheap bulk to sparsity or recurrence — plus relentless hardware co-design. The
+      "attention alternative" framing turned out to be less accurate than "attention
+      <em>budget</em> management."
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottomline">
+    <h2>The bottom line</h2>
+    <p>
+      The quadratic curse has exactly four mathematical escapes — skip, factorize,
+      reorder, or recur — plus two engineering moves: map it better onto hardware, or
+      mix several escapes. Everything from Longformer to Mamba to NSA is one of those
+      six ideas, dressed for a particular regime. The decade-long experiment has a
+      clear verdict so far: the radical replacements (pure linear, pure SSM) are
+      brilliant and useful but give up the exact recall that makes attention special,
+      so the production winners are <em>hybrids and hardware-aware exact/sparse
+      attention</em>, not wholesale replacements.
+    </p>
+    <h3>Open questions</h3>
+    <ul>
+      <li><strong>The recall gap.</strong> Can a fixed-size state ever match attention's
+        precise long-range lookup, or is some attention always necessary?</li>
+      <li><strong>The right hybrid ratio.</strong> How many attention layers, where, and
+        how much sparsity — currently tuned by hand.</li>
+      <li><strong>Training-native everything.</strong> NSA showed sparse-from-scratch
+        beats bolt-on. The same likely holds for hybrids; co-designing the whole stack
+        is open.</li>
+      <li><strong>Beyond a million tokens.</strong> Ring attention scales with hardware;
+        sparse and recurrent scale with cleverness. The cheapest path to 10M+ context is
+        unsettled.</li>
+    </ul>
+    <h3>The mental model to keep</h3>
+    <p>
+      Attention is an exact lookup over the whole past; it is expensive precisely
+      because it is exact and complete. Every alternative is a bet that you don't need
+      all of that all the time — so spend the full lookup only where recall matters, and
+      use a cheaper approximation (a sparse subset, a low-rank sketch, or a running
+      state) everywhere else. Seen that way, the zoo isn't a list of rival species. It's
+      a menu of how much to pay for memory — and the best systems order from several
+      dishes at once.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Companion posts:
+      <a href="../sparse_attention/index.html">Sparse attention</a> &nbsp;·&nbsp;
+      <a href="../flash_attention/index.html">FlashAttention</a>
+    </p>
+    <p class="tiny">All paper figures © the original authors (Mamba: Gu &amp; Dao; RWKV: Peng et al.; Linformer: Wang et al.), used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>
