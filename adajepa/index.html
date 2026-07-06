@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AdaJEPA: An Adaptive Latent World Model — an interactive explainer</title>
+  <meta name="description" content="An interactive explainer of AdaJEPA (Wang, Bounou, LeCun, Ren, 2026): test-time adaptation of a frozen JEPA world model, one gradient step at a time, inside the MPC replanning loop."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vz': '{\\mathbf{z}}', '\\vo': '{\\mathbf{o}}', '\\va': '{\\mathbf{a}}', '\\vu': '{\\mathbf{u}}',
+        '\\gL': '{\\mathcal{L}}', '\\gB': '{\\mathcal{B}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>AdaJEPA: An Adaptive Latent World Model</h1>
+    <p class="byline">
+      Wang, Bounou, LeCun, Ren &middot; NYU / LeCun's group &middot; June 2026 &middot;
+      <a href="https://arxiv.org/abs/2606.32026" target="_blank" rel="noopener">arXiv 2606.32026</a>
+    </p>
+    <p class="lede">
+      Every JEPA world model in this family — LeCun's original proposal, LeWorldModel, SkyJEPA — shares one quiet
+      assumption: once training ends, the model is <em>done</em>. Frozen. Whatever it learned about the world is
+      whatever it will ever know, and if the real world drifts away from its training distribution mid-deployment,
+      it has no way to notice. AdaJEPA removes that assumption with something almost too simple to be the whole
+      story: after every single action the robot takes, do <strong>one gradient step</strong> on the transition
+      that just happened, using the exact same self-supervised loss the model was pretrained with. On unseen
+      object shapes, that one extra step very nearly <strong>doubles</strong> the success rate — and on a
+      constrained data budget, a model adapted on 1,000 trajectories beats a frozen model trained on
+      <strong>16× more data</strong>.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#frozen-problem">Why frozen world models fail quietly</a></li>
+      <li><a href="#mechanism">The trick: one gradient step, in the replanning loop</a></li>
+      <li><a href="#which-params">Which parameters, and how much it costs</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/main_loop.png" alt="The plan-execute-adapt closed loop diagram"/>
+      <img src="assets/figures/main_plan.png" alt="The encoder-predictor-cost planning diagram"/>
+      <figcaption>AdaJEPA's core loop (left) and its planning stack (right): a standard JEPA world model —
+      encoder, predictor, latent goal cost — but with a replay buffer and an adaptation step wired directly into
+      the control loop.</figcaption>
+    </figure>
+    <p>
+      Model-predictive control with a learned world model is normally a one-way pipeline: pretrain a model
+      offline, freeze it, then use it to plan forever. That pipeline has a structural blind spot. The model was
+      trained on some distribution of shapes, layouts, lighting, or dynamics — and the exact reason you're
+      deploying a world model instead of a hand-coded physics engine is that you can't enumerate every situation
+      it will encounter in advance. When reality drifts from training, a frozen model doesn't fail loudly; its
+      predictions just get quietly less accurate, degrading whatever plan is built on top of them.
+    </p>
+    <p>
+      AdaJEPA's answer isn't a bigger model, more training data, or a separate fine-tuning phase — it's cheaper
+      than all three: keep training, forever, one real transition and one gradient step at a time, threaded
+      through the exact loop the robot is already running.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="frozen-problem">
+    <h2>1. Why frozen world models fail quietly</h2>
+    <p>
+      AdaJEPA's related-work section names the entire family this fixes: LeCun's 2022 proposal, V-JEPA2, DINO-WM,
+      Wang et al.'s temporal-straightening world models, LeWorldModel, and hierarchical-planning variants — every
+      one of them, the paper notes, is "kept frozen at test time, leading to potential performance degradation
+      under test-time distribution shift." The nearest prior attempt (Parthasarathy et al., 2025) tries to close
+      the train-test gap by synthesizing more diverse data <em>during training</em> — but the resulting model is
+      still frozen once deployed, and still only evaluated in-distribution. AdaJEPA claims to be the first to
+      adapt a JEPA world model <em>during planning itself</em>.
+    </p>
+    <p>
+      The failure mode is visible directly in the paper's own success-rate curves: on shapes the model never saw
+      during training, a frozen model's performance climbs for a few replanning steps, then flatlines early — it
+      simply runs out of useful signal, because everything it knows is already baked in. The widget below plots
+      this shape, endpoints taken from the paper's own reported numbers, next to what happens when the model
+      keeps learning.
+    </p>
+    <div class="widget-frame" id="frozen-vs-adaptive">
+      <p class="widget-title">Frozen vs. adaptive, over the episode</p>
+      <p class="widget-sub">Toggle between a shape the model was trained on and one it wasn't. Frozen plateaus
+      early either way; AdaJEPA keeps improving for the whole episode.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="mechanism">
+    <h2>2. The trick: one gradient step, in the replanning loop</h2>
+    <p>
+      The base system is an ordinary JEPA world model: a sensory encoder, an action encoder, and a predictor,
+      $\vz_t = \mathcal{E}^s_\phi(\vo_t)$, $\vu_t = \mathcal{E}^a_\psi(\va_t)$,
+      $\hat\vz_{t+1} = f_\theta(\vz_t,\vu_t)$ — trained from scratch per environment following a
+      temporal-straightening recipe (a ResNet encoder, transformer predictor, stop-gradient target branch), the
+      same broad family as LeWorldModel and SkyJEPA but not literally either of them.
+    </p>
+    <p>
+      The adaptation loss is the giveaway that this isn't a new architecture at all — it's the training loss,
+      redeployed:
+    </p>
+    <p class="eq">$$ \gL_{\rm ada}(\gB) = \frac{1}{|\gB|}\sum_{i}\, \ell\big(f_\theta(\vz_i,\vu_i),\ \mathrm{sg}(\vz_{i+1})\big) $$</p>
+    <p>
+      applied not to an offline dataset but to $\gB$, a small rolling buffer of the <em>real</em> transitions the
+      robot has actually observed so far this episode. Algorithm 1's loop is exactly the five stages in the
+      diagram above: plan a 25-step action sequence against the current model (gradient descent or CEM, both
+      supported and compared), execute only the first action chunk (5 low-level actions), append the resulting
+      real transition to the buffer, take <strong>exactly one</strong> gradient step on $\gL_{\rm ada}$, and
+      replan. The paper is explicit that one step is the default and recommended setting — ablations with 2 or 5
+      steps exist but don't reliably beat it.
+    </p>
+    <div class="widget-frame" id="loop-stepper">
+      <p class="widget-title">Walk through one cycle</p>
+      <p class="widget-sub">Click a stage, or auto-cycle through all five.</p>
+    </div>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/plan_execute_adapt.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">Two agents chasing the same goal under the same systematic model mismatch. The
+      frozen model's bias never corrects and it misses; AdaJEPA's one-gradient-step-per-replan shrinks the bias
+      away and it reaches the goal.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="which-params">
+    <h2>3. Which parameters, and how much it costs</h2>
+    <p>
+      Adapting every parameter of the network on a single noisy transition would be a recipe for instability, so
+      by default only a small subset updates: the visual encoder's last stage and the predictor's last
+      transformer block (including its final LayerNorm) — labeled "predlast+enclast" in the paper's own ablation.
+      Six variants are compared, plus a LoRA-adapter alternative (rank 8, all linear layers). All of them beat the
+      frozen baseline; the paper's honest finding is that <em>which</em> subset matters far less than the decision
+      to adapt at all — though adapting the predictor's <em>first</em> block specifically helps under layout/maze
+      shifts, because it sits closer to the raw action and latent inputs and can recalibrate local transition
+      structure faster.
+    </p>
+    <div class="widget-frame" id="layer-ablation">
+      <p class="widget-title">Which layers to adapt</p>
+      <p class="widget-sub">Relative performance across adaptation-target variants (illustrative bars, real
+      qualitative ordering from the paper's ablation).</p>
+    </div>
+    <figure class="paper-figure">
+      <img src="assets/figures/overall_layer_summary.png" alt="Bar chart comparing success rate across seven adaptation-target variants, by shift type and planner"/>
+      <figcaption>The paper's own version of the same comparison, broken out by shift type and planner (GD vs.
+      CEM) rather than collapsed into one relative score.</figcaption>
+    </figure>
+    <p>
+      The reason this is viable inside a real-time control loop at all: updating a small parameter subset for a
+      single step is nearly free. On one H200 GPU, adaptation adds only <strong>0.01–0.03 seconds</strong> per
+      MPC replanning step on top of base planning time (for context, plain gradient-descent planning alone takes
+      roughly 3 seconds per step; CEM roughly a quarter of a second) — the paper calls this overhead "almost
+      negligible." It often pays for itself anyway: an adapting model frequently needs <em>fewer</em> total
+      replans to reach the goal, so net episode time can be lower despite the added per-step cost.
+    </p>
+    <p>
+      Two further knobs matter more than which layers you pick. <strong>Learning rate and step count trade off</strong>:
+      a large learning rate (5× the pretraining rate) works well with exactly one adaptation step but destabilizes
+      training if you push it to two or five steps, while a small rate (0.2×) is stable at any step count but needs
+      more steps to catch up — and more steps means more per-replan latency. <strong>The replay buffer matters less
+      than you'd guess</strong>: comparing no buffer, a 5-transition sliding window, a 5-transition "hard example"
+      window, and an unbounded buffer, the swings are modest next to the LR/step-count effect, and a plain
+      recent-N window is judged the most stable choice and used as the default — there's no elaborate
+      prioritized-replay scheme hiding here, just the last handful of real transitions.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>4. Results</h2>
+    <p>
+      Three test environments: <strong>PushT</strong> (push a T-block to a target pose), <strong>PushObj</strong>
+      (PushT generalized to seven shapes — trained on four, tested on three held-out shapes plus visual
+      perturbations), and <strong>PointMaze</strong> (2D navigation, tested under shifted dynamics and unseen
+      maze layouts).
+    </p>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/all_shapes_gd_cem_ttt.png" alt="Success rate curves across all seven PushObj shapes, frozen vs adaptive, GD and CEM planners"/>
+      <img src="assets/figures/pusht_visual_shifts_gd_cem_ttt.png" alt="Success rate curves under visual perturbations: blur, salt-and-pepper noise, darkness, recolored agent/block/anchor"/>
+      <figcaption>Left: all seven PushObj shapes (★ = held-out/unseen), both planners. Right: visual robustness —
+      blur, noise, and darkening see clear gains; recoloring the agent or object sees smaller gains, because the
+      model leans on color to tell them apart.</figcaption>
+    </figure>
+    <p>
+      On unseen shapes, AdaJEPA very nearly doubles success rate — for the held-out square shape under
+      gradient-descent planning, frozen success sits near 20%, adaptation lifts it to roughly 40%. Under shifted
+      PointMaze dynamics (higher joint damping), one adaptation variant improves success by as much as
+      <strong>25 percentage points</strong>. On the default, in-distribution dynamics, where the frozen model is
+      already strong, adaptation does no harm — it doesn't need distribution shift to be safe to leave on.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/example_square_ttt.png" alt="Qualitative rollout on the unseen square shape: simulator ground truth vs. decoder-reconstructed frames"/>
+      <figcaption>A qualitative rollout on the held-out "square" shape — top row is the real simulator, bottom row
+      is what a post-hoc decoder reconstructs from the model's latent trajectory. Worth noticing: the decoder's
+      hallucinated shape leans toward a shape the model actually trained on (a cross/"+"), a visible symptom of
+      the exact frozen-model failure this paper targets — the model's internal notion of "object shape" is
+      dragged toward what it has seen before.</figcaption>
+    </figure>
+    <p>
+      The visual-shift results have a specific, honest asymmetry worth dwelling on rather than averaging away:
+      blur, sensor noise, and darkening all see clean, substantial gains from adaptation, but recoloring the agent,
+      the block, or the anchor point sees only modest gains. The paper's own diagnosis is that the frozen model
+      partly relies on color as a shortcut to distinguish the pusher from the object it's pushing — when color is
+      exactly the thing perturbed, one gradient step per replan isn't always enough to unlearn a shortcut the
+      model leaned on throughout pretraining. Adaptation fixes a shifted <em>distribution</em> quickly; it's
+      slower to fix a shortcut the model was actively relying on.
+    </p>
+    <p>
+      The data-efficiency result is the sharpest number in the paper. In the low-data regime — a single shape,
+      only 1,000 training trajectories — the frozen model reaches 28.1% success; AdaJEPA lifts the <em>same
+      pretrained checkpoint</em> to 60.8%, more than doubling it. More strikingly, that adapted 1,000-trajectory
+      model <strong>beats a frozen model trained on 16,000 trajectories</strong> of the same shape (43.5%) — one
+      gradient step per replan, at test time, outperforming sixteen times the offline data.
+    </p>
+    <div class="widget-frame" id="data-efficiency">
+      <p class="widget-title">One gradient step vs. sixteen times the data</p>
+      <p class="widget-sub">Real numbers from the paper's low-data-regime experiment.</p>
+    </div>
+    <figure class="paper-figure">
+      <img src="assets/figures/shapescale7_success_lines.png" alt="Line chart of success rate vs. number of training shapes and trajectories per shape, frozen vs adapt"/>
+      <figcaption>The full data-scaling picture, not just the two headline numbers above: across the whole grid
+      of shape diversity (K) and trajectories-per-shape (N), adaptation improves seen-shape success by more than
+      30 percentage points on average and unseen-shape success by more than 15 — and shape <em>diversity</em>
+      turns out to matter more than raw trajectory count for how well adaptation transfers to a shape the model
+      has never seen.</figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>5. Why this works</h2>
+    <p>
+      Three ideas do the real work here, and none of them is exotic. First, <strong>the adaptation signal is
+      free</strong> — it's the transition the robot was going to observe anyway by acting in the world, not extra
+      labeled data someone has to collect. Second, <strong>the loss is already the right one</strong>: because
+      it's the identical self-supervised prediction loss used in pretraining, there's no new objective to design
+      or balance against the old one, and no risk of catastrophic forgetting from optimizing toward some
+      unrelated downstream signal. Third, <strong>test-time distribution shift is exactly the setting where a
+      single gradient step is most valuable</strong> — you don't need to relearn the whole task, you need to
+      correct a specific, local mismatch (a shape the encoder never saw, a shifted friction coefficient), and one
+      step of local recalibration is often enough to do that without destabilizing everything else the model
+      already knows.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>6. What it means</h2>
+    <p>
+      Put next to LeWorldModel and SkyJEPA, AdaJEPA is answering a different question about the same family of
+      models. Those two ask "how do you build a good frozen world model in the first place" — this one asks "what
+      do you do the moment that frozen model meets a situation it wasn't built for." Neither question makes the
+      other obsolete: SkyJEPA's physics-inspired prober and AdaJEPA's test-time adaptation are not competing
+      solutions to the same problem, they're two different, stackable answers to two different failure modes
+      (systematic model-structure error vs. genuine distribution shift) — a genuinely well-built world model still
+      benefits from being allowed to keep learning after it ships.
+    </p>
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Does the replay buffer strategy matter more at longer horizons?</strong> The paper's own
+      ablation shows buffer choice has a smaller effect than learning rate/step-count, but only tests a handful of
+      strategies (none, recent-5, hard-5, infinite) over relatively short episodes.</li>
+      <li><strong>How far can "one gradient step" scale?</strong> A single step works because the mismatch it's
+      correcting is small and local; it's an open question whether a bigger distribution shift needs more steps,
+      a bigger buffer, or a fundamentally different adaptation rule.</li>
+      <li><strong>Combine with a physics-structured prober?</strong> SkyJEPA's lesson — impose known structure,
+      learn only the residual — and AdaJEPA's lesson — keep updating that residual online — look directly
+      composable, and neither paper tries the combination.</li>
+    </ul>
+    <h3>The bottom line</h3>
+    <p>
+      The frozen-model assumption running through this entire family of papers was never a law of nature — it was
+      a simplification nobody had gotten around to removing. AdaJEPA removes it with the cheapest possible fix: a
+      single gradient step, on data the robot was already collecting, inside a loop it was already running. The
+      result isn't a smarter model. It's a model that's allowed to notice when it's wrong.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/2606.32026" target="_blank" rel="noopener">arXiv:2606.32026</a> &middot;
+      part of the same family as <a href="../jepa_lineage/index.html">the JEPA world-model lineage</a> (LeCun 2022,
+      LeJEPA, LeWorldModel, SkyJEPA).
+    </p>
+    <p class="tiny">Figures and numbers are drawn from the paper's own reported results; some per-cell numbers in
+    its Table 1 were reconstructed from OCR with imperfect alignment — treat exact ablation percentages as
+    directionally accurate rather than pixel-perfect transcriptions.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

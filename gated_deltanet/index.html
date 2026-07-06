@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remember, Forget, Correct — Gated DeltaNet & the linear-attention frontier</title>
+  <meta name="description" content="How the delta rule and a forget gate brought linear attention back to the frontier — and why Qwen3-Next, Qwen3.5 and Kimi Linear ship them."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vS': '{\\mathbf{S}}',  '\\vI': '{\\mathbf{I}}',  '\\vK': '{\\mathbf{K}}',
+        '\\vQ': '{\\mathbf{Q}}',  '\\vV': '{\\mathbf{V}}',  '\\vO': '{\\mathbf{O}}',
+        '\\vo': '{\\mathbf{o}}',  '\\vT': '{\\mathbf{T}}',
+        '\\vM': '{\\mathbf{M}}',  '\\vW': '{\\mathbf{W}}',  '\\vU': '{\\mathbf{U}}',
+        '\\vk': '{\\mathbf{k}}',  '\\vq': '{\\mathbf{q}}',  '\\vv': '{\\mathbf{v}}',
+        '\\vg': '{\\mathbf{g}}',  '\\vx': '{\\mathbf{x}}',  '\\vy': '{\\mathbf{y}}',
+        '\\diag': '\\operatorname{diag}',
+        '\\sig':  '\\sigma'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Remember, Forget, Correct</h1>
+    <p class="byline">
+      The gated delta rule &amp; the linear-attention models eating long context &middot;
+      DeltaNet · Gated DeltaNet · Gated Attention &middot; a field guide &middot; 2024 → 2026 &middot;
+      <a href="https://arxiv.org/abs/2412.06464" target="_blank" rel="noopener">arXiv 2412.06464</a>,
+      <a href="https://arxiv.org/abs/2406.06484" target="_blank" rel="noopener">2406.06484</a>,
+      <a href="https://arxiv.org/abs/2505.06708" target="_blank" rel="noopener">2505.06708</a>,
+      <a href="https://arxiv.org/abs/2510.26692" target="_blank" rel="noopener">2510.26692</a>
+    </p>
+    <p class="lede">
+      Softmax attention remembers <em>everything</em> — and pays for it with a cache that grows without
+      bound. Linear attention promised a fixed-size memory instead, a single matrix you read and write in
+      $O(1)$ per token — but for years it simply <em>lost</em>. What brought it back to the frontier is two
+      old ideas wearing new clothes: a <strong>forget gate</strong> (erase fast) and the <strong>delta
+      rule</strong> (correct precisely). Bolt them together and you get the <strong>gated delta rule</strong>
+      — and it isn't a toy. It is the token mixer inside <strong>Qwen3-Next</strong>, <strong>Qwen3.5</strong>,
+      and (in a sharper form) <strong>Kimi Linear</strong>, which reports <strong>6× faster decoding and a 75%
+      smaller KV cache at a million tokens</strong> while <em>beating</em> full attention.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#rnn">Everything is an RNN with a matrix</a></li>
+      <li><a href="#delta">The delta rule: a memory that corrects itself</a></li>
+      <li><a href="#gate">The missing forget gate</a></li>
+      <li><a href="#watch">Watch the memory move</a></li>
+      <li><a href="#cousin">The cousin: gating returns to softmax attention</a></li>
+      <li><a href="#hybrid">Why nobody ships pure linear attention</a></li>
+      <li><a href="#models">Who actually uses this</a></li>
+      <li><a href="#why">Why it works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/gdn_architecture.png" alt="Gated DeltaNet hybrid architectures and block design"/>
+      <figcaption><strong>The shape of a modern hybrid.</strong> Two Gated DeltaNet stacks (H1, H2) and the
+        Gated DeltaNet block (right): keys and queries go through a short conv, SiLU and L2-norm; the
+        <em>gated delta rule</em> mixes tokens; a forget gate $\alpha$ and a write strength $\beta$ come from
+        cheap linear projections; an output gate sits before the projection. Real frontier models stack
+        mostly blocks like this and sprinkle in a few full-attention layers.
+        <span class="src">Yang, Kautz &amp; Hatamizadeh, <em>Gated Delta Networks</em>, ICLR 2025, Fig. 1.</span></figcaption>
+    </figure>
+
+    <p>Here is the bargain at the heart of every Transformer. Softmax attention is a perfect associative
+      memory: it keeps every token it has ever seen and can attend to any of them exactly. The price is that
+      "keep everything" is literal — the KV cache grows linearly with context, and each new token attends to
+      all the old ones, so generation gets slower the longer you talk. At a million tokens this is brutal.</p>
+
+    <p>The obvious escape is to <em>compress</em>. Instead of storing every key and value, keep a single
+      fixed-size matrix $\vS$ — a running summary — and update it as tokens stream by. That is
+      <strong>linear attention</strong>, and it gives you $O(1)$ memory and $O(1)$ work per token. For years
+      it came with a catch: the compressed memory was <em>worse</em> — it forgot the wrong things, smeared
+      facts together, and flunked the simplest "what did I just tell you" retrieval tests.</p>
+
+    <p>This piece is about the two ideas that fixed it, and the models that now ship them. We'll build the
+      one recurrence that contains linear attention, RetNet, Mamba2, GLA, DeltaNet and Gated DeltaNet as
+      special cases; see why the <em>delta rule</em> lets a memory overwrite itself; watch a <em>forget gate</em>
+      learn to throw things away; meet the cousin idea — gating bolted onto ordinary softmax attention — and
+      finish by dissecting the real architectures: Qwen3-Next, Qwen3.5, Kimi Linear and MiniMax.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="rnn">
+    <h2>1. Everything is an RNN with a matrix in it</h2>
+
+    <p>Start from one picture and almost the entire "linear-attention zoo" falls out of it. Give your layer a
+      memory that is a single matrix $\vS_t \in \mathbb{R}^{d_v \times d_k}$. Reading is one matrix–vector
+      product against the query; writing folds the new key–value pair into the state:</p>
+
+    <p class="eq">$$ \vo_t = \vS_t\, \vq_t \qquad\text{(read)}, \qquad \vS_t = \vS_{t-1} + \vv_t \vk_t^\top \qquad\text{(write)}. $$</p>
+
+    <p>That write rule is the whole of vanilla linear attention (Katharopoulos et al., 2020): every token
+      stamps an outer product $\vv_t \vk_t^\top$ onto the memory and walks away. It is wonderfully cheap and
+      it is also the problem — the memory only ever <em>adds</em>. Stamp enough associations onto a
+      fixed-size matrix and they start to overlap; old facts never fade and corrected facts pile on top of
+      the wrong ones. The state saturates into a blur.</p>
+
+    <p>Every successful variant is a fix to one of two knobs in that line:</p>
+
+    <ul>
+      <li><strong>The write rule.</strong> Do you blindly <em>add</em> $\vv_t\vk_t^\top$ (linear attention,
+        RetNet, GLA, Mamba2), or do you first <em>check what's already stored</em> and write only the
+        correction (the delta rule)?</li>
+      <li><strong>The forget rule.</strong> Before writing, do you scale the old memory down — by nothing, by
+        a fixed constant, by a learned scalar, or by a learned per-channel vector? That scaling is a
+        <em>gate</em>: a content-dependent valve that decides what to keep.</li>
+    </ul>
+
+    <p>Pick a setting for each knob and you have named a paper. Here is the entire family in one table —
+      every row is "linear attention, plus a particular gate, with a particular write rule." The
+      <span style="color:var(--accent);font-weight:700">transition</span> column is the matrix that maps
+      $\vS_{t-1}\!\to\!\vS_t$ before the new write is added; it is the single most useful way to tell these
+      models apart.</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Model</th><th>State update $\vS_t$</th><th>Transition $\vS_{t-1}\to$</th><th>Gate</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">Linear Attn</td><td>$\vS_{t-1} + \vv_t\vk_t^\top$</td><td>$\vI$</td><td>none</td></tr>
+        <tr><td class="cat">RetNet</td><td>$\gamma\,\vS_{t-1} + \vv_t\vk_t^\top$</td><td>$\gamma\,\vI$</td><td>fixed scalar</td></tr>
+        <tr><td class="cat">Mamba2</td><td>$\alpha_t\,\vS_{t-1} + \vv_t\vk_t^\top$</td><td>$\alpha_t\,\vI$</td><td>data-dep. scalar</td></tr>
+        <tr><td class="cat">GLA</td><td>$\vS_{t-1}\diag(\alpha_t) + \vv_t\vk_t^\top$</td><td>$\diag(\alpha_t)$</td><td>data-dep. vector</td></tr>
+        <tr><td class="cat">DeltaNet</td><td>$\vS_{t-1}(\vI - \beta_t\vk_t\vk_t^\top) + \beta_t\vv_t\vk_t^\top$</td><td>$\vI - \beta_t\vk_t\vk_t^\top$</td><td>none (delta write)</td></tr>
+        <tr><td class="cat">Gated DeltaNet</td><td>$\vS_{t-1}\big(\alpha_t(\vI - \beta_t\vk_t\vk_t^\top)\big) + \beta_t\vv_t\vk_t^\top$</td><td>$\alpha_t(\vI - \beta_t\vk_t\vk_t^\top)$</td><td>scalar <em>+</em> delta</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">All rows share the read-out $\vo_t=\vS_t\vq_t$ and the convention $\vv_t\vk_t^\top$.
+      RetNet's $\gamma$ is a per-head constant (data-independent); Mamba2 reuses its $\alpha$ parameterization.
+      Sources: Katharopoulos 2006.16236 · RetNet 2307.08621 · Mamba2 2405.21060 · GLA 2312.06635 ·
+      DeltaNet 2406.06484 · Gated DeltaNet 2412.06464.</p>
+
+    <p>The widget below is that table made live. Pick a variant and you see its transition matrix and a
+      tiny diagnostic: stream a value into one key, bury it under noise, and try to read it back. Watch
+      which models forget, which interfere, and which can hold a fact.</p>
+
+    <div class="widget-frame" id="taxonomy-lab">
+      <p class="widget-title">The zoo in one recurrence</p>
+      <p class="widget-sub">Pick a variant. Left: its transition matrix on the memory. Right: can it remember one fact through a storm of writes?</p>
+    </div>
+
+    <aside class="callout">
+      <strong>Gating never actually left.</strong> The forget gate is the LSTM's oldest trick (1997): a sigmoid
+      that decides what a recurrent state keeps. Highway networks (2015) ported it to depth — a residual
+      connection is just a carry gate wired permanently open. The 2017 Transformer dropped gating from
+      sequence mixing entirely (it survived only inside the FFN, as SwiGLU). What's happening now is the
+      rediscovery that a content-dependent valve belongs on the memory too — whether that memory is a
+      recurrent matrix or, as we'll see, the output of a softmax head.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="delta">
+    <h2>2. The delta rule: a memory that corrects itself</h2>
+
+    <p>Linear attention's sin is that it writes without looking. The <strong>delta rule</strong> fixes exactly
+      that. Before storing key $\vk_t$'s new value, it reads what the memory <em>currently</em> predicts for
+      that key, $\vS_{t-1}\vk_t$, measures the error against the target $\vv_t$, and writes only the
+      difference. In the fast-weight tradition this is "erase the old value, write the new one":</p>
+
+    <p class="eq">$$ \vS_t = \vS_{t-1} - \underbrace{(\vS_{t-1}\vk_t)\vk_t^\top}_{\text{erase old}} + \underbrace{\big(\beta_t\vv_t + (1-\beta_t)\vS_{t-1}\vk_t\big)\vk_t^\top}_{\text{write blend}} = \vS_{t-1}(\vI - \beta_t\vk_t\vk_t^\top) + \beta_t\vv_t\vk_t^\top. $$</p>
+
+    <p>That transition $\vI - \beta_t\vk_t\vk_t^\top$ is a <em>generalized Householder</em> matrix — a rank-one
+      surgical edit that leaves everything orthogonal to $\vk_t$ untouched and rewrites only the $\vk_t$
+      direction. Compare the two writes directly: linear attention does $\vS \mathrel{+}= \vv\vk^\top$ no
+      matter what; the delta rule does $\vS \mathrel{+}= \beta(\vv - \vS\vk)\vk^\top$, a correction
+      proportional to how wrong it currently is.</p>
+
+    <p>If that looks like gradient descent, it is. Define a per-token regression loss
+      $\mathcal{L}(\vS) = \tfrac12\lVert \vS\vk_t - \vv_t\rVert^2$ — "make the memory map $\vk_t$ to $\vv_t$."
+      One SGD step is</p>
+
+    <p class="eq">$$ \vS_t = \vS_{t-1} - \beta_t\,\nabla\mathcal{L}(\vS_{t-1}) = \vS_{t-1} - \beta_t(\vS_{t-1}\vk_t - \vv_t)\vk_t^\top, $$</p>
+
+    <p>which is the delta rule, with the write strength $\beta_t$ playing the role of a <em>learning rate</em>.
+      So a DeltaNet layer is doing online learning at inference time: each token is a training example, and
+      the state is a fast weight matrix taking one gradient step per token. (This is the same lens as
+      test-time training and the fast-weight programmers of Schlag et al., 2021.)</p>
+
+    <p>The widget makes the difference visceral. Write a few key→value pairs, then <em>overwrite</em> one key
+      with a new value and query it. Additive linear attention hands back a smear of old and new; the delta
+      rule returns the clean, corrected value.</p>
+
+    <div class="widget-frame" id="recall-race">
+      <p class="widget-title">Associative recall: add vs. correct</p>
+      <p class="widget-sub">Store bindings, overwrite one, then query. Watch which memory gives you the right answer back.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>"But isn't this slow?"</strong> The delta rule looks inherently sequential — each write depends
+      on reading the previous state. DeltaNet's contribution (Yang et al., 2024) was a <em>chunkwise parallel
+      form</em>: within a chunk, the product of Householder transitions compresses into a small
+      $C\times C$ matrix via the classic WY representation,
+      $\vT = \big[\vI + \operatorname{strictLower}(\diag(\beta)\vK\vK^\top)\big]^{-1}\diag(\beta)$, after which
+      everything is matmuls a GPU loves. That single trick is what made the delta rule trainable at scale and
+      turned a 2021 curiosity into a 2025 production layer.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="gate">
+    <h2>3. The missing forget gate</h2>
+
+    <p>The delta rule is a precise editor, but it has no eraser. Its transition has eigenvalues that are
+      either $1$ (directions it leaves alone) or $1-\beta_t$ (the one direction it edits) — nothing globally
+      shrinks. So a pure DeltaNet never <em>forgets</em>; in a long, noisy stream the irrelevant stuff it
+      wrote early never decays, and a finite memory eventually collides with itself. Mamba2 has the opposite
+      problem: its scalar gate $\alpha_t$ forgets beautifully but its write is the blind additive one, so it
+      can't surgically correct a specific binding.</p>
+
+    <p>Gated DeltaNet's move (Yang, Kautz &amp; Hatamizadeh, 2024) is almost embarrassingly simple: take the
+      delta rule's Householder transition and multiply the whole thing by Mamba2's learned scalar forget gate.</p>
+
+    <p class="eq">$$ \boxed{\;\vS_t = \vS_{t-1}\big(\alpha_t(\vI - \beta_t\vk_t\vk_t^\top)\big) + \beta_t\vv_t\vk_t^\top\;} $$</p>
+
+    <p>Two knobs, two jobs. The gate $\alpha_t \in (0,1)$ is a global dial on memory: push it toward $0$ and
+      the state is wiped in a step; hold it at $1$ and you recover the pure delta rule. The write strength
+      $\beta_t \in (0,1)$ is the local editor: it decides how hard to overwrite the one key in front of you.
+      The authors' one-liner: <em>"gating enables rapid memory erasure while the delta rule facilitates
+      targeted updates."</em></p>
+
+    <p>There's a clean way to see why combining them is principled, not just convenient. Each of these
+      recurrences is the exact solution of an online objective — a "stay close to the old state" regularizer
+      plus a "fit the new pair" term:</p>
+
+    <table class="results">
+      <thead><tr><th>Model</th><th>Online objective (minimized each step)</th><th>Reading</th></tr></thead>
+      <tbody>
+        <tr><td class="cat">Linear Attn</td><td>$\lVert\vS_t-\vS_{t-1}\rVert_F^2 - 2\langle\vS_t\vk_t,\vv_t\rangle$</td><td>keep everything, then add</td></tr>
+        <tr><td class="cat">Mamba2</td><td>$\lVert\vS_t-\alpha_t\vS_{t-1}\rVert_F^2 - 2\langle\vS_t\vk_t,\vv_t\rangle$</td><td>gate relaxes "keep"</td></tr>
+        <tr><td class="cat">DeltaNet</td><td>$\lVert\vS_t-\vS_{t-1}\rVert_F^2 - 2\langle\vS_t\vk_t,\beta_t(\vv_t-\vS_{t-1}\vk_t)\rangle$</td><td>fit the <em>error</em></td></tr>
+        <tr><td class="cat">Gated DeltaNet</td><td>$\lVert\vS_t-\alpha_t\vS_{t-1}\rVert_F^2 - 2\langle\vS_t\vk_t,\beta_t(\vv_t-\alpha_t\vS_{t-1}\vk_t)\rangle$</td><td class="win">gate <em>and</em> error</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">From Gated DeltaNet Table 1, using the Longhorn online-learning framework. The gate
+      $\alpha_t$ is exactly an <em>adaptive weight decay</em> term on the delta rule's test-time SGD step.</p>
+
+    <p>The proof of the pudding is a needle-in-a-haystack stress test (S-NIAH). When you have to <em>filter</em>
+      a noisy real-world haystack, pure DeltaNet (no forgetting) collapses and the gated models thrive. When
+      you have to <em>memorize</em> a hard pattern like a random UUID, pure Mamba2 (no precise write) collapses
+      and the delta-rule models thrive. Only the combination is good at both:</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>S-NIAH task (1.3B)</th><th>DeltaNet<br><span style="font-weight:400">delta only</span></th><th>Mamba2<br><span style="font-weight:400">gate only</span></th><th>Gated DeltaNet<br><span style="font-weight:400">both</span></th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">number-in-haystack · 4K</td><td>18.6</td><td>56.2</td><td class="win"><strong>92.2</strong></td></tr>
+        <tr><td class="cat">number-in-haystack · 8K</td><td>14.4</td><td>17.0</td><td class="win"><strong>29.6</strong></td></tr>
+        <tr><td class="cat">UUID-in-haystack · 2K</td><td>47.0</td><td>47.6</td><td class="win"><strong>84.2</strong></td></tr>
+        <tr><td class="cat">UUID-in-haystack · 4K</td><td>22.4</td><td>4.6</td><td class="win"><strong>27.6</strong></td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">Zero-shot accuracy, S-NIAH from RULER (Gated DeltaNet Table 2). "Gating facilitates
+      filtering; the delta rule helps memorization."</p>
+
+    <p>Play with both knobs below. With the gate off ($\alpha=1$) you can watch a finite memory fill up with
+      junk and start failing; turn forgetting on and the same memory stays sharp because it sheds the noise it
+      doesn't need.</p>
+
+    <div class="widget-frame" id="gate-explorer">
+      <p class="widget-title">Forget &amp; write: the two knobs</p>
+      <p class="widget-sub">Slide the forget gate α and the write strength β. Watch a fixed-size memory either saturate into noise or stay clean.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="watch">
+    <h2>4. Watch the memory move</h2>
+
+    <p>One way to <em>feel</em> all of this: the state $\vS$ is a linear map from keys to values, so it turns
+      the unit circle of key directions into an ellipse of stored values. A blind additive write just dents
+      the ellipse. The delta rule is a rank-one <em>correction</em> that bends the ellipse so $\vS\vk$ lands
+      exactly on the value you want — and the gate then shrinks the whole ellipse toward the origin, which is
+      what forgetting looks like geometrically.</p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/memory_map.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">The memory as a map. The orange ellipse is $\vS$ acting on every key direction at
+      once. The delta rule $\vS\leftarrow\vS-\beta(\vS\vk-\vv)\vk^\top$ collapses the error vector until the
+      prediction $\vS\vk$ sits on the target $\vv$ — a local, surgical edit. Then the forget gate
+      $\vS\leftarrow\alpha\vS$ contracts the entire ellipse: forget globally, correct locally.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="cousin">
+    <h2>5. The cousin: gating returns to softmax attention</h2>
+
+    <p>Here's the twist that makes "gating is back" more than a slogan: the same idea came home to
+      <em>full</em> quadratic attention. The Qwen team's <strong>Gated Attention</strong> (Qiu et al., 2025,
+      a NeurIPS 2025 oral) adds one cheap, query-dependent sigmoid gate on the output of each attention head,
+      right after the scaled-dot-product attention and before the output projection:</p>
+
+    <p class="eq">$$ \vy' = \mathrm{SDPA}(\vx) \,\odot\, \sigma(\vx\,\vW_\theta). $$</p>
+
+    <p>It is, almost literally, the LSTM's output gate re-attached to an attention head. The gate is
+      <em>head-specific</em> and <em>element-wise</em> (one value per head per channel), and because it reads
+      the current token it is query-dependent. Three things happen, and all three are useful:</p>
+
+    <h3>It adds non-linearity</h3>
+    <p>A head's value and output projections are two consecutive linear maps that collapse into one low-rank
+      linear transform. The sigmoid gate breaks that collapse, buying genuine expressiveness for free.</p>
+
+    <h3>It induces sparsity</h3>
+    <p>The learned gate values pile up near $0$: most of the time most heads are told to contribute almost
+      nothing, and the gate routes only the relevant context through. A head can finally say "I have nothing
+      to add here."</p>
+
+    <h3>It kills attention sinks</h3>
+    <p>This is the prettiest one. Softmax rows must sum to $1$, so a head with nothing relevant to say is
+      still forced to put its mass <em>somewhere</em> — and models learn to dump it on a junk "sink" token
+      (usually the first one), which spawns the notorious massive-activation outliers. Give the head an
+      off-switch and it stops faking. Attention to the first token drops from <strong>46.7% to 4.8%</strong>,
+      the sink disappears, and those giant activations deflate.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/ga_massive_baseline.png" alt="Massive activations in a baseline model, up to 1600"/>
+      <img src="assets/figures/ga_massive_gated.png" alt="Massive activations with the output gate, much smaller"/>
+      <figcaption><strong>The output gate deflates massive activations.</strong> Max activation per layer in a
+        baseline model (left, peaking near <strong>1600</strong>) versus the same model with the SDPA output
+        gate (right, peaking near <strong>400</strong> — note the different vertical scales). The gate removes
+        the "no-op" mass that attention sinks parked on token 0, which also stabilizes training and improves
+        length extrapolation. <span class="src">Qiu et al., <em>Gated Attention for LLMs</em>, 2025.</span></figcaption>
+    </figure>
+
+    <p>The reported wins are modest but consistent across 30+ variants: roughly <strong>+2 points on MMLU</strong>,
+      lower perplexity, and <strong>more than +10 points on long-context RULER at 128k</strong>. This is the
+      "gated attention stuff" that shows up alongside the linear layers in real models — and it's exactly the
+      flavor of full-attention used inside Qwen3-Next. Toggle it below and watch the sink evaporate.</p>
+
+    <div class="widget-frame" id="sink-gate">
+      <p class="widget-title">The attention sink, with and without the gate</p>
+      <p class="widget-sub">A head with nothing to say must still spend its softmax mass. Toggle the output gate and watch where the mass goes.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="hybrid">
+    <h2>6. Why nobody ships <em>pure</em> linear attention</h2>
+
+    <p>If Gated DeltaNet is so good, why do the real models still keep some full attention around? Because a
+      fixed-size memory, however clever, has a hard ceiling: it cannot perfectly recall an arbitrary item from
+      an arbitrarily long past. Softmax attention can — that's its whole point. Exact-copy and long-range
+      retrieval are precisely where pure linear models still wobble.</p>
+
+    <p>So the field converged on a compromise that is now nearly universal: <strong>hybrids</strong>. Stack
+      mostly cheap linear/recurrent layers for the heavy lifting of sequence mixing, and interleave a few
+      full-attention layers to recover exact recall. Gated DeltaNet's own recipe (the H1/H2 stacks in the
+      teaser) mixes the gated delta layer with sliding-window attention; at 1.3B it beats both its pure-linear
+      parent and a Transformer baseline:</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>1.3B model</th><th>Wiki ppl ↓</th><th>LMB ppl ↓</th><th>Avg. acc ↑ <span style="font-weight:400">(7 tasks)</span></th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">RetNet</td><td>19.08</td><td>17.27</td><td>52.02</td></tr>
+        <tr><td class="cat">DeltaNet</td><td>17.71</td><td>16.88</td><td>52.14</td></tr>
+        <tr><td class="cat">Mamba2</td><td>16.56</td><td>12.56</td><td>54.89</td></tr>
+        <tr><td class="cat">Gated DeltaNet</td><td>16.42</td><td><strong>12.17</strong></td><td>55.32</td></tr>
+        <tr><td class="cat">Gated DeltaNet-H1 <span style="font-weight:400">(+SWA)</span></td><td>16.07</td><td>12.12</td><td class="win"><strong>56.40</strong></td></tr>
+        <tr><td class="cat">Gated DeltaNet-H2 <span style="font-weight:400">(+Mamba2+SWA)</span></td><td><strong>15.91</strong></td><td>12.55</td><td>56.18</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">All trained on 100B FineWeb-Edu tokens, identical setup (Gated DeltaNet Table 3). The
+      seven-task average covers LAMBADA, PIQA, HellaSwag, WinoGrande, ARC-easy/challenge, SIQA/BoolQ.</p>
+
+    <p>The pattern that the production models settled on is a <strong>3:1 ratio</strong>: three linear
+      (gated-delta) layers for every one full-attention layer. That's the knob in the last widget — build a
+      stack and see how the proportion of cheap layers drives down the KV cache while a few exact-recall
+      layers keep quality up.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="models">
+    <h2>7. Who actually uses this</h2>
+
+    <p>This is no longer a benchmark curiosity. As of 2026 the gated-delta lineage is the token mixer in
+      several of the largest open-weight models — and it's worth being precise about <em>which</em> mechanism
+      each one uses, because three different families get lumped together.</p>
+
+    <h3>Qwen3-Next — the proof of concept at scale</h3>
+    <p>Alibaba's Qwen3-Next (Sept 2025) is the headline adopter. Its 48 layers repeat a simple block twelve
+      times: <strong>three Gated DeltaNet layers, then one gated full-attention layer</strong> — exactly the
+      3:1 ratio — each followed by a sparse MoE feed-forward. The full-attention layers are the
+      <em>gated attention</em> from §5 (per-head output gate, zero-centered weight-decayed norm, partial
+      RoPE); the linear layers are Gated DeltaNet (head dim 128). It's an 80B-parameter MoE that activates
+      only <strong>3B per token</strong> (512 experts, 10 routed + 1 shared), trained on 15T tokens with a
+      262K native context extensible toward 1M. Qwen reports it was trained for <strong>under 10% of the
+      GPU-hours of Qwen3-32B</strong> yet delivers <strong>more than 10× the inference throughput</strong>
+      beyond 32K context. Both ingredients of this blog — the gated delta rule <em>and</em> gated attention —
+      ship in the same model.</p>
+
+    <h3>Qwen3.5 — the production generation</h3>
+    <p>Qwen3-Next was the preview; <strong>Qwen3.5</strong> (Feb 2026) is the production family built on the
+      same recipe. The open-weight flagship, Qwen3.5-397B-A17B, is 60 layers in the identical 3:1
+      Gated-DeltaNet-to-gated-attention pattern (397B total, 17B active), with a smaller 35B-A3B sibling and a
+      1M-context hosted tier. The vendor-reported numbers are eye-watering — on the order of
+      <strong>8–19× faster decoding</strong> than a comparable dense Qwen and ~60% less VRAM — though as
+      single-source claims they're worth treating as "reported, not independently benchmarked." The lineage
+      continues into Qwen3.6. The takeaway is the durable one: a frontier lab bet its flagship on this
+      architecture.</p>
+
+    <h3>Kimi Linear — the delta rule, sharpened</h3>
+    <p>Moonshot's Kimi Linear (Oct 2025) pushes the gate further. Its <strong>Kimi Delta Attention (KDA)</strong>
+      is Gated DeltaNet with a <em>finer-grained, channel-wise</em> forget gate instead of a single scalar —
+      each feature dimension gets its own decay — implemented with a bespoke chunkwise algorithm over
+      Diagonal-Plus-Low-Rank transitions. It uses the same 3:1 ratio, here interleaving KDA with full
+      Multi-Head Latent Attention. At 48B total / 3B active it's the first such model reported to
+      <strong>beat full attention outright</strong> under matched training, while cutting the
+      <strong>KV cache by up to 75%</strong> and decoding <strong>up to 6× faster at 1M tokens</strong>.</p>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/kimi_linear_fig1.png" alt="Kimi Linear performance-vs-acceleration and TPOT plots"/>
+      <figcaption><strong>Kimi Linear vs. full attention.</strong> Left: quality (RULER, MMLU-Pro) against
+        decoding acceleration — Kimi Linear is Pareto-optimal, matching or beating full MLA at higher speed.
+        Right: time-per-output-token vs. context length — the gap widens with length, reaching
+        <strong>6.3× at 1M tokens</strong> because the recurrent state, unlike a KV cache, doesn't grow.
+        <span class="src">Kimi Team, <em>Kimi Linear</em>, arXiv 2510.26692, Fig. 1.</span></figcaption>
+    </figure>
+
+    <h3>The cousins, and what's <em>not</em> a delta rule</h3>
+    <p>It's easy to over-claim here, so a clean taxonomy of real hybrids:</p>
+    <ul>
+      <li><strong>Delta-rule hybrids</strong> — Qwen3-Next, Qwen3.5/3.6, Kimi Linear (KDA). These actually use
+        the gated delta rule from this blog.</li>
+      <li><strong>Decay linear-attention hybrids</strong> — MiniMax-01 (Jan 2025) interleaves
+        <em>Lightning Attention</em> with softmax at a 7:1 ratio (456B total, 45.9B active, 1M training
+        context). Lightning Attention is a linear-attention <em>cousin</em> with fixed, data-independent
+        decay — related to, but <em>not</em>, the delta rule.</li>
+      <li><strong>SSM (Mamba-2) hybrids</strong> — IBM Granite 4.0, NVIDIA Nemotron-H, Falcon-H1 and the older
+        Jamba interleave Mamba-2 state-space layers with attention. These gate, but with Mamba-2's SSM
+        recurrence, not the Householder delta write.</li>
+    </ul>
+
+    <table class="results">
+      <thead>
+        <tr><th>Model</th><th>Linear mechanism</th><th>Ratio</th><th>Params (total/active)</th><th>Context</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">Qwen3-Next</td><td class="win">Gated DeltaNet + gated attn</td><td>3:1</td><td>80B / 3B</td><td>262K → 1M</td></tr>
+        <tr><td class="cat">Qwen3.5-397B</td><td class="win">Gated DeltaNet + gated attn</td><td>3:1</td><td>397B / 17B</td><td>262K → 1M</td></tr>
+        <tr><td class="cat">Kimi Linear</td><td class="win">KDA (channel-wise gated delta)</td><td>3:1</td><td>48B / 3B</td><td>1M</td></tr>
+        <tr><td class="cat">MiniMax-01</td><td>Lightning Attention (cousin)</td><td>7:1</td><td>456B / 45.9B</td><td>1M → 4M</td></tr>
+        <tr><td class="cat">Granite 4.0 / Nemotron-H</td><td>Mamba-2 SSM</td><td>~9:1</td><td>various</td><td>long</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">Sources: Qwen3-Next &amp; Qwen3.5 model cards / Qwen blog; Kimi Linear 2510.26692;
+      MiniMax-01 2501.08313; Granite 4.0 / Nemotron-H tech reports. Qwen3.5 figures are post-2025 and
+      vendor-reported.</p>
+
+    <p>Pick a model below to see its actual layer stack and what the recurrent state buys you at long context.</p>
+
+    <div class="widget-frame" id="model-stack">
+      <p class="widget-title">Real hybrid stacks</p>
+      <p class="widget-sub">Choose a model. See its layer pattern and how the fixed-size recurrent state collapses the KV-cache curve.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why it works</h2>
+
+    <p>Step back and the story is coherent, not a bag of tricks.</p>
+
+    <h3>A fixed-size memory has to be <em>managed</em>, not just filled</h3>
+    <p>Softmax attention sidesteps memory management by never forgetting — at the cost of an unbounded cache.
+      The moment you commit to a fixed-size state, you've signed up for the classic problem of a finite
+      memory: you must decide what to keep, what to overwrite, and what to drop. The gate is the keep/drop
+      decision; the delta rule is the overwrite decision. Linear attention failed for years because it had
+      neither — it could only fill.</p>
+
+    <h3>The two knobs are genuinely complementary</h3>
+    <p>The S-NIAH table isn't a coincidence. Filtering a noisy haystack is a forgetting problem (you want
+      $\alpha_t$ small for the junk); memorizing a precise UUID is a writing problem (you want a clean,
+      collision-free delta write). They stress opposite mechanisms, which is exactly why a model with only one
+      knob fails one test, and a model with both passes both.</p>
+
+    <h3>It's a hierarchy of transition matrices</h3>
+    <p>Read the taxonomy column as a ladder of expressiveness for how the memory may transform each step:
+      from a fixed scalar ($\gamma\vI$), to a data-dependent scalar ($\alpha_t\vI$), to a diagonal
+      ($\diag(\alpha_t)$), to scalar-times-Householder ($\alpha_t(\vI-\beta_t\vk\vk^\top)$, Gated DeltaNet),
+      and onward to diagonal-plus-low-rank (RWKV-7, and the per-channel gate of Kimi's KDA). Each rung lets
+      the state do something the rung below cannot — and richer transitions buy real capabilities like
+      in-context retrieval and even state-tracking.</p>
+
+    <h3>Inference is learning</h3>
+    <p>Because the delta rule is online gradient descent and the gate is adaptive weight decay, a gated-delta
+      layer is literally training a tiny associative model on your prompt as it reads it. "Long context" stops
+      being "a bigger lookup table" and becomes "a fast-weight network that has learned more from what it has
+      seen." That reframing — context as test-time learning — is why this family connects to Titans, test-time
+      training, and fast-weight programmers, and why people expect it to keep climbing.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>9. What it means</h2>
+
+    <p>For a decade the received wisdom was that attention had won and recurrence was a historical footnote.
+      The gated-delta story flips that into something subtler: the winning design is a <em>marriage</em>. Keep
+      a few full-attention layers for the exact recall only a growing cache can give you, and let a managed,
+      gated, self-correcting recurrent memory do the rest — cheaply, in constant state, at speeds that pull
+      away from softmax as context grows. The frontier isn't linear-vs-attention; it's the right hybrid.</p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>How few attention layers can you get away with?</strong> 3:1 is today's safe bet; the cache
+        and latency story gets dramatically better if it's 7:1 or 15:1 without losing recall.</li>
+      <li><strong>How fine should the gate be?</strong> Scalar (Gated DeltaNet), per-channel (Kimi KDA), or
+        full diagonal-plus-low-rank (RWKV-7)? More expressive transitions cost more to train fast — the
+        sweet spot is unsettled.</li>
+      <li><strong>What can a managed state actually track?</strong> Allowing the write strength past $1$ gives
+        the transition negative eigenvalues and unlocks state-tracking tasks that pure-decay models provably
+        cannot do. How far does that go?</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>Linear attention didn't beat the Transformer by being cleverer about attention. It won the long-context
+      fight by remembering an older lesson: a finite memory needs a forget gate to throw things away and an
+      error signal to fix what it got wrong. The LSTM knew the first; the delta rule supplies the second.
+      Glue them onto a matrix you can write in parallel, sprinkle in a little exact attention, and you get the
+      thing now humming inside Qwen3.5 and Kimi Linear — a memory that remembers, forgets, and corrects.</p>
+  </section>
+
+  <footer>
+    <p>
+      Core papers:
+      <a href="https://arxiv.org/abs/2412.06464" target="_blank" rel="noopener">Gated DeltaNet (2412.06464)</a> ·
+      <a href="https://arxiv.org/abs/2406.06484" target="_blank" rel="noopener">DeltaNet (2406.06484)</a> ·
+      <a href="https://arxiv.org/abs/2505.06708" target="_blank" rel="noopener">Gated Attention (2505.06708)</a> ·
+      <a href="https://arxiv.org/abs/2510.26692" target="_blank" rel="noopener">Kimi Linear (2510.26692)</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation. Real-model
+      details from official model cards and tech reports; figures released after 2025 are vendor-reported.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

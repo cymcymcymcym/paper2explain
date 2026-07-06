@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The JEPA World-Model Lineage: From LeCun's 2022 Vision to LeWorldModel and SkyJEPA — an interactive explainer</title>
+  <meta name="description" content="A field guide tracing four connected papers — LeCun's 2022 world-model proposal, LeJEPA's isotropic-Gaussian anti-collapse theory, LeWorldModel, and SkyJEPA — with quizzes at every node."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vz': '{\\mathbf{z}}', '\\vx': '{\\mathbf{x}}', '\\vo': '{\\mathbf{o}}', '\\va': '{\\mathbf{a}}',
+        '\\vu': '{\\mathbf{u}}', '\\vh': '{\\mathbf{h}}',
+        '\\E': '{\\mathbb{E}}', '\\R': '{\\mathbb{R}}',
+        '\\enc': '{\\mathrm{enc}_\\theta}', '\\pred': '{\\mathrm{pred}_\\phi}',
+        '\\sA': '{\\mathbb{A}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">A field guide</p>
+    <h1>The JEPA World-Model Lineage: From LeCun's 2022 Vision to LeWorldModel and SkyJEPA</h1>
+    <p class="byline">
+      A field guide tracing four connected papers &middot; LeCun's 2022 world-model architecture &middot; LeJEPA's
+      isotropic-Gaussian anti-collapse theory &middot; LeWorldModel &middot; SkyJEPA &middot; with a quiz at every node
+    </p>
+    <p class="lede">
+      Citation graphs get flattened into tidy stories all the time — "X builds on Y builds on Z" — and most of the
+      time that's roughly true. This one isn't, and the exact place it stops being a straight line is the most
+      interesting part. Four papers, three years, and one shared piece of math: a 2022 position paper's proposal
+      for how an intelligent agent should model the world, a 2025 theorem about the single best distribution for
+      an embedding to have, and two 2026 papers that both build a working world model on top of that theorem —
+      independently of each other. This is the toolkit and the real graph, node by node, with a quiz at each stop.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#lecun">Node 1 — LeCun's world model (2022)</a></li>
+      <li><a href="#lejepa">Node 2 — LeJEPA: the isotropic Gaussian theory (2025)</a></li>
+      <li><a href="#leworldmodel">Node 3 — LeWorldModel (2026)</a></li>
+      <li><a href="#skyjepa">Node 4 — SkyJEPA (2026)</a></li>
+      <li><a href="#tree">The real family tree</a></li>
+      <li><a href="#why">Why the shared theory matters</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      Start with the question this whole lineage answers: if you want a model to predict the future, should it
+      predict the future in pixels, or in some compressed internal code? Predicting pixels means wasting capacity
+      on irrelevant detail — the exact texture of bark on a tree you're driving past — and it's expensive.
+      Predicting in a compressed code is cheap and throws away the irrelevant detail for free. The catch is that
+      it's also trivially <em>gameable</em>: a network that maps every input to the same constant vector "predicts
+      the future" perfectly, because there's nothing left to get wrong. This failure has a name —
+      <strong>representation collapse</strong> — and for a decade the fix was a pile of heuristics: negative
+      examples, stop-gradients, momentum-averaged teacher networks, careful learning-rate schedules for each.
+    </p>
+    <p>
+      In 2025, Randall Balestriero and Yann LeCun proved something specific about what a <em>non-collapsed</em>,
+      maximally useful embedding distribution should look like — and it's not an arbitrary target. Two papers in
+      2026, working on completely different problems (general video/robot world models, and real-time quadrotor
+      control), both reached for that exact result to solve their own collapse problem. Neither cites the other as
+      an influence. That's the graph this piece actually traces.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="lecun">
+    <h2>1. Node 1 — LeCun's world model (2022)</h2>
+    <p>
+      "A Path Towards Autonomous Machine Intelligence" (LeCun, 2022, OpenReview) is a position paper, not a system
+      — it proposes an architecture for an autonomous agent built from six differentiable, mostly-trainable
+      modules, without shipping a working implementation of most of them.
+    </p>
+    <div class="widget-frame" id="architecture-explorer">
+      <p class="widget-title">The cognitive architecture</p>
+      <p class="widget-sub">Click each module to read its role. The World Model is the one every later paper in
+      this lineage actually builds.</p>
+    </div>
+    <p>
+      The <strong>World Model</strong> is the module every downstream paper in this piece cares about: given the
+      current estimated state and a hypothesized action, predict the resulting future state — not as pixels, but
+      as a latent representation. LeCun's argument for why this should be trained with a
+      <strong>Joint-Embedding Predictive Architecture (JEPA)</strong> rather than a generative model is exactly the
+      collapse trade-off from the hook: a generative decoder is forced to reconstruct every pixel, wasting
+      capacity and gradient signal on unpredictable, irrelevant detail, while a JEPA is free to represent only
+      what's predictable — provided you can stop it from cheating by collapsing. The paper names the problem
+      precisely but doesn't solve it: it surveys contrastive and non-contrastive heuristics without landing on a
+      principled fix. That's exactly the gap LeJEPA closes three years later.
+    </p>
+    <aside class="callout">
+      <strong>Not the same as V-JEPA.</strong> Meta's V-JEPA is a concrete <em>instance</em> of the JEPA idea for
+      video representation learning — useful, but a perception/pretraining model, not the full agent architecture
+      (Actor, Cost, planning loop) this 2022 paper describes. This lineage traces the <em>world-model</em> half of
+      LeCun's proposal specifically.
+    </aside>
+    <div id="quiz-lecun"></div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="lejepa">
+    <h2>2. Node 2 — LeJEPA: the isotropic Gaussian theory (2025)</h2>
+    <p>
+      Balestriero &amp; LeCun's "LeJEPA: Provable and scalable self-supervised learning without the heuristics"
+      (arXiv:2511.08544) asks a sharper version of LeCun 2022's open question: <em>which</em> embedding
+      distribution should a JEPA converge to, if you want it to be useful for <em>any</em> downstream task, not
+      just the one you happened to train it for?
+    </p>
+    <h3>The theory: why isotropic Gaussian, specifically</h3>
+    <p>
+      The paper answers this with two complementary arguments, both landing on the same target. For
+      <strong>linear probing</strong> (ridge regression on frozen embeddings), comparing an anisotropic embedding
+      matrix against an isotropic one with identical total energy: whenever the eigenvalues of the anisotropic
+      one are unequal, there exists <em>some</em> downstream task for which it gives a higher-bias estimate, and
+      at zero regularization its estimator variance is provably higher too. For <strong>nonlinear probing</strong>
+      (k-NN and kernel regression), a theorem bounds the integrated squared bias of both estimators and proves
+      that under a fixed total-variance constraint, the isotropic Gaussian is the <em>unique minimizer</em>. Put
+      together: an isotropic Gaussian embedding is the choice that minimizes worst-case risk across the whole
+      space of possible downstream probes — not a heuristic, a proof.
+    </p>
+    <p>
+      Turning that target into a trainable loss needs one more idea: the <strong>Hyperspherical Cramér–Wold</strong>
+      theorem, which says two distributions in $\R^d$ are identical if and only if <em>every</em> 1-D projection
+      of them is identical. That collapses an intractable multivariate distribution-matching problem into
+      something you can check (and optimize) one direction at a time.
+    </p>
+    <h3>SIGReg: turning the theory into a loss</h3>
+    <p>
+      The paper tests three families of 1-D distributional tests before picking one. Moment-matching (Jarque–Bera
+      style) fails a theorem showing finitely many matched moments never implies full distributional equality.
+      CDF-based tests (Cramér–von Mises, Anderson–Darling) need $O(N\log N)$ sorting and aren't cleanly
+      differentiable. The one that survives is the <strong>Epps–Pulley</strong> characteristic-function test:
+    </p>
+    <p class="eq">$$ \mathrm{SIGReg}_T(\sA, \{f_\theta(x_n)\}) \triangleq \frac{1}{|\sA|}\sum_{\vu\in\sA} T\big(\{\vu^\top f_\theta(x_n)\}_{n=1}^N\big), \qquad T = \int w(t)\,\big|\hat\phi(t)-\phi_0(t)\big|^2\,dt $$</p>
+    <p>
+      where $\hat\phi$ is the empirical characteristic function of the embeddings projected onto direction $\vu$,
+      $\phi_0$ is the standard normal's characteristic function, and $\sA$ is a set of randomly sampled unit
+      directions (resampled every step). A companion theorem proves this statistic has bounded gradient and
+      curvature — it can't blow up during training — and the whole computation is $O(N)$ in batch size: no
+      sorting, just an average of complex exponentials that's trivially summed across GPUs. Because it's a
+      genuine statistical test for the full target distribution, not a proxy like matching variance and
+      covariance (which is what VICReg does, and which SIGReg reduces to as a special case if you swap in a
+      weaker test), collapse is <em>excluded by the test itself</em> — no negative pairs, stop-gradient, or
+      momentum encoder required.
+    </p>
+    <p>
+      The widget below runs the actual SIGReg gradient — the same equation above, not a stand-in — on a small 2D
+      point cloud, live in your browser.
+    </p>
+    <div class="widget-frame" id="sigreg-live">
+      <p class="widget-title">SIGReg, live</p>
+      <p class="widget-sub">50 points start collapsed onto a line (all variance in one direction — classic
+      representation collapse). Take gradient steps on the real SIGReg objective and watch them spread into an
+      isotropic cloud.</p>
+    </div>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/sigreg_unfold.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">The same gradient descent as the widget above, at 160 steps instead of the widget's
+      manual increments — watch the loss fall and the point cloud lose its one preferred direction.</p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/lejepa_unfold.png" alt="Six candidate anti-collapse regularizers applied to an adversarial 2D X-shaped point cloud embedded in high-dimensional noise"/>
+      <figcaption>Fig. from Balestriero &amp; LeCun (2025): a collapsed "X"-shaped 2D density, embedded in
+      high-dimensional noise, driven toward isotropic Gaussian by six candidate regularizers. VICReg and the
+      moment/CDF-based tests leave visible residual structure; Epps–Pulley (SIGReg's choice, rightmost) is the
+      cleanest.</figcaption>
+    </figure>
+    <p>
+      Full training loss, with a single hyperparameter $\lambda$ (default $0.05$) trading off prediction against
+      the isotropic-Gaussian pressure:
+    </p>
+    <p class="eq">$$ \gL_{\rm LeJEPA} = \frac{\lambda}{V}\sum_{v=1}^V \mathrm{SIGReg}\big(\{\vz_{n,v}\}_{n=1}^B\big) + \frac{1-\lambda}{B}\sum_{n=1}^B \big\|\mu_n - \vz_{n,v'}\big\|_2^2 $$</p>
+    <p>
+      Validated across <strong>60+ architectures and 10+ datasets</strong>, stable under sweeps of batch size,
+      embedding dimension, and register-token count; a ViT-H/14 reaches <strong>79% linear-probe accuracy on
+      ImageNet-1k</strong>, and a LeJEPA ViT-L trained for a third the epochs of I-JEPA's ViT-H beats it on
+      average transfer accuracy. The abstract's own framing: the entire method fits in about 50 lines of PyTorch.
+    </p>
+    <div id="quiz-lejepa"></div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="leworldmodel">
+    <h2>3. Node 3 — LeWorldModel (2026)</h2>
+    <p>
+      "LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels" (Maes, Le Lidec,
+      Scieur, LeCun, Balestriero — arXiv:2603.19312) is the first paper in this lineage to actually build a world
+      model in LeCun 2022's sense: a small ViT-Tiny encoder (~5M params) and a 6-layer transformer predictor
+      (~10M params) trained end-to-end from raw pixels, with actions injected via zero-initialized Adaptive
+      LayerNorm at every predictor layer.
+    </p>
+    <p>
+      The training objective is exactly two terms — a next-embedding prediction loss, and SIGReg, imported
+      directly: the method section's own words are that they adopt SIGReg <em>"due to its simplicity, scalability,
+      and stability."</em> Nothing about SIGReg is re-derived; it's used exactly as LeJEPA specifies.
+    </p>
+    <p class="eq">$$ \gL_{\rm LeWM} = \big\|\pred(\vz_t,\va_t) - \vz_{t+1}\big\|_2^2 + \lambda\cdot\mathrm{SIGReg}(\mZ) $$</p>
+    <p>
+      The payoff of importing a provably-correct regularizer instead of hand-tuning heuristics: the paper's own
+      comparison is against PLDM, "the only existing end-to-end alternative," whose loss has <strong>six</strong>
+      separately-tuned coefficients (variance, covariance, temporal-similarity, temporal-variance,
+      temporal-covariance, and an inverse-dynamics term) requiring roughly $O(n^6)$ grid search. LeWorldModel needs
+      one — $\lambda$ — searchable by simple bisection, $O(\log n)$. The ablation below is the real curve from
+      their Push-T experiments.
+    </p>
+    <div class="widget-frame" id="lambda-sensitivity">
+      <p class="widget-title">The one hyperparameter that matters</p>
+      <p class="widget-sub">Real ablation data: success rate stays high across a wide range of &lambda;, peaks
+      near 0.09, and collapses once the regularizer overwhelms the prediction loss.</p>
+    </div>
+    <p>
+      Two results are worth dwelling on. First, <strong>physical structure emerges without being asked for</strong>:
+      linear probes recover object/robot position from single-frame latents competitively with DINOv2-pretrained
+      DINO-WM despite roughly two orders of magnitude less pretraining data, and — unregularized, purely emergent
+      — the cosine similarity between consecutive latent-velocity vectors increases over training, meaning the
+      model's internal notion of "how things move" becomes smoother than its raw training signal required.
+      Second, a <strong>violation-of-expectation test</strong> borrowed from developmental psychology: perturb a
+      rollout by teleporting an object to a random location mid-trajectory, and the model's prediction error
+      spikes significantly ($p&lt;0.01$ across three environments) — while a mere color change produces a much
+      weaker, non-significant response. The model is more surprised by physically impossible events than by
+      visually unusual ones, exactly the asymmetry a real physical world model should have.
+    </p>
+    <p>
+      Headline control numbers: LeWorldModel beats PLDM by <strong>18 percentage points</strong> of success rate
+      on Push-T, and even edges out DINO-WM there despite DINO-WM having access to proprioception that
+      LeWorldModel doesn't. It plans using roughly <strong>200× fewer tokens</strong> per observation than
+      DINO-WM, translating to up to <strong>48× faster planning</strong> than foundation-model-scale world models
+      — under a second per plan.
+    </p>
+    <div id="quiz-lewm"></div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="skyjepa">
+    <h2>4. Node 4 — SkyJEPA (2026)</h2>
+    <p>
+      "SkyJEPA: Learning Long-Horizon World Models for Zero-Shot Sim-to-Real Control of Quadrotors" (Rao, Zhang,
+      Balestriero, LeCun, Loianno — arXiv:2606.23444) takes the same JEPA-plus-SIGReg recipe into a domain
+      LeWorldModel never touches: a physical robot, controlled in real time, on embedded hardware.
+    </p>
+    <p>
+      The state is the quadrotor's full rigid-body state — position, velocity, the three columns of its rotation
+      matrix, and body-frame angular velocity (18 numbers) — and the action is four individual motor thrusts.
+      Two small temporal convolutional encoders (state history, action history) feed a single-layer GRU predictor
+      — the entire latent dynamics model is about <strong>9,000 parameters</strong>, tiny even next to
+      LeWorldModel. The training loss is again prediction-plus-SIGReg, with $\lambda_{\rm sig}=0.02$.
+    </p>
+    <aside class="callout">
+      <strong>Correcting a citation assumption.</strong> It's tempting to assume SkyJEPA builds on LeWorldModel —
+      same broad idea, same two co-authors, three months apart. It doesn't. SkyJEPA cites LeWorldModel exactly
+      once, grouped with other prior JEPA-robotics work as tested only "on toy problems or in exocentric
+      simulation" — a critical, distancing mention, not an endorsement. The SIGReg component is credited directly
+      to LeJEPA. LeWorldModel and SkyJEPA are <strong>siblings</strong>: two independent applications of the same
+      parent theory, not a sequential chain.
+    </aside>
+    <h3>The physics-inspired prober</h3>
+    <p>
+      SkyJEPA's real contribution is what happens after the JEPA world model: a second, separately-trained stage
+      called the <strong>physics-inspired prober</strong>. With the encoders and predictor completely frozen, the
+      prober doesn't try to decode physical state directly from the latent — it predicts only two small residual
+      terms (a translational-acceleration correction and a matrix mapping motor forces to a torque correction) and
+      injects them into a <em>known</em> Newton–Euler rigid-body integrator, including the $SO(3)$ exponential
+      map for attitude update. The frozen JEPA latent only ever has to supply the part of the dynamics that
+      idealized physics gets wrong — drag, motor lag, manufacturing variation — not reinvent Newton's laws from
+      scratch.
+    </p>
+    <div class="widget-frame" id="physics-prober">
+      <p class="widget-title">Structure vs. no structure</p>
+      <p class="widget-sub">Toggle between a generic MLP prober (learns everything from scratch) and the
+      physics-inspired prober (learns only the residual on top of known kinematics) and watch long-horizon error
+      accumulate differently.</p>
+    </div>
+    <p>
+      The ablation that isolates each piece: holding the prober fixed, switching from reconstruction to JEPA
+      training cuts position error from 6.82m to 5.56m — a real but modest gain. Holding the JEPA objective fixed
+      and switching from a generic MLP prober to the physics-inspired one cuts it from 5.56m to
+      <strong>1.43m</strong>, an <strong>84% reduction</strong>, with attitude error falling <strong>91%</strong>.
+      The structured kinematic integrator, not the anti-collapse objective, is doing most of the work — trained
+      on 20,000 trajectories across 500 domain-randomized simulated quadrotors (mass, drag, and motor parameters
+      all varied), it transfers <strong>zero-shot</strong> to a real 1.3kg quadrotor outdoors, cutting position
+      RMSE 26–38% and attitude error 33–54% versus a plain physics-regularized baseline, across five held-out
+      flight trajectories, with no fine-tuning on real data at all.
+    </p>
+    <div id="quiz-skyjepa"></div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="tree">
+    <h2>5. The real family tree</h2>
+    <p>
+      Click through the actual structure. The lesson isn't really about quadrotors or PyTorch line counts — it's
+      that "traceable link" and "linear chain" aren't the same thing. Two papers sharing an author, a publication
+      window, and a research area can still be technically independent; the only way to know is to check what
+      each one's own method section actually cites its mechanism to, not what the abstracts imply.
+    </p>
+    <div class="widget-frame" id="family-tree">
+      <p class="widget-title">Four papers, one shared theorem</p>
+      <p class="widget-sub">Click each node.</p>
+    </div>
+    <div id="quiz-tree"></div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>6. Why the shared theory matters</h2>
+    <p>
+      The reason SIGReg was reusable at all — by two completely different teams, for two completely different
+      robots — is that LeJEPA's theorem is stated about the embedding distribution in the abstract, with no
+      reference to what's being embedded. "Match an isotropic Gaussian" doesn't know or care whether the encoder
+      reads video frames or ten motor-force histories. That's what makes it theory rather than a trick tuned to
+      one dataset: the moment you can state a training objective's correctness independently of the domain, it
+      becomes portable in exactly the way a domain-specific heuristic (a particular augmentation, a particular
+      EMA schedule) never is.
+    </p>
+    <p>
+      It's also why the LeWorldModel/SkyJEPA split is the right kind of divergence, not a redundancy. LeWorldModel
+      spends its effort on the world-model half of the stack — decent-quality frozen representations of physical
+      scenes, useful for many downstream planners. SkyJEPA spends almost none of its effort there (a 9K-parameter
+      world model is tiny) and all of it on the prober — the part that turns a generically-useful latent into a
+      number a flight controller can act on within its 10-millisecond control budget. Both are legitimate,
+      different answers to "given a collapse-proof world model, what do you build around it," and neither needed
+      to wait for the other.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>7. What it means</h2>
+    <p>
+      Zoom out and this is a clean illustration of how a research program actually accumulates, as opposed to how
+      it gets summarized after the fact. LeCun's 2022 paper is a target with an acknowledged gap. LeJEPA is a
+      2025 theorem that closes exactly that gap, in a form general enough to be domain-agnostic. LeWorldModel and
+      SkyJEPA are two 2026 groups independently recognizing "this is the fix for the collapse problem in our own
+      world model" and importing it wholesale, rather than re-deriving their own anti-collapse heuristic from
+      scratch — which is the mark of a genuinely reusable theoretical result, not a coincidence of shared
+      authorship.
+    </p>
+    <h3>Open questions</h3>
+    <ul>
+      <li><strong>Does SIGReg's isotropic-Gaussian target hold up in low-intrinsic-dimensionality settings?</strong>
+      LeWorldModel's own results show it underperforming simpler baselines on their easiest environment (TwoRoom),
+      attributed to the Gaussian prior being a poor fit when the true underlying state space is very low-dimensional.</li>
+      <li><strong>Will the next application in this family cite LeWorldModel or SkyJEPA — or go straight back to LeJEPA
+      again?</strong> Given the pattern so far, betting on the latter is reasonable.</li>
+      <li><strong>Does the prober idea generalize past quadrotors?</strong> SkyJEPA's real lesson — a tiny frozen
+      latent plus a physically-structured probe beats a bigger latent doing everything — is a template, not a
+      quadrotor-specific trick.</li>
+    </ul>
+    <h3>The bottom line</h3>
+    <p>
+      "Traceable link" is doing real work in this piece's own title: it doesn't mean straight line. LeJEPA is the
+      hub, not the second link in a chain — and the honest version of this family tree, the one a citation graph
+      would actually draw, is one strong theoretical result with two independent, unrelated applications standing
+      on it. That's a better outcome for the theory than a strict sequential dependency would have been: it means
+      the isotropic-Gaussian result was correct and general enough to be worth reaching for twice, by two teams
+      who didn't need each other's permission to use it.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Further reading — the lineage: <a href="https://openreview.net/pdf?id=BZ5a1r-kVsf" target="_blank" rel="noopener">LeCun 2022</a> ·
+      <a href="https://arxiv.org/abs/2511.08544" target="_blank" rel="noopener">LeJEPA 2511.08544</a> ·
+      <a href="https://arxiv.org/abs/2603.19312" target="_blank" rel="noopener">LeWorldModel 2603.19312</a> ·
+      <a href="https://arxiv.org/abs/2606.23444" target="_blank" rel="noopener">SkyJEPA 2606.23444</a> — cited along the way:
+      <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">VICReg</a> · PLDM · DINO-WM —
+      the sibling paper in this same family: <a href="adajepa/index.html">AdaJEPA</a>, on test-time adaptation of
+      frozen JEPA world models.
+    </p>
+    <p class="tiny">Figures and numbers throughout are drawn from the cited papers' own reported results; treat
+    exact percentages as the authors' own account. Widget 2 runs the real SIGReg gradient at N=50 points — a
+    faithful small-scale reimplementation, not a canned animation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+<script>
+  buildQuiz('quiz-lecun', [
+    {
+      q: 'What is the World Model module in LeCun\'s 2022 architecture responsible for?',
+      options: ['Estimating the current state from sensory input', 'Predicting future world states given a hypothesized action', 'Measuring the agent\'s discomfort/cost', 'Searching for the best action sequence'],
+      correct: 1,
+      explain: 'Perception estimates the current state; Cost measures discomfort; Actor searches for actions. The World Model is specifically the predictive component — the one all four papers in this lineage build.'
+    },
+    {
+      q: 'Why does the 2022 paper argue for JEPA (predict latents) over a generative model (predict pixels) for the World Model?',
+      options: ['Generative models are always less accurate', 'Reconstructing every pixel wastes capacity on irrelevant, unpredictable detail', 'JEPA models train faster on any hardware', 'Pixels cannot be differentiated'],
+      correct: 1,
+      explain: 'The argument is about where capacity and gradient signal go: a decoder is forced to account for every pixel, including irrelevant noise, while a JEPA can represent only what is genuinely predictable.'
+    },
+  ]);
+
+  buildQuiz('quiz-lejepa', [
+    {
+      q: 'According to LeJEPA\'s theory, which embedding distribution minimizes worst-case downstream risk across linear and nonlinear probes?',
+      options: ['A uniform distribution on the unit sphere', 'An isotropic Gaussian', 'A distribution matching the input data exactly', 'Any distribution with zero mean'],
+      correct: 1,
+      explain: 'Both the linear-probing (ridge regression bias/variance) and nonlinear-probing (k-NN, kernel regression) analyses conclude the isotropic Gaussian uniquely minimizes worst-case risk under a fixed total-variance constraint.'
+    },
+    {
+      q: 'What does the Hyperspherical Cramér–Wold result let SIGReg do?',
+      options: ['Compute exact multivariate density estimates', 'Reduce matching a full multivariate distribution to matching many 1-D projections', 'Skip the need for a target distribution entirely', 'Guarantee convergence in one gradient step'],
+      correct: 1,
+      explain: 'Cramér–Wold says two distributions are identical iff every 1-D projection is identical — turning an intractable multivariate test into an average over cheap, differentiable 1-D tests.'
+    },
+    {
+      q: 'Why did the paper reject CDF-based tests (Cramér–von Mises, Anderson–Darling) in favor of the Epps–Pulley characteristic-function test?',
+      options: ['CDF-based tests are more accurate but patented', 'CDF-based tests require O(N log N) sorting and are not cleanly differentiable', 'Epps–Pulley was the only test invented after 2020', 'CDF-based tests cannot detect collapse at all'],
+      correct: 1,
+      explain: 'Sorting breaks GPU-friendly parallelism and clean differentiability; the characteristic-function test is a smooth average of complex exponentials, O(N), with provably bounded gradients.'
+    },
+  ]);
+
+  buildQuiz('quiz-lewm', [
+    {
+      q: 'How many tunable loss hyperparameters does LeWorldModel need, versus PLDM ("the only existing end-to-end alternative")?',
+      options: ['Six, same as PLDM', 'One (λ) versus PLDM\'s six', 'Zero versus PLDM\'s one', 'Twelve versus PLDM\'s six'],
+      correct: 1,
+      explain: 'PLDM\'s loss has six separately-tuned coefficients (variance, covariance, temporal-similarity/variance/covariance, inverse-dynamics). LeWorldModel\'s SIGReg-based loss needs only λ, searchable by simple bisection.'
+    },
+    {
+      q: 'In the violation-of-expectation test, what triggers a significant prediction-error spike, and what does not?',
+      options: ['Color changes spike strongly; teleportation barely registers', 'Teleporting an object spikes significantly (p<0.01); a color change is weak/non-significant', 'Both trigger identical spikes', 'Neither triggers any measurable change'],
+      correct: 1,
+      explain: 'This is exactly the asymmetry a physical world model should show: sensitive to physically impossible events (teleportation), much less sensitive to merely visually unusual ones (recoloring).'
+    },
+  ]);
+
+  buildQuiz('quiz-skyjepa', [
+    {
+      q: 'Which paper does SkyJEPA\'s SIGReg anti-collapse term actually come from?',
+      options: ['LeWorldModel, cited as its direct training-recipe backbone', 'LeJEPA, cited directly — LeWorldModel is only mentioned in passing', 'Neither — SkyJEPA derives its own regularizer', 'V-JEPA'],
+      correct: 1,
+      explain: 'Despite the surface similarity to LeWorldModel (shared co-authors, same year), SkyJEPA\'s method section credits SIGReg to LeJEPA directly. LeWorldModel appears only in a critical, distancing citation.'
+    },
+    {
+      q: 'What does the physics-inspired prober actually predict — full physical state, or something narrower?',
+      options: ['The complete 18-dimensional physical state directly from the latent', 'Only two small residual terms, injected into a known Newton-Euler integrator', 'A full second neural network duplicating the physics engine', 'Nothing — it decodes the latent directly to images'],
+      correct: 1,
+      explain: 'The prober predicts a residual acceleration and a residual torque-mapping matrix; the actual state comes from integrating known rigid-body kinematics, corrected by those residuals — it never has to relearn Newton\'s laws.'
+    },
+    {
+      q: 'In the ablation, which change produced the larger error reduction — switching to JEPA training, or switching to the physics-inspired prober?',
+      options: ['JEPA training (6.82m → 5.56m is a bigger relative change)', 'The physics-inspired prober (5.56m → 1.43m, an 84% reduction)', 'They contributed exactly equally', 'Neither changed the error at all'],
+      correct: 1,
+      explain: 'JEPA vs. reconstruction (holding prober fixed) is a modest gain, 6.82→5.56m. Generic vs. physics-inspired prober (holding the objective fixed) is the big one: 5.56→1.43m, an 84% reduction.'
+    },
+  ]);
+
+  buildQuiz('quiz-tree', [
+    {
+      q: 'What is the actual shape of this citation graph?',
+      options: ['A strict linear chain: LeCun 2022 → LeJEPA → LeWorldModel → SkyJEPA', 'A branch: LeCun 2022 → LeJEPA → {LeWorldModel, SkyJEPA} as independent siblings', 'Four unrelated papers that happen to share a topic', 'A cycle — each paper cites all the others'],
+      correct: 1,
+      explain: 'LeJEPA is the hub. LeWorldModel and SkyJEPA both import SIGReg directly from LeJEPA, independently of each other — despite SkyJEPA citing LeWorldModel, it does so dismissively, not as a technical basis.'
+    },
+  ]);
+</script>
+</body>
+</html>

@@ -170,7 +170,7 @@
       training the network gets queried at continuous positions, not a fixed grid).
       The integral becomes a sum that is exactly classical alpha compositing:
     </p>
-    <p class="eq">$$ \hat{C}(\vr) = \sum_{i=1}^{N} T_i\,\big(1 - e^{-\sigma_i \delta_i}\big)\,\vc_i, \qquad T_i = \exp\!\Big(\!-\!\sum_{j<i}\sigma_j \delta_j\Big), \qquad \alpha_i = 1 - e^{-\sigma_i \delta_i} $$</p>
+    <p class="eq">$$ \hat{C}(\vr) = \sum_{i=1}^{N} T_i\,\big(1 - e^{-\sigma_i \delta_i}\big)\,\vc_i, \qquad T_i = \exp\!\Big(\!-\!\sum_{j&lt;i}\sigma_j \delta_j\Big), \qquad \alpha_i = 1 - e^{-\sigma_i \delta_i} $$</p>
     <p>
       where $\delta_i$ is the distance between adjacent samples. This sum is trivially
       differentiable in every $(\vc_i, \sigma_i)$, so gradients of a pixel error flow

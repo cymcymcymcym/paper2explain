@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Quality: How Do You Know Your Training Data Is Any Good? — an interactive explainer</title>
+  <meta name="description" content="A field guide to judging training data before you train on it: the math (distribution shift, diversity, distinguishability) and the methods (dedup, filtering, importance resampling) real pipelines use."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vx': '{\\mathbf{x}}', '\\vy': '{\\mathbf{y}}',
+        '\\E': '{\\mathbb{E}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">A field guide</p>
+    <h1>Data Quality: How Do You Know Your Training Data Is Any Good?</h1>
+    <p class="byline">
+      A field guide to judging training data before you train on it &middot; the math of distribution, diversity and
+      distinguishability &middot; deduplication, filtering, and importance resampling &middot; case studies from GPT-3 to FineWeb
+    </p>
+    <p class="lede">
+      Every model is downstream of a pile of text (or images, or trajectories) that someone decided was good enough
+      to learn from — and almost none of that decision is made by reading the data. It's made by a chain of
+      statistical tests: is this document a near-duplicate of one we've already kept? Does it look enough like the
+      kind of text we want? Could a classifier even tell our training set apart from our test set? This is the
+      full toolkit — the math that answers those questions, the methods that apply it at web scale, and what happens
+      when real pipelines get it right (and wrong).
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#framework">Five questions "is this data good?" breaks into</a></li>
+      <li><a href="#toolkit">The math: distribution, diversity, distinguishability</a></li>
+      <li><a href="#dedup">Finding near-duplicates</a></li>
+      <li><a href="#filtering">Quality filtering: heuristics, perplexity, classifiers</a></li>
+      <li><a href="#matching">Matching a target distribution</a></li>
+      <li><a href="#case-studies">Case studies: what good data engineering looks like</a></li>
+      <li><a href="#why">Why this matters more every year</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      In 2020, a five-line logistic regression classifier — trained on a few hundred thousand Wikipedia and
+      book excerpts as "good" examples versus raw Common Crawl as "bad" ones — decided which few percent of the
+      entire scraped web was worth GPT-3 reading. No architecture search, no extra parameters, no new loss
+      function. Just a filter, applied before training ever started. Half a decade later, the frontier labs still
+      spend more engineering effort on <em>what goes into</em> the model than almost anything that happens once
+      training begins.
+    </p>
+    <p>
+      That's the uncomfortable truth about "data quality": it isn't a vibe, and it isn't one number. It's a
+      compounding stack of independent statistical tests, each answering a narrower question than it sounds like —
+      <em>is this a duplicate? Does this look like the target domain? Would a simple model even notice if I swapped
+      this document for a random one?</em> — and each with decades of history, from 1970s two-sample statistics to
+      2023's semantic deduplication papers.
+    </p>
+    <p>
+      This is the full toolkit: the mathematics for measuring distribution shift, diversity, and distinguishability
+      directly, the concrete methods (deduplication, heuristic and learned filtering, importance resampling) that
+      turn that math into a pipeline, and four real case studies — GPT-3's original web-text classifier, the
+      Hugging Face FineWeb pipeline, LIMA's 1,000-example alignment set, and what happens when you skip
+      deduplication entirely — of what "good data engineering" concretely looks like.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="framework">
+    <h2>1. Five questions "is this data good?" breaks into</h2>
+    <p>
+      "Data quality" is a folk category that dissolves, on inspection, into several genuinely different questions —
+      and the reason data pipelines have five-plus distinct stages is that no single test answers more than one of
+      them:
+    </p>
+    <ul>
+      <li><strong>Validity.</strong> Is this a real, parseable document in the language and format you expect, or
+      boilerplate, an error page, a wall of navigation links?</li>
+      <li><strong>Redundancy.</strong> Have you (or the model) already seen this, or something close enough to it
+      that a second copy teaches nothing new — and worse, risks being memorized verbatim?</li>
+      <li><strong>Distributional fit.</strong> Does this document look like the kind of text you actually want the
+      model to learn from, or is it merely <em>available</em>?</li>
+      <li><strong>Diversity.</strong> Across the whole retained set, is there enough genuine variation, or did your
+      filters accidentally converge everything onto one narrow style?</li>
+      <li><strong>Contamination.</strong> Does this document leak the answer to a test you're going to grade the
+      model on later?</li>
+    </ul>
+    <p>
+      Every method in this piece is an answer to exactly one of those five questions, and the case studies later on
+      show what happens when a pipeline only answers some of them.
+    </p>
+    <aside class="callout">
+      <strong>Why not just use more data?</strong> Because more low-quality data doesn't average out — a model
+      trained on twice the tokens of mixed quality can lose to one trained on half the tokens of curated quality,
+      because gradient steps on redundant or off-distribution text don't just fail to help, they compete for
+      capacity against the steps that would have helped. See <a href="#why">§8</a>.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="toolkit">
+    <h2>2. The math: distribution, diversity, distinguishability</h2>
+    <p>
+      Before any specific method, it helps to have precise mathematical language for the three properties every
+      quality method ultimately measures. All three can be computed from nothing but pairwise similarities between
+      data points — which is why the same handful of tools reappears under different names throughout this piece.
+    </p>
+    <h3>Distribution shift: is set B drawn from the same distribution as set A?</h3>
+    <p>
+      The classical tools are information-theoretic divergences — <strong>KL divergence</strong>
+      $D_{KL}(P\|Q) = \E_{x\sim P}\left[\log \frac{P(x)}{Q(x)}\right]$ and its symmetric cousin the
+      <strong>Jensen–Shannon divergence</strong> — but both require density estimates, which is exactly what you
+      don't have for a pile of raw documents. The tool that avoids this is the
+      <strong>Maximum Mean Discrepancy</strong> (MMD; Gretton et al., 2012): embed both sets through a kernel
+      $k(x,y)$ and compare only mean embeddings,
+    </p>
+    <p class="eq">$$ \mathrm{MMD}^2(P,Q) = \E_{x,x'\sim P}[k(x,x')] + \E_{y,y'\sim Q}[k(y,y')] - 2\,\E_{x\sim P, y\sim Q}[k(x,y)] $$</p>
+    <p>
+      which is zero iff $P=Q$ (for a characteristic kernel like the Gaussian RBF) and estimable from finite samples
+      with no density estimation at all — just pairwise kernel evaluations. This is the same quantity that shows
+      up, in disguise, wherever a paper claims a training set "matches" or "doesn't match" a target domain.
+    </p>
+
+    <h3>Diversity: how many effectively distinct things are in this set?</h3>
+    <p>
+      Counting unique documents is useless — near-duplicates inflate the count without adding information.
+      The <strong>Vendi Score</strong> (Friedman &amp; Dieng, 2022, arXiv:2210.02410) fixes this by treating
+      diversity as an <em>effective count</em>, borrowing the same "effective number of species" idea from
+      ecology. Build a similarity matrix $K$ over the set (any kernel with $K_{ii}=1$), normalize it to
+      $K/n$, and take the exponential of its von Neumann entropy:
+    </p>
+    <p class="eq">$$ \mathrm{VS}(K) = \exp\!\left(-\sum_i \lambda_i \log \lambda_i \right), \qquad \lambda_i = \text{eigenvalues of } K/n $$</p>
+    <p>
+      A set of $n$ identical points scores $\mathrm{VS}=1$; $n$ mutually orthogonal (maximally distinct) points
+      scores $\mathrm{VS}=n$. Six clusters of near-duplicates score close to 6, no matter how many total points you
+      have — which is exactly the failure mode raw document counts can't see and deduplication is meant to fix.
+    </p>
+
+    <h3>Distinguishability: could a classifier even tell these two sets apart?</h3>
+    <p>
+      This is the most operational of the three, because it's literally the question every learned quality filter,
+      DSIR-style importance weight, and contamination check is built on: train (or simulate) a classifier to
+      separate set A from set B, and read off its accuracy. Near 50% (chance, for balanced sets) means the two
+      sets are statistically indistinguishable; near 100% means a simple model can spot the difference every time.
+      The cheapest version that needs no training at all is the classic <strong>nearest-neighbor two-sample
+      test</strong> (Friedman &amp; Rafsky, 1979; reframed for deep learning as the "classifier two-sample test" by
+      Lopez-Paz &amp; Oquab, 2017): pool both sets, and for every point check whether its single nearest neighbor
+      shares its label. The fraction that do is the test statistic — and it's this same logic, scaled up to a real
+      logistic-regression or fastText classifier over text features, that GPT-3's data pipeline and DSIR's
+      importance weights both run internally (see §5–6).
+    </p>
+
+    <div class="widget-frame" id="distribution-sandbox">
+      <p class="widget-title">Distribution sandbox</p>
+      <p class="widget-sub">Drag the reference and candidate clouds apart, stretch the candidate's spread, or flip
+      it to "duplicate-heavy" — and watch three genuinely different statistics respond to the same change.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="dedup">
+    <h2>3. Finding near-duplicates</h2>
+    <p>
+      Exact duplicates are trivial — hash the document, drop repeats. The real problem is <em>near</em>-duplicates:
+      the same news wire copy syndicated to forty sites with different navigation chrome, the same product
+      description template with the noun swapped, the same forum signature block appended to ten thousand
+      unrelated posts. <strong>Lee et al., 2022</strong> ("Deduplicating Training Data Makes Language Models
+      Better," arXiv:2107.06499) found that this kind of near-duplication was severe enough in standard LM
+      pretraining corpora that some sequences were emitted <em>verbatim</em> by trained models thousands of times
+      more often than their training frequency would predict — and that deduplicating the training set cut
+      that memorization dramatically while <em>matching or improving</em> validation perplexity, using fewer
+      training steps.
+    </p>
+    <p>
+      Their method (and the one CCNet, GPT-3, and nearly every large pretraining pipeline since has converged on)
+      is <strong>MinHash + Locality-Sensitive Hashing</strong>. Break each document into overlapping word- or
+      character-shingles, treat the document as the <em>set</em> of its shingles, and estimate the
+      Jaccard similarity $J(A,B) = |A\cap B| / |A\cup B|$ between any two documents without ever computing the
+      full intersection:
+    </p>
+    <p class="eq">$$ \Pr[\,\min_{s\in A} h(s) = \min_{s\in B} h(s)\,] = J(A,B) $$</p>
+    <p>
+      for a uniformly random hash function $h$. Run $H$ independent hash functions, keep the minimum hash value
+      each produces for every document (its <em>signature</em>), and the fraction of matching signature slots
+      between two documents is an unbiased estimator of their true Jaccard similarity — one that gets tighter as
+      $H$ grows, by nothing more exotic than the law of large numbers. Bucket documents by bands of their
+      signatures (LSH) and you can find every pair above a similarity threshold across a billion-document corpus
+      without ever comparing most pairs directly. Lee et al.'s own pipeline used signatures of 9,000 hash
+      functions (20 bands of 450) and flagged anything above Jaccard 0.8 — plus a second, complementary pass
+      (<strong>EXACTSUBSTR</strong>) that used a suffix array to find any verbatim span of 50+ tokens shared
+      across documents, regardless of what surrounded it.
+    </p>
+    <p>
+      The scale of the problem is easy to underestimate until you measure it: <strong>3.04%</strong> of C4's
+      training documents turned out to be near-duplicates of another document in the same corpus, <strong>13.63%</strong>
+      of RealNews, and one 61-word sentence in C4 appeared <strong>61,036 times</strong> verbatim. The payoff for
+      removing it wasn't just a smaller corpus — a model trained on the deduplicated data emitted memorized
+      50-token training sequences at <strong>0.189%</strong> the rate (NearDup) or <strong>0.138%</strong> (ExactSubstr)
+      of a model trained on the original data's <strong>1.926%</strong> rate, an order-of-magnitude drop in verbatim
+      memorization, while matching or slightly improving validation perplexity using fewer training steps.
+    </p>
+    <p>
+      A newer variant skips shingles entirely and works in embedding space. <strong>SemDeDup</strong>
+      (Abbas et al., 2023, arXiv:2303.09540) embeds every document, k-means clusters the embeddings, and within
+      each cluster removes near-duplicates whose cosine similarity exceeds a threshold — catching paraphrases and
+      reformattings that share no exact shingles at all, which pure MinHash is blind to. On LAION-440M, removing
+      <strong>37%</strong> of the data this way cost just <strong>0.08 points</strong> of ImageNet accuracy
+      (68.74%→68.66%); removing <strong>50%</strong> cost <strong>0.47 points</strong> while halving training
+      time — and on several out-of-distribution evals, the <em>smaller, deduplicated</em> set actually scored
+      higher than the full one.
+    </p>
+
+    <div class="widget-frame" id="minhash-dedup">
+      <p class="widget-title">MinHash near-duplicate detector</p>
+      <p class="widget-sub">Pick a document pair, then drag the number of hash functions and watch the MinHash
+      estimate converge onto the true Jaccard similarity.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="filtering">
+    <h2>4. Quality filtering: heuristics, perplexity, classifiers</h2>
+    <p>
+      Once duplicates are gone, most of what's left of a raw crawl is still not text you'd want to train on:
+      navigation chrome, keyword-stuffed spam, auto-generated boilerplate, non-language symbol soup from encoding
+      failures. Three families of filter attack this, in roughly increasing order of cost and precision.
+    </p>
+    <h3>Heuristic rules</h3>
+    <p>
+      The cheapest filters are simple, hand-written thresholds — no model required. <strong>C4</strong>
+      (Raffel et al., "Exploring the Limits of Transfer Learning...," 2019, arXiv:1910.10683 — the dataset behind
+      T5) keeps only lines ending in terminal punctuation, discards pages under three sentences, drops any page
+      containing a word from a fixed obscenity list, a "lorem ipsum" placeholder, a curly brace (usually code),
+      or the word "Javascript," and deduplicates any three-sentence span that recurs elsewhere in the corpus. That
+      pipeline alone took a 6.1 TB raw crawl down to <strong>745 GB</strong>. DeepMind's <strong>Gopher /
+      MassiveText</strong> pipeline (Rae et al., 2021, arXiv:2112.11446) goes further with a battery of statistical
+      thresholds instead of a wordlist — word count between 50 and 100,000, mean word length between 3 and 10
+      characters, a symbol-to-word ratio under 0.1, at least 80% of words containing an alphabetic character, a
+      requirement that at least two of a short list of common English stop words appear, and explicit repetition
+      ratios (reject if more than 30% of lines or paragraphs are duplicated within the document). Gopher's authors
+      deliberately skip a wordlist entirely, citing evidence that such lists over-remove text written in minority
+      dialects and about minority identities.
+    </p>
+    <h3>Perplexity filtering</h3>
+    <p>
+      A cheap statistical model can do better than fixed thresholds. <strong>CCNet</strong> (Wenzek et al., 2019,
+      arXiv:1911.00359) first deduplicates at the paragraph level with a simple hash (removing roughly
+      <strong>70%</strong> of raw text on its own), then trains a 5-gram KenLM model per language on Wikipedia and
+      scores every remaining paragraph by perplexity under it — bucketing into "head" (looks like Wikipedia),
+      "middle," and "tail" (doesn't). On one February 2019 crawl, this took 24 TB and 3 billion pages down to 1.5
+      billion documents across 174 languages, and a BERT model trained only on the resulting English "head" bucket
+      beat one trained on Wikipedia itself by <strong>3.3 points</strong> on XNLI (75.9 vs. 72.6). The catch, and
+      the reason no serious pipeline uses perplexity alone: a highly repetitive spam page can score a
+      <em>deceptively low</em> perplexity, because repeated text is trivially predictable. That's why real
+      pipelines pair a perplexity cut with the repetition heuristics above, not either one alone — the same
+      Goodhart's-Law lesson that shows up everywhere a metric becomes a target.
+    </p>
+    <h3>Learned quality classifiers</h3>
+    <p>
+      The most expensive and most precise option: train an actual classifier to score documents by quality. GPT-3
+      (Brown et al., 2020, arXiv:2005.14165) trained a logistic-regression classifier on hashed text features to
+      distinguish curated reference text (WebText, Wikipedia, books) from raw Common Crawl, then kept each crawled
+      document with probability drawn from a Pareto distribution shaped by that classifier's score — a soft cut
+      rather than a hard threshold, tuned so the accepted documents matched WebText's own score distribution. That
+      classifier plus MinHashLSH dedup took 45 TB of crawled text down to <strong>570 GB</strong> — roughly
+      <strong>1.3%</strong> of the raw input. Years later, Hugging Face's <strong>FineWeb-Edu</strong> pipeline
+      (Penedo et al., 2024, arXiv:2406.17557) pushed the same idea further: have Llama-3-70B-Instruct label 460,000
+      pages for educational value on a 0–5 scale, then distill those labels into a small classifier (82% F1 at a
+      keep-threshold of 3) cheap enough to run over the entire multi-trillion-token pool. It kept only <strong>1.3
+      trillion</strong> of FineWeb's 15 trillion tokens — throwing away <strong>92%</strong> — and a 1.7B model
+      trained on that sliver still <em>beat</em> one trained on the full set: MMLU rose from 33% to 37%, ARC from
+      46% to 57%, matching other web datasets' scores using roughly <strong>10× fewer tokens</strong>.
+    </p>
+
+    <div class="widget-frame" id="perplexity-filter">
+      <p class="widget-title">Perplexity quality filter</p>
+      <p class="widget-sub">A synthetic but realistically shaped distribution of document perplexities. Drag the
+      head and tail cutoffs and watch the keep rate — and what kind of text falls into each bucket.</p>
+    </div>
+
+    <h3>Decontamination: does this leak the answer?</h3>
+    <p>
+      This is the fifth question from §1 in its cleanest form — a two-sample distinguishability check between your
+      training set and the specific benchmarks you'll grade the model on. GPT-3's pipeline swept for 13-gram
+      overlaps between training documents and benchmark text, removing a window around every collision — though a
+      bug in that filter left some overlap only partially removed, and by the authors' own count, roughly a
+      quarter of the benchmarks they checked had more than half their examples overlapping the training set
+      (DROP hit 94%). GPT-4's technical report (2023, arXiv:2303.08774) used a coarser but faster substring check —
+      three random 50-character snippets per example — and found contamination ranging from about 1% (GSM8K) to
+      39% (LSAT), concluding that the measured effect on scores was "generally small and about as often positive
+      as negative." That last finding is easy to misread as "contamination doesn't matter" — it's closer to "we
+      couldn't detect a large effect with this method," which is itself a reason to run a real decontamination
+      pass rather than skip it.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="matching">
+    <h2>5. Matching a target distribution</h2>
+    <p>
+      Filtering removes bad documents; it doesn't tell you the retained set has the right <em>proportions</em>. If
+      your downstream task looks like formal writing and your raw pool is 90% forum chatter, uniformly filtering
+      out the worst 10% of forum chatter still leaves you with mostly forum chatter. <strong>DSIR</strong>
+      (Data Selection via Importance Resampling; Xie et al., 2023, arXiv:2302.03169) reframes the problem as
+      exactly what its name says: importance resampling from classical Monte Carlo, applied to text selection.
+    </p>
+    <p>
+      For every candidate document $x$ in the raw pool, estimate an importance weight
+    </p>
+    <p class="eq">$$ w(x) = \frac{p_{\text{target}}(x)}{p_{\text{raw}}(x)} $$</p>
+    <p>
+      using two cheap generative classifiers — multinomial models over hashed uni- and bigrams (10,000 buckets),
+      one fit to a sample of the target domain and one fit to the raw pool — then resample the raw pool without
+      replacement, with probability proportional to $w(x)$ (via a Gumbel-top-$k$ trick, so the whole selection is
+      one pass with no rejection sampling). Documents that look like the target relative to how common they are in
+      the raw pool get oversampled; documents that are either off-target or already overrepresented get
+      downweighted. No document is ever manually labeled "good" or "bad" — the target domain (say, Wikipedia plus
+      books) implicitly defines the shape of what "good" means for this specific model. Selecting from The Pile
+      against a Wikipedia+books target, DSIR reached an <strong>82.30%</strong> average on GLUE — beating both
+      random selection (80.25%) and a GPT-3-style trained classifier filter (79.85%) — while running on nothing
+      more exotic than a single 96-core CPU node, no GPU required.
+    </p>
+
+    <div class="widget-frame" id="dsir-resampling">
+      <p class="widget-title">Importance resampling</p>
+      <p class="widget-sub">A broad raw pool (grey) and a tight target domain (purple), simplified to 2D. Drag the
+      resampling temperature from uniform toward fully importance-weighted and watch the selection concentrate.</p>
+    </div>
+
+    <h3>The expensive tier: data attribution</h3>
+    <p>
+      Everything so far scores a document in isolation. The most expensive tier asks a sharper question: <em>which
+      specific training examples caused this specific model behavior?</em> <strong>Influence functions</strong>
+      approximate the counterfactual "how would this model's output change if example $z$ were upweighted?" without
+      retraining, via $I_f(z) = -\nabla f(\theta^*)^\top H^{-1} \nabla L(z,\theta^*)$ — a Hessian-vector product
+      that is intractable at LLM scale unless you approximate it. Anthropic's <strong>Grosse et al., 2023</strong>
+      (arXiv:2308.03296) made it tractable with an EK-FAC approximation to the Gauss-Newton Hessian, and found
+      something that only shows up once you scale the search from 810M to 52B parameters: the most influential
+      training examples stop being lexical near-matches and start being <em>thematic</em> ones. Asked why a model
+      resisted being shut down, the 810M model's top influences were simple keyword overlaps; the 52B model's
+      included a passage of HAL's dialogue from <em>2010: Odyssey Two</em> — no shared vocabulary, just the same
+      underlying scenario. This tier is too expensive to run over a whole pretraining corpus, but it's exactly the
+      tool for the question dedup, filtering, and resampling can't answer: not "is this data good," but "is this
+      the data actually responsible for the behavior you're trying to understand."
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="case-studies">
+    <h2>6. Case studies: what good data engineering looks like</h2>
+    <p>
+      Individually, dedup and filtering are textbook methods. The interesting engineering is in how real pipelines
+      compose them — and how differently "good data" can look depending on what stage of training you're feeding.
+    </p>
+
+    <div class="widget-frame" id="pipeline-funnel">
+      <p class="widget-title">The filtering pipeline funnel</p>
+      <p class="widget-sub"><strong>RefinedWeb</strong> (Penedo et al., 2023). Toggle each stage on and off and
+      watch what fraction of the raw Common Crawl survives to the final training corpus.</p>
+    </div>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/data_funnel.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">Language ID leaves 48% of the raw crawl; quality heuristics take that down to 23% of
+      the <em>original</em>; deduplication removes another 45% of what's left — ending around 12–13% of the raw
+      crawl. RefinedWeb's whole argument was that this — heuristics and dedup, with <em>no learned classifier at
+      all</em> — was enough on its own: a 1B-parameter model trained on it scored 56.2% on their aggregate benchmark,
+      against 55.7% for C4, 55.0% for OSCAR, and 53.4% for the hand-curated Pile.</p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Case study</th><th>What they did</th><th>Headline result</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="2" class="cat">Filtering</td>
+          <td>GPT-3 / Common Crawl (Brown et al., 2020)</td>
+          <td>Pareto-weighted quality classifier + MinHashLSH dedup: 45&nbsp;TB raw → <strong>570&nbsp;GB</strong> (~1.3% kept)</td>
+        </tr>
+        <tr>
+          <td>FineWeb-Edu (Penedo et al., 2024)</td>
+          <td>LLM-distilled educational classifier drops 92% of FineWeb's tokens; the 8% left <strong>beats</strong> the
+          full set on MMLU (33%→37%) and ARC (46%→57%) using ~10× fewer tokens</td>
+        </tr>
+        <tr>
+          <td class="cat">Curation</td>
+          <td>LIMA (Zhou et al., 2023)</td>
+          <td><strong>1,000</strong> hand-curated instruction examples, no RLHF — beats Alpaca-65B head-to-head
+          (53 wins / 21 ties / 26 losses) and ties DaVinci003 (44/21/35)</td>
+        </tr>
+        <tr>
+          <td class="cat">Dedup</td>
+          <td>Lee et al., 2022</td>
+          <td>Removing near-duplicates cuts verbatim memorization from <strong>1.93%</strong> to <strong>0.14–0.19%</strong>
+          of generations, perplexity unchanged or improved</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">GPT-3, RefinedWeb, and Lee et al. figures are from the cited papers' own reported pipeline
+    statistics and ablations; treat exact percentages as order-of-magnitude illustrations of each method rather
+    than a guarantee that any other corpus filters at the same rate.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>7. Why this matters more every year</h2>
+    <p>
+      Two results from the last few years explain why "just add more tokens" stopped being a satisfying answer to
+      a data shortfall.
+    </p>
+    <p>
+      The first is about <strong>repeating what you already have</strong>. Muennighoff et al.'s data-constrained
+      scaling laws (2023, arXiv:2305.16264) found that training on up to <strong>4 epochs</strong> of repeated data
+      costs almost nothing compared to the same number of unique tokens — repetition has real value, not just
+      redundancy. But that value decays: their fitted "repetition half-life" puts the point of steeply diminishing
+      returns around <strong>15 epochs</strong>, and by roughly 40 epochs additional repeats are worth close to
+      nothing. The nuance that matters for this whole piece: in their experiments, filtering to the lowest-perplexity
+      quarter of the data <em>improved</em> loss, while naive deduplication filtering on its own did not — repetition
+      and redundancy are related problems, but they don't have the same fix, which is exactly why this piece has
+      needed five separate tools rather than one.
+    </p>
+    <p>
+      The second is about <strong>what happens when you run out of real data and reach for synthetic data
+      instead</strong>. Shumailov et al.'s "model collapse" result (Nature, 2024; arXiv:2305.17493) trains a model,
+      generates text from it, trains the next generation on that generated text, and repeats — a recursive loop
+      that increasingly resembles how a model-saturated web actually works. Each generation's output distribution
+      narrows: rare, correct tail behavior disappears first, then more and more mass concentrates on a shrinking
+      set of "safe" generic outputs. Their OPT-125M/wikitext2 experiment shows perplexity degrading from 20 to 28
+      across ten generations of this loop — and one qualitative example is hard to forget: a benign prompt about
+      medieval architecture degenerates, by the ninth generation, into a repeating list of jackrabbit color
+      variants. The fix in their experiments wasn't esoteric — keeping just <strong>10%</strong> real data mixed
+      into each generation prevented most of the degradation. But it does mean that <em>distinguishing real from
+      model-generated text</em> — precisely the "distinguishability" question from §2 — is quietly becoming as
+      important a data-quality check as deduplication or contamination.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>8. What it means</h2>
+    <p>
+      Put the five questions from §1 back together and a pattern falls out: none of them get easier as models get
+      bigger. If anything, scale raises the stakes on every one of them at once — more parameters to memorize a
+      near-duplicate verbatim, more capacity to overfit a contaminated benchmark, more tokens needed to notice a
+      subtly shifted distribution, and (per §7) a shrinking supply of clearly-real data to check any of it against.
+      "Data quality" isn't a preprocessing footnote you can bolt onto a bigger model later — it's a set of
+      statistical tests that has to run before training starts, get cheaper as they get less precise, and compound
+      when chained.
+    </p>
+    <p>
+      That compounding is also the practical decision rule. Cheap, high-leverage checks come first: exact and
+      near-duplicate removal (§3) is close to free relative to its effect on memorization, and heuristic rules
+      (§4) require no training at all. Perplexity and learned classifiers (§4) cost more but buy real precision —
+      FineWeb-Edu's willingness to throw away 92% of its own tokens only pays off because the classifier is cheap
+      to run at that scale. Decontamination (§4) isn't optional at any budget; it's the one check whose absence
+      you can't detect from your own training curves. Distribution-matching (§5) and data attribution (§5) are
+      the expensive, precise tools — worth it exactly when the marginal document matters more than the aggregate
+      count, which is why LIMA's 1,000 examples and Anthropic's per-example influence search both live at that end
+      of the cost spectrum, not the pretraining end.
+    </p>
+    <h3>The bottom line</h3>
+    <p>
+      "Is this data good?" was never one question with one number. It's five narrower ones — validity, redundancy,
+      distributional fit, diversity, contamination — each with its own mathematics (distribution shift, an
+      effective-count diversity score, a distinguishability test) and its own family of methods (heuristics,
+      perplexity, learned classifiers, MinHash, importance resampling, influence functions). The toolkit doesn't
+      change as models scale up. It just has to run earlier, cheaper, and more automatically than it used to — because
+      the next 10x in model size is now more likely to come from a better filter than a bigger crawl.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Further reading, by topic — filtering: <a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">C4</a> ·
+      <a href="https://arxiv.org/abs/2112.11446" target="_blank" rel="noopener">Gopher/MassiveText</a> ·
+      <a href="https://arxiv.org/abs/1911.00359" target="_blank" rel="noopener">CCNet</a> ·
+      <a href="https://arxiv.org/abs/2406.17557" target="_blank" rel="noopener">FineWeb</a> ·
+      <a href="https://arxiv.org/abs/2306.01116" target="_blank" rel="noopener">RefinedWeb</a> — dedup:
+      <a href="https://arxiv.org/abs/2107.06499" target="_blank" rel="noopener">Lee et al., "Deduplicating Training Data"</a> ·
+      <a href="https://arxiv.org/abs/2303.09540" target="_blank" rel="noopener">SemDeDup</a> — matching &amp; attribution:
+      <a href="https://arxiv.org/abs/2302.03169" target="_blank" rel="noopener">DSIR</a> ·
+      <a href="https://arxiv.org/abs/2308.03296" target="_blank" rel="noopener">Grosse et al., influence functions</a> —
+      diversity &amp; distinguishability: <a href="https://arxiv.org/abs/2210.02410" target="_blank" rel="noopener">Vendi Score</a> ·
+      <a href="https://arxiv.org/abs/1610.06545" target="_blank" rel="noopener">Lopez-Paz &amp; Oquab, classifier two-sample test</a> —
+      curation: <a href="https://arxiv.org/abs/2305.11206" target="_blank" rel="noopener">LIMA</a> — why it matters:
+      <a href="https://arxiv.org/abs/2305.16264" target="_blank" rel="noopener">Muennighoff et al., data-constrained scaling</a> ·
+      <a href="https://arxiv.org/abs/2305.17493" target="_blank" rel="noopener">Shumailov et al., model collapse</a> — origin:
+      <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">GPT-3</a> ·
+      <a href="https://arxiv.org/abs/2303.08774" target="_blank" rel="noopener">GPT-4 technical report</a>
+    </p>
+    <p class="tiny">Figures and dates throughout are drawn from the cited papers' own reported numbers; a few
+    papers' text and released code or internal tables disagree slightly (noted inline where it matters), so treat
+    exact percentages as the papers' own best account rather than independently re-verified ground truth.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

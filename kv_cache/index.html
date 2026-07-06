@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The KV Cache: why LLM inference is a memory problem</title>
+  <meta name="description" content="An interactive tour of the transformer KV cache: why it exists, why it — not the weights — sets the price of context, and the fix ecosystem: GQA, MLA, PagedAttention, quantization, attention sinks, and prefix caching."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vk': '{\\mathbf{k}}', '\\vv': '{\\mathbf{v}}', '\\vq': '{\\mathbf{q}}',
+        '\\vc': '{\\mathbf{c}}', '\\vh': '{\\mathbf{h}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>The KV Cache: why LLM inference is a memory problem</h1>
+    <p class="byline">
+      A field guide through <strong>the cache</strong>, <strong>MQA/GQA</strong>, <strong>MLA</strong>,
+      <strong>PagedAttention</strong>, and <strong>attention sinks</strong> &middot; 2019 → 2026 &middot;
+      <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA 2305.13245</a> ·
+      <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">vLLM 2309.06180</a> ·
+      <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">StreamingLLM 2309.17453</a> ·
+      <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">DeepSeek-V2 2405.04434</a>
+    </p>
+    <p class="lede">
+      Every chat with an LLM quietly builds a tensor nobody talks about. On Llama-2-7B it grows by
+      <strong>half a megabyte per token</strong> — by the time your conversation hits 4,000 tokens it is a
+      <strong>2&nbsp;GB object per user</strong>, larger per active request than most of the activations, and it must
+      be re-read in full to produce every single next token. This is the <strong>KV cache</strong>: the reason
+      long context costs money, the reason GPUs serving LLMs run out of memory long before they run out of
+      compute, and the object that an entire ecosystem — GQA, DeepSeek's MLA, vLLM's PagedAttention, attention
+      sinks, prompt caching — was invented to shrink, share, page, and prune. Understand this one tensor and
+      the economics of inference stop being mysterious.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The tensor behind the bill</a></li>
+      <li><a href="#why-cache">1. Why the cache exists</a></li>
+      <li><a href="#the-bill">2. The bill: bytes and bandwidth</a></li>
+      <li><a href="#share-heads">3. Share heads: MQA and GQA</a></li>
+      <li><a href="#mla">4. Compress: DeepSeek's MLA</a></li>
+      <li><a href="#paged">5. Manage: PagedAttention</a></li>
+      <li><a href="#shrink-numbers">6. Shrink the numbers: quantization</a></li>
+      <li><a href="#drop-tokens">7. Drop tokens: windows, sinks, heavy hitters</a></li>
+      <li><a href="#reuse">8. Reuse: prefix caching</a></li>
+      <li><a href="#bottom-line">The modern stack &amp; cheat sheet</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/gpu_memory_layout.png" alt="Memory layout of an A100 40GB serving a 13B model: 65% parameters, over 30% KV cache" style="max-width:420px"/>
+      <figcaption>
+        Where the memory of a serving GPU actually goes: an NVIDIA A100 40&nbsp;GB running a 13B-parameter
+        model spends 65% on weights — and essentially all of the rest on KV cache. The weights are fixed;
+        the cache is the resource being fought over, and how well you manage it decides how many users fit
+        on the card. (Kwon et al., vLLM, 2023.)
+      </figcaption>
+    </figure>
+
+    <p>
+      When people picture the cost of running a large language model they picture the weights: billions of
+      parameters, tens of gigabytes, the headline number on the model card. But weights are a <em>fixed</em>
+      cost — one copy serves every user. The cost that scales with usage lives somewhere else. Every active
+      conversation drags around its own private, growing state: for each token seen so far, for every layer,
+      the attention keys and values that token produced. That state is the KV cache, and on a serving GPU it
+      is the second-largest — and the only <em>elastic</em> — occupant of memory.
+    </p>
+    <p>
+      The cache sits at the center of a remarkable amount of modern LLM engineering. Why do all recent open
+      models use grouped-query attention? The cache. Why did DeepSeek redesign the attention layer itself?
+      The cache. What made vLLM famous overnight in 2023? Managing the cache like an operating system manages
+      RAM. Why do API providers sell "prompt caching" at a tenth of the input price? They're selling you reuse
+      of this exact tensor. Even the number on your bill — so many cents per million input tokens, more for
+      long context — is, to first order, KV-cache economics passed through.
+    </p>
+    <p>
+      This post builds the object from scratch: why autoregressive attention forces it to exist, the
+      three-line formula for its size (and the bandwidth argument for why it also sets <em>speed</em>), and
+      then the four families of fixes — <strong>share</strong> it across heads, <strong>compress</strong> it into a latent,
+      <strong>manage</strong> it like virtual memory, and <strong>prune</strong> it token by token. It's a companion to our
+      <a href="../flash_attention/index.html">FlashAttention</a> and
+      <a href="../sparse_attention/index.html">sparse attention</a> posts: those are about the attention
+      <em>computation</em>; this one is about the attention <em>state</em>.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why-cache">
+    <h2>1. Why the cache exists</h2>
+    <p>
+      Attention, stripped to its inference-time essentials. Each token $t$ in the sequence produces, at every
+      layer and head, three vectors: a query $\vq_t$, a key $\vk_t$, and a value $\vv_t$ (each a linear map
+      of the token's hidden state). To compute token $t$'s output, its query is scored against
+      <em>every</em> key so far, and the scores mix the values:
+    </p>
+    <p class="eq">$$
+      \mathrm{out}_t \;=\; \sum_{i \le t} \operatorname{softmax}_i\!\left(\frac{\vq_t \cdot \vk_i}{\sqrt{d}}\right) \vv_i .
+    $$</p>
+    <p>
+      The detail that creates the cache is the subscript $i \le t$: the <strong>causal mask</strong>. Token $t$
+      looks only backwards. That means $\vk_i$ and $\vv_i$ for a past token $i$ can never be affected by
+      anything that comes after — <em>the past is immutable</em>. Compute them once, and they are correct
+      forever.
+    </p>
+    <p>
+      Now watch what generation does without exploiting that. To generate token 101 you run the model on
+      tokens 1–100; to generate token 102 you run it on tokens 1–101 — recomputing from scratch the exact
+      same keys and values you computed a moment ago, 100 tokens' worth, at every layer. Generating $n$ tokens
+      this way costs $O(n^2)$ full-model forward passes' worth of work. The fix is obvious once said aloud:
+      <strong>store every $\vk_i, \vv_i$ the first time it's computed, and never compute it again.</strong>
+      Each new token then requires exactly one new column written and one sweep of reads. That store is the
+      KV cache.
+    </p>
+
+    <figure class="paper-figure">
+      <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+        <source src="assets/videos/growing_cache.mp4" type="video/mp4"/>
+      </video>
+      <figcaption>
+        The whole object in one loop. <strong>Prefill</strong> processes the prompt in one parallel pass and writes
+        its K/V columns at once. Then each <strong>decode</strong> step sweeps a read across <em>every</em> cached column
+        — a read that gets longer as the context grows — and appends exactly one new column. The memory bar
+        only ever goes up.
+      </figcaption>
+    </figure>
+
+    <p>
+      Note the two-phase structure the animation shows, because all serving economics inherits it.
+      <strong>Prefill</strong> (processing your prompt) is one big parallel pass — thousands of tokens' worth of matrix
+      multiplies that saturate the GPU's compute units. <strong>Decode</strong> (generating the reply) is one token at a
+      time: tiny matrix-vector products, plus that ever-growing sweep over the cache. Prefill is
+      compute-bound; decode, as we'll quantify next, is <em>memory</em>-bound. Feel the difference caching makes first:
+    </p>
+
+    <div class="widget-frame" id="cache-replay">
+      <p class="widget-title">Generation with and without the cache</p>
+      <p class="widget-sub">Two models generate the same continuation. One recomputes all keys and values for the
+        whole sequence at every step ($O(t)$ fresh K/V per token); one caches and only computes the newest
+        ($O(1)$ per token). Watch the cumulative K/V-computation counters diverge — quadratic vs linear.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="the-bill">
+    <h2>2. The bill: bytes and bandwidth</h2>
+    <p>
+      So what does the store cost? One token's worth of cache, for a standard multi-head transformer, is
+      keys plus values ($2$), across every layer, across the full key/value width:
+    </p>
+    <p class="eq">$$
+      \text{bytes per token} \;=\; 2 \;\cdot\; n_{\text{layers}} \;\cdot\; n_{\text{kv-heads}}\, d_{\text{head}} \;\cdot\; \text{bytes/elem},
+    $$</p>
+    <p>
+      and the full cache multiplies that by sequence length and batch size. Plug in Llama-2-7B
+      ($n_{\text{layers}}{=}32$, $32$ heads of dimension $128$, fp16): $2 \times 32 \times 4096 \times 2 =$
+      <strong>512&nbsp;KiB per token</strong>. A 4,096-token conversation: <strong>2&nbsp;GiB</strong> — for one user, next to
+      13&nbsp;GB of weights. Batch 32 such users and the cache alone wants 64&nbsp;GiB; the weights haven't
+      moved. The vLLM paper's example is the same arithmetic on OPT-13B: 800&nbsp;KB per token, at which point
+      "a request may need up to 1.6&nbsp;GB" and a 40&nbsp;GB A100 can hold only a few dozen concurrent
+      requests <em>if nothing is wasted</em> (§5 shows plenty was). This is the first law of the cache:
+      <strong>weights scale with the model; cache scales with the model × context × users.</strong>
+    </p>
+    <p>
+      The cache doesn't just consume capacity — it sets <em>speed</em>. To produce one token, the GPU must read
+      each weight once (matrix–vector, batch size permitting) and read <em>the entire cache for that sequence</em>
+      once. Those reads come from HBM at finite bandwidth — say 3.35&nbsp;TB/s on an H100 — and during decode
+      the arithmetic per byte is so thin that bandwidth, not FLOPs, is the ceiling:
+      $\text{tokens/s} \lesssim \text{bandwidth} / \text{bytes touched per token}$. Batching amortizes the
+      weight reads across users; it does <em>not</em> amortize cache reads, because every sequence has its own.
+      At long context, the cache becomes most of the bytes — which is why a model that streams at 100 tokens/s
+      on a short chat crawls on a 100k-token document, and why every technique in the rest of this post,
+      nominally about <em>memory</em>, is also a <em>latency</em> optimization in disguise.
+    </p>
+
+    <div class="widget-frame" id="cache-calculator">
+      <p class="widget-title">The cache bill, interactively</p>
+      <p class="widget-sub">Pick a model, drag context length and batch size, choose the cache dtype. Bars show
+        weights vs total KV cache; the readout counts H100-80GB cards needed and the bandwidth-implied decode
+        ceiling. Note what GQA (Llama-2-70B, Mistral) and MLA (DeepSeek-V2) do to the red bar.</p>
+    </div>
+
+    <p>
+      Play with the presets and one pattern jumps out: the models differ far more in <em>cache per token</em> than
+      in anything else — 512&nbsp;KiB for the MHA-era 7B, 160&nbsp;KiB for GQA-era Llama-2-70B's much bigger
+      model, ~70&nbsp;KiB for DeepSeek-V2's MLA despite 236B parameters. That's not an accident of scale; it's
+      the design axis the last three years of attention research deliberately moved along. The next three
+      sections are those moves, in order of increasing surgery.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="share-heads">
+    <h2>3. Share heads: MQA and GQA</h2>
+    <p>
+      First move: attack the $n_{\text{kv-heads}}$ factor. In multi-head attention every one of $h$ query
+      heads carries its own K and V projections, so the cache stores $h$ separate key/value sets. But do the
+      keys and values really need to be different per head? In 2019 — years before anyone worried about
+      serving costs at today's scale — Noam Shazeer proposed <strong>multi-query attention</strong> (MQA): keep all
+      $h$ query heads, but give them <em>one shared</em> key head and <em>one shared</em> value head. The cache shrinks
+      by a factor of $h$ — 32× for our running example — and, just as importantly for speed, the decode-time
+      memory traffic shrinks with it.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/gqa_diagram.png" alt="MHA, GQA and MQA head-sharing diagram"/>
+      <figcaption>
+        The one-knob family. Multi-head: every query head has private K/V. Multi-query: all query heads share
+        a single K/V. Grouped-query: query heads are chunked into groups, one K/V per group — the dial
+        between the extremes. (Ainslie et al., GQA, 2023.)
+      </figcaption>
+    </figure>
+
+    <p>
+      MQA's problem was quality: collapsing 32 key/value subspaces into one measurably hurts, and it can be
+      unstable to train. <strong>Grouped-query attention</strong> (GQA, 2023) is the pragmatic interpolation: divide the
+      $h$ query heads into $g$ groups, each group sharing one K/V head. $g{=}h$ recovers MHA; $g{=}1$ is MQA;
+      and the sweet spot in between — typically $g{=}8$ — turns out to cost almost nothing. The GQA paper's
+      two findings made it the industry default overnight: an existing MHA checkpoint can be
+      <em>uptrained</em> into GQA with just <strong>5% of the original pretraining compute</strong>, and the result matches
+      MHA quality at close to MQA speed. Llama-2-70B, Llama-3, Mistral, Qwen, Gemma — essentially every
+      major open model since ships with GQA-8: an 8× smaller cache as the new baseline.
+    </p>
+
+    <div class="widget-frame" id="heads-slider">
+      <p class="widget-title">The n<sub>kv</sub> dial</p>
+      <p class="widget-sub">Eight query heads; slide the number of KV heads from 8 (MHA) through 2 (GQA) to 1
+        (MQA). The diagram regroups, the cache bar shrinks, and the marker shows where real models sit on the
+        quality/size trade-off.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="mla">
+    <h2>4. Compress: DeepSeek's multi-head latent attention</h2>
+    <p>
+      GQA shrinks the cache by deleting heads. DeepSeek's <strong>multi-head latent attention</strong> (MLA,
+      2024) asks a sharper question: what if the per-token K/V information across <em>all</em> heads is
+      low-rank — expressible in a small shared latent? Instead of caching keys and values at all, MLA caches a
+      single compressed vector per token, $\vc_t = W^{DKV}\vh_t$, with every head's key and value
+      <em>reconstructed</em> from it on demand:
+    </p>
+    <p class="eq">$$
+      \vc_t = W^{DKV}\,\vh_t \in \mathbb{R}^{d_c},
+      \qquad
+      \vk_t^{(i)} = W^{UK}_{(i)}\,\vc_t,
+      \quad
+      \vv_t^{(i)} = W^{UV}_{(i)}\,\vc_t .
+    $$</p>
+    <p>
+      In DeepSeek-V2, $d_c = 512$ — four head-dims' worth — standing in for what MHA would store as 128 heads
+      × 128 dims × 2 (K and V) per layer. Two tricks make this practical rather than merely clever. First,
+      the up-projections never actually run at decode time: because attention scores are bilinear,
+      $W^{UK}$ can be <em>absorbed</em> into the query projection and $W^{UV}$ into the output projection, so
+      the model does attention directly against the cached latents. Second, RoPE position rotations don't
+      commute with that absorption — so MLA carries a small <em>decoupled</em> rotary key (dimension 64) alongside
+      the latent, and only that part is position-rotated. Cached bytes per token per layer:
+      $512 + 64 = 576$ numbers — which the paper notes is the cache of GQA with just
+      <strong>2.25 groups</strong>, while <em>outscoring full MHA</em> in their ablations, because the latent is trained,
+      not truncated.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/mha_gqa_mqa_mla.png" alt="MHA, GQA, MQA and MLA compared; MLA caches a compressed latent"/>
+      <figcaption>
+        The whole design space on one axis — what gets cached (hatched). MHA: everything. GQA/MQA: fewer
+        copies of the same thing. MLA: a learned compression of the thing, with per-head K/V regenerated by
+        projection. (DeepSeek-AI, 2024.)
+      </figcaption>
+    </figure>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/deepseek_efficiency.png" alt="DeepSeek-V2 vs 67B: 93.3% smaller KV cache, 5.76x throughput" style="max-width:520px"/>
+      <figcaption>
+        What it buys at system level: DeepSeek-V2 vs. their previous dense 67B — <strong>93.3% less KV cache per
+        token</strong> and <strong>5.76× higher maximum generation throughput</strong> (>50k tokens/s on one 8×H800 node).
+        The cache reduction <em>is</em> the throughput increase: more sequences fit, and each token reads fewer bytes.
+      </figcaption>
+    </figure>
+
+    <p>
+      MLA is the strongest evidence for this post's thesis: at the frontier, <em>the attention layer itself is
+      being redesigned around the cache</em>. DeepSeek-V3 and R1 kept MLA; the technique's spread to other model
+      families is limited mostly by its one real cost — it's a training-time decision, not a retrofit (though
+      "uptraining" GQA models into MLA is an active research vein). If you're wondering how far the
+      compression direction can go, the answer of the linear-attention world — covered in our
+      <a href="../gated_deltanet/index.html">Gated DeltaNet post</a> — is "all the way to a constant-size
+      state," at the price of exact recall.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="paged">
+    <h2>5. Manage: PagedAttention and the memory OS</h2>
+    <p>
+      The next fix changes nothing about the model at all. Ask instead: of the cache memory we allocate, how
+      much holds actual tokens? Before 2023 the standard answer was <em>shockingly little</em>. Serving systems
+      stored each request's cache in one contiguous buffer, pre-sized to the maximum possible length — because
+      attention kernels wanted contiguous tensors, and because a sequence's final length is unknown at
+      admission time. The result was every memory pathology at once:
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/vllm_fragmentation.png" alt="Contiguous per-request KV allocation: reserved slots, internal and external fragmentation"/>
+      <figcaption>
+        Contiguous allocation in pre-vLLM systems: a request that generates 4 tokens on a 2048-token
+        reservation strands 2,038 slots (internal fragmentation), and the differently-sized reservations
+        shred the address space (external fragmentation). Measured across systems: only
+        <strong>20.4–38.2%</strong> of KV memory held actual token states. (Kwon et al., 2023.)
+      </figcaption>
+    </figure>
+
+    <p>
+      vLLM's <strong>PagedAttention</strong> is the operating-systems classic applied verbatim: virtual memory.
+      Chop every sequence's cache into fixed-size <strong>blocks</strong> (16 tokens each), allocate blocks on demand
+      from a shared pool, and keep a per-sequence <em>block table</em> mapping logical position → physical block —
+      the attention kernel follows the table. Just like OS paging, fragmentation collapses to at most one
+      partially-filled block per sequence (~4% waste instead of ~70%), and — the underrated half — <em>pages can
+      be shared</em>. Parallel samples from one prompt, beam-search branches, requests with a common system
+      prompt: all point their tables at the same physical blocks, copy-on-write when they diverge. Utilization
+      becomes throughput directly: more real tokens per gigabyte → bigger batches →
+      <strong>2–4× serving throughput at the same latency</strong>, with zero change to model quality. Within a year
+      paged KV management was table stakes in every serving stack (TGI, TensorRT-LLM, SGLang, llama.cpp).
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/vllm_memory_batch.png" alt="Memory usage vs batch size and resulting throughput, existing systems vs vLLM" style="max-width:440px"/>
+      <figcaption>
+        Same GPU, same model (13B on A100 40GB): because each request's cache footprint drops from
+        worst-case to actual, vLLM fits ~5× the batch — and decode throughput scales with the batch.
+        (Kwon et al., 2023.)
+      </figcaption>
+    </figure>
+
+    <div class="widget-frame" id="paged-race">
+      <p class="widget-title">Fragmentation, live</p>
+      <p class="widget-sub">The same random stream of requests (each with an unknown final length) served two
+        ways: contiguous max-length reservations vs 16-token pages from a shared pool. Watch the utilization
+        gap — and how many requests the paged side fits before running out of memory.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="shrink-numbers">
+    <h2>6. Shrink the numbers: cache quantization</h2>
+    <p>
+      Orthogonal to <em>what</em> you cache and <em>where</em> it lives: how many bits per number? Weights routinely
+      survive 4-bit quantization, and the cache is the other big tensor, so the temptation is obvious. FP8 KV
+      is by now nearly free — a 2× cut supported natively in vLLM and TensorRT-LLM with negligible quality
+      loss. Below that it gets interesting, because keys and values fail differently. Keys have
+      <em>outlier channels</em> — specific dimensions with persistently huge magnitudes (a cousin of the attention-sink
+      phenomenon in the next section) — so quantizing keys wants <strong>per-channel</strong> scales; values have no such
+      structure and quantize best <strong>per-token</strong>. That asymmetric recipe (KIVI is the canonical reference)
+      pushes the cache to 2–4 bits at small perplexity cost: another 4–8× context or batch, from arithmetic
+      alone. The compounding is the point: GQA's 8× and INT4's 4× multiply.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="drop-tokens">
+    <h2>7. Drop tokens: windows, sinks, and heavy hitters</h2>
+    <p>
+      The most aggressive family refuses to keep the whole history at all. The blunt version is the
+      <strong>sliding window</strong>: cache only the last $L$ tokens, evict the oldest — memory becomes constant,
+      and Mistral-7B shipped exactly this (window 4,096) interleaved into a real model. But run a plain window
+      on an unmodified model and something bizarre happens: the moment the <em>first few tokens of the
+      sequence</em> fall out of the cache, perplexity doesn't degrade — it <em>detonates</em>, from ~5 to thousands.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/attention_sinks.png" alt="Attention heatmaps across layers: beyond the first layers, attention mass piles onto the first token"/>
+      <figcaption>
+        Why: look where attention actually goes. Past the first couple of layers, a huge share of every
+        token's attention lands on the <em>first tokens of the sequence</em> (the solid red first column) —
+        regardless of content. Softmax must sum to one; when a head has nothing to say, it parks the mass on
+        a stable, always-visible position. Those positions are <strong>attention sinks</strong>. (Xiao et al., 2023.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Evicting the sinks yanks the drain out of every softmax at once — the parked probability mass has
+      nowhere to go, activations shift out of distribution, and the model falls apart. <strong>StreamingLLM</strong>'s
+      fix is comedically small: keep the window, <em>plus the first 4 tokens, forever</em>. That's it. With
+      4 sinks + a rolling window, off-the-shelf Llama/Mistral models stream stably past
+      <strong>4 million tokens</strong>, at up to <strong>22.2× lower latency</strong> than the honest alternative
+      (recomputing the window's cache each step):
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/streamingllm_scheme.png" alt="Dense, window, sliding-with-recompute, and StreamingLLM compared"/>
+      <figcaption>
+        The four options on one line: dense attention ($O(T^2)$, dies slowly), plain window (cheap, dies
+        suddenly at PPL 5158), window + recompute (works, $O(TL^2)$ per token), and window + 4 sinks
+        (works, cheap, PPL 5.40). (Xiao et al., 2023.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Sinks-plus-window keeps <em>positional</em> survivors. <strong>H2O</strong> (Heavy-Hitter Oracle) generalizes to
+      <em>content-based</em> eviction: track each cached token's accumulated attention score; when over budget,
+      evict the token that has mattered least. The empirical license is that attention is brutally sparse —
+      a small set of "heavy hitter" tokens soaks up most of the mass — so a <strong>20% cache budget</strong> (recent
+      tokens + heavy hitters) matches the full model across their benchmarks, and the freed memory becomes up
+      to <strong>29× throughput</strong> against offloading-based baselines. The caveat for both: eviction is a bet
+      that the future won't need what you dropped — fine for streaming chat, dangerous for
+      "now quote paragraph 3 verbatim." Lossless tricks (paging, MLA, prefix reuse) don't carry that risk;
+      eviction does.
+    </p>
+
+    <div class="widget-frame" id="evict-explorer">
+      <p class="widget-title">Who survives eviction?</p>
+      <p class="widget-sub">A synthetic attention pattern with sinks, heavy hitters, and locality. Choose a policy
+        — window only, window + 4 sinks, or H2O-style scoring — and drag the cache budget. Cells show which
+        K/V entries survive; the readout shows how much total attention mass the surviving cache can still serve.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="reuse">
+    <h2>8. Reuse: prefix caching and the agent era</h2>
+    <p>
+      The last fix exploits a workload fact rather than a model fact: <em>prompts repeat</em>. Every request to a
+      chatbot carries the same system prompt; an agent loop re-sends an ever-growing transcript to which it
+      appends one tool result at a time; a RAG system re-uses document chunks. The KV cache for a shared
+      prefix is <em>identical</em> across all requests that share it — attention is causal, so a prefix's cache
+      doesn't depend on what follows. So keep prefixes' caches around, keyed by content: paged blocks make
+      this natural (SGLang's <strong>RadixAttention</strong> organizes cached blocks in a radix tree over token
+      sequences), and a hit turns that part of prefill from a compute job into a lookup.
+    </p>
+    <p>
+      This is also the one cache trick you can see on a price sheet. API "prompt caching" — where re-sent
+      prefix tokens are billed at roughly <strong>a tenth</strong> of the normal input price — is exactly this: the
+      provider kept your prefix's KV blocks warm, skipped the prefill compute, and passed some of the savings
+      through. For agent workloads whose transcripts grow monotonically, the effective input cost drops by
+      near the full factor, which is a big part of why long-running agents became economically sane in
+      2024–25. (It also pairs with <a href="../speculative_decoding/index.html">speculative decoding</a> —
+      one attacks prefill cost, the other decode latency.)
+    </p>
+    <aside class="callout">
+      <strong>The full loop, priced.</strong> A 100k-token agent transcript on a GQA-8 70B model is ~1.6&nbsp;GB of
+      cache. Recomputing it from scratch each turn is seconds of H100 prefill; reading it from cache is
+      milliseconds of lookups. Multiply by every turn of every agent, and "who keeps whose KV blocks warm,
+      for how long" quietly became one of the most consequential scheduling problems in AI infrastructure.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottom-line">
+    <h2>The modern stack &amp; cheat sheet</h2>
+    <p>
+      None of these techniques compete; a 2026 serving stack runs essentially all of them at once, because
+      they attack different factors of the same product:
+    </p>
+    <table class="results">
+      <thead><tr><th>axis</th><th>technique</th><th>saves</th><th>cost / caveat</th></tr></thead>
+      <tbody>
+        <tr><td class="cat">fewer K/V heads</td><td class="win">GQA-8 (MQA at the extreme)</td><td>~8×</td><td>needs (up)training; tiny quality gap</td></tr>
+        <tr><td class="cat">compress representation</td><td class="win">MLA latent (576/token/layer)</td><td>~13× vs MHA</td><td>training-time redesign; RoPE workaround</td></tr>
+        <tr><td class="cat">stop wasting allocation</td><td class="win">PagedAttention blocks</td><td>~2–4× throughput</td><td>none — pure systems win</td></tr>
+        <tr><td class="cat">fewer bits</td><td class="win">FP8 → INT4 KV (per-channel K, per-token V)</td><td>2–4×</td><td>small perplexity cost below 8 bits</td></tr>
+        <tr><td class="cat">fewer tokens</td><td class="win">window + 4 sinks; H2O at 20%</td><td>unbounded ctx / 5×</td><td><em>lossy</em> — dropped tokens are gone</td></tr>
+        <tr><td class="cat">don't recompute prefixes</td><td class="win">radix/prefix caching</td><td>~10× on repeated input</td><td>cache scheduling; privacy scoping</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Stack them and the arithmetic that opened this post inverts. Naive 2023: an MHA 7B at 4k context,
+      contiguously allocated in fp16 — 2&nbsp;GiB per user, ~70% of it wasted. Modern: a GQA-8 model in
+      paged FP8 blocks with a warm system-prompt prefix — tens of megabytes of <em>marginal</em> cache per user.
+      That two-orders-of-magnitude collapse, more than any FLOP trend, is what made 128k-token context
+      windows and always-on agents affordable in the span of about three years.
+    </p>
+    <h3>The bottom line</h3>
+    <p>
+      The KV cache is what "having context" physically <em>is</em>: the model's memory of your conversation,
+      materialized as gigabytes of key/value vectors that must be stored somewhere and re-read for every
+      generated token. Weights are rent; cache is the utility bill that scales with use. So the field learned
+      to shrink it four independent ways — share it (GQA), compress it (MLA), page it (vLLM), prune it
+      (sinks, H2O) — and to stop paying twice for the same prefix. Next time a price sheet charges by input
+      token, or a model advertises million-token context, or a paper redesigns attention "for inference
+      efficiency," you know the tensor they're all actually talking about.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Key papers: <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">MQA (1911.02150)</a> ·
+      <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA (2305.13245)</a> ·
+      <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">vLLM / PagedAttention (2309.06180)</a> ·
+      <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">StreamingLLM (2309.17453)</a> ·
+      <a href="https://arxiv.org/abs/2306.14048" target="_blank" rel="noopener">H2O (2306.14048)</a> ·
+      <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">DeepSeek-V2 / MLA (2405.04434)</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

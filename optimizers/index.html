@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Optimizers: Understanding Adam, Muon, and How to Judge a Training Algorithm — an interactive explainer</title>
+  <meta name="description" content="A field guide to neural network optimizers: how Adam actually works, what Muon's orthogonalized updates do differently, what changes at large-model scale, and how to evaluate an optimizer rigorously."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vg': '{\\mathbf{g}}', '\\vm': '{\\mathbf{m}}', '\\vv': '{\\mathbf{v}}',
+        '\\vtheta': '{\\boldsymbol{\\theta}}',
+        '\\E': '{\\mathbb{E}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">A field guide</p>
+    <h1>Optimizers: Understanding Adam, Muon, and How to Judge a Training Algorithm</h1>
+    <p class="byline">
+      A field guide to neural network optimizers &middot; Adam from first principles &middot; Muon's orthogonalized updates
+      &middot; what changes at large-model scale &middot; how to actually evaluate one
+    </p>
+    <p class="lede">
+      Every deep learning paper's method section ends with a one-liner — "we use Adam, lr=3e-4" — that hides one of
+      the most consequential design choices in the whole training run. The optimizer decides how a gradient, a
+      single noisy hint about which way to move, turns into an actual step in parameter space, taken billions of
+      times over. This is the full toolkit: how Adam actually works and why each of its pieces exists, what Muon's
+      orthogonalized momentum update does differently and why it's spreading through frontier labs, what changes
+      when the model has hundreds of billions of parameters, and how to tell a genuine improvement from a lucky
+      hyperparameter sweep.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#principles">What makes an optimizer good</a></li>
+      <li><a href="#adam">Understanding Adam</a></li>
+      <li><a href="#muon">The new wave: Muon</a></li>
+      <li><a href="#scale">What's special at large-model scale</a></li>
+      <li><a href="#evaluating">How to evaluate an optimizer</a></li>
+      <li><a href="#design-principles">Common design principles</a></li>
+      <li><a href="#why">Why this all works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      Plain gradient descent has one job — subtract the gradient, scaled by a learning rate — and one glaring
+      failure mode: it treats every direction in parameter space as equally well-behaved. Real loss landscapes
+      aren't. A narrow ravine here, a nearly flat plateau there, one layer's gradients an order of magnitude
+      larger than another's a few layers over. Use a learning rate small enough to be stable in the ravine and
+      you crawl for a thousand steps on the plateau; use one large enough to make progress on the plateau and you
+      oscillate out of the ravine entirely.
+    </p>
+    <p>
+      Nearly every optimizer since 2011 is an answer to some version of that problem — estimate something about
+      the local geometry on the fly and use it to reshape the step. AdaGrad, RMSprop, and Adam all estimate a
+      per-parameter scale from the gradient's own history. Muon, released in 2024 and already running inside
+      frontier training runs by 2025, instead reshapes the update's entire spectrum in one shot, treating a
+      weight matrix as a matrix rather than a bag of independent numbers.
+    </p>
+    <p>
+      This piece builds the whole family from the ground up: the two-line fix that turns SGD into momentum, the
+      three ideas that combine into Adam, the matrix operation at the center of Muon, and the two questions —
+      what does "good" mean, and how do you actually measure it — that most discussions of optimizers skip
+      entirely.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="principles">
+    <h2>1. What makes an optimizer good</h2>
+    <p>
+      "Good" collapses into at least four mostly-independent axes, and a real optimizer is a set of trade-offs
+      across all four rather than a win on any single one:
+    </p>
+    <ul>
+      <li><strong>Convergence speed.</strong> How many gradient steps (or how much wall-clock time) to reach a
+      target loss. This is what most papers report and the easiest axis to game with a narrow hyperparameter
+      sweep on a favorite benchmark.</li>
+      <li><strong>Generalization.</strong> A lower training loss doesn't guarantee a better model — some
+      optimizers reliably find flatter minima that generalize better, others find sharper ones that memorize
+      more. This is the axis benchmarks most often forget to check.</li>
+      <li><strong>Robustness to hyperparameters.</strong> An optimizer that needs its learning rate tuned to
+      within a factor of 2 is a worse practical tool than one that works across a factor of 10, even if the
+      first is faster at its optimum — most practitioners never get to run the sweep that finds that optimum.</li>
+      <li><strong>Overhead.</strong> Extra memory (optimizer state can rival or exceed the model's own parameter
+      memory) and extra compute per step, both of which matter enormously more at scale than they do on a laptop
+      GPU (see §4).</li>
+    </ul>
+    <p>
+      Keep these four in mind through the rest of this piece — nearly every design decision below is a trade
+      between them, not a free lunch.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="adam">
+    <h2>2. Understanding Adam</h2>
+    <h3>The two ingredients that came before it</h3>
+    <p>
+      Plain SGD updates $\vtheta_{t} = \vtheta_{t-1} - \alpha \vg_t$. Two independent fixes to this predate Adam
+      by decades and each solves one half of its eventual design.
+    </p>
+    <p>
+      <strong>Momentum</strong> (Polyak, 1964) keeps a running exponential average of past gradients and steps in
+      that direction instead of the instantaneous gradient: $\vm_t = \beta \vm_{t-1} + \vg_t$,
+      $\vtheta_t = \vtheta_{t-1} - \alpha \vm_t$. This damps oscillation across a narrow ravine (opposing gradients
+      partially cancel in the running average) while accelerating consistent movement along a shallow, consistent
+      slope (the average compounds). <strong>Nesterov's</strong> variant (1983) evaluates the gradient at the
+      point momentum is <em>about</em> to carry you to, rather than where you currently are — a "look before you
+      leap" correction that measurably speeds convergence on convex problems.
+    </p>
+    <p>
+      <strong>AdaGrad</strong> (Duchi, Hazan &amp; Singer, 2011) attacks the other half of the problem: different
+      parameters need different step sizes. It divides each parameter's update by the square root of the sum of
+      all its squared gradients seen so far — parameters with large, frequent gradients get shrunk, parameters
+      with small or rare gradients get boosted. The flaw is right there in "sum of all": that denominator only
+      grows, so the effective learning rate decays monotonically toward zero and eventually training stalls
+      completely, even on parameters that still need to move. <strong>RMSprop</strong> (Hinton, unpublished, 2012)
+      is the one-line fix — replace the running <em>sum</em> with a running exponential <em>average</em> of squared
+      gradients, so the denominator can rise and fall as gradient magnitudes change, and training never
+      permanently stalls.
+    </p>
+
+    <h3>Adam: combine both, then fix the startup transient</h3>
+    <p>
+      Adam (Kingma &amp; Ba, 2015, arXiv:1412.6980 — "Adam: A Method for Stochastic Optimization") is, at its
+      core, momentum and RMSprop layered on top of each other: a first moment (momentum) and a second moment
+      (RMSprop-style adaptive scale), each its own exponential moving average.
+    </p>
+    <p class="eq">$$ \vm_t = \beta_1 \vm_{t-1} + (1-\beta_1)\vg_t \qquad \vv_t = \beta_2 \vv_{t-1} + (1-\beta_2)\vg_t^2 $$</p>
+    <p>
+      With $\vm_0 = \vv_0 = 0$, both estimates start life biased hard toward zero — early on, the average is
+      mostly still its own zero initialization, not the true gradient statistics. Left uncorrected this is worst
+      exactly when it matters most: at step 1, $\vv_1 = (1-\beta_2)\vg_1^2$, which for the default $\beta_2=0.999$
+      is a <strong>0.1%</strong> sample of the true squared gradient — a massive underestimate that would make the
+      very first update size explode (dividing by the square root of a value 1000x too small). Adam's fix is a
+      simple rescaling that removes this bias <em>exactly</em>, at every step, whenever the underlying gradient
+      statistics are stationary:
+    </p>
+    <p class="eq">$$ \hat{\vm}_t = \frac{\vm_t}{1-\beta_1^t} \qquad \hat{\vv}_t = \frac{\vv_t}{1-\beta_2^t} \qquad \vtheta_t = \vtheta_{t-1} - \alpha\,\frac{\hat{\vm}_t}{\sqrt{\hat{\vv}_t}+\epsilon} $$</p>
+    <p>
+      with default hyperparameters $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$, $\alpha=0.001$. The widget
+      below makes the correction concrete: under a perfectly constant gradient, the raw second moment ramps up
+      from zero following exactly $1-\beta_2^t$, while the corrected estimate is exactly right from step one — not
+      approximately, exactly, because the correction is the precise inverse of the bias the recursion itself
+      introduces.
+    </p>
+
+    <div class="widget-frame" id="bias-correction">
+      <p class="widget-title">Bias correction, made exact</p>
+      <p class="widget-sub">Drag &beta;&#8322; and watch the raw second-moment estimate crawl up from zero while
+      the bias-corrected version is already correct at every step.</p>
+    </div>
+
+    <p>
+      Put together, Adam's per-parameter step is roughly "move in the direction of the recent average gradient,
+      scaled to be about the same size regardless of how large or small that parameter's gradients typically
+      are." That per-parameter normalization is exactly the property plain SGD and momentum lack, and it's most
+      visible on a loss surface with very different curvature along different axes:
+    </p>
+
+    <div class="widget-frame" id="optimizer-race">
+      <p class="widget-title">Same valley, three optimizers</p>
+      <p class="widget-sub">A 40:1 ill-conditioned quadratic bowl. Scrub through steps (or hit play) and watch SGD
+      crawl in the shallow direction, Momentum overshoot in the steep one, and Adam glide down the diagonal.</p>
+    </div>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/optimizer_race.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">The same race, run end to end: SGD kills the steep direction almost immediately then
+      crawls for the rest of the run; Momentum overshoots and oscillates across the ravine for dozens of steps;
+      Adam treats both directions as roughly equally curved and heads straight for the minimum.</p>
+
+    <p>
+      <strong>AdamW</strong> (Loshchilov &amp; Hutter, arXiv:1711.05101 — "Decoupled Weight Decay Regularization")
+      fixes a subtler issue: for SGD, L2 regularization and weight decay are mathematically identical, but for
+      Adam they aren't, because the L2 gradient term gets divided by $\sqrt{\hat{\vv}_t}$ along with everything
+      else — parameters with large gradients get <em>less</em> regularization pull, exactly backwards from the
+      intent. AdamW decouples the two: apply weight decay directly to the parameters, outside the adaptive
+      update, and it became the default for essentially every transformer trained since.
+    </p>
+
+    <aside class="callout">
+      <strong>Adam's convergence proof had a bug.</strong> The original paper's convergence argument turned out
+      to be incorrect — Reddi, Kale &amp; Kumar's "On the Convergence of Adam and Beyond" (ICLR 2018,
+      arXiv:1904.09237) constructed a simple convex counterexample where Adam provably fails to converge, traced
+      to the second-moment estimate being allowed to <em>decrease</em>, and proposed AMSGrad (keep a running
+      maximum of $\vv_t$) as a fix. In practice, the base Adam/AdamW recipe still won the field anyway — a
+      recurring theme in §5.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="muon">
+    <h2>3. The new wave: Muon</h2>
+    <p>
+      Everything in §2 treats a weight matrix as a flat list of independent numbers — Adam's second moment is
+      computed and applied entrywise, with no notion that a linear layer's gradient is actually a
+      <em>matrix</em>, with its own rank, its own singular directions, some far more dominant than others. Adam's
+      per-element normalization doesn't see that structure at all. <strong>Muon</strong> (Keller Jordan et al.,
+      blog post and open-source code, December 2024 — no separate arXiv paper for the base method; see
+      kellerjordan.github.io/posts/muon and github.com/KellerJordan/Muon) is built entirely around seeing it.
+    </p>
+    <p>
+      Muon keeps the same momentum accumulator as classical momentum, then does one more thing before taking the
+      step: it replaces the momentum matrix with the nearest <em>semi-orthogonal</em> matrix — same row/column
+      space, but every singular value pulled toward the same magnitude. In SVD terms, a momentum update
+      $G=U\Sigma V^\top$ becomes $UV^\top$: the directions are kept, the wildly uneven stretch factors $\Sigma$
+      are thrown away. A raw gradient update for a real weight matrix is typically dominated by a handful of
+      large singular directions; orthogonalizing forces <em>every</em> direction to receive a comparably-sized
+      update, the matrix analogue of what Adam does per-parameter.
+    </p>
+    <p>
+      Computing an exact SVD every step would be far too slow, so Muon approximates the orthogonalized matrix
+      with a <strong>quintic Newton-Schulz iteration</strong> — a polynomial recurrence that operates directly on
+      the matrix, no eigendecomposition required:
+    </p>
+    <p class="eq">$$ X_{k+1} = aX_k + b\,X_k(X_k^\top X_k) + c\,X_k(X_k^\top X_k)^2, \qquad (a,b,c) = (3.4445,\,-4.7750,\,2.0315) $$</p>
+    <p>
+      run for exactly 5 steps starting from $X_0 = G/\|G\|_F$. Those coefficients are deliberately tuned to
+      overshoot the mathematically "safe" convergence radius — the iteration doesn't settle onto a stable fixed
+      point (run it far past 5 steps and singular values drift and oscillate rather than converge), it's tuned
+      purely to pull the singular-value spread tight <em>fast</em>. The widget below shows exactly this: the
+      ratio between singular values collapses to nearly 1 within about 3 iterations, well before the absolute
+      scale has stopped moving around — and 5 iterations is the number Muon actually ships with.
+    </p>
+
+    <div class="widget-frame" id="muon-orthogonalize">
+      <p class="widget-title">Orthogonalizing an update</p>
+      <p class="widget-sub">Pick a raw update matrix, then drag the number of Newton-Schulz iterations and watch
+      its singular values converge to each other — the transformed unit circle becomes a circle again.</p>
+    </div>
+
+    <p>
+      Muon's early results were speedrun records, not benchmark papers: a CIFAR-10 speedrun record fell from
+      3.3 to 2.6 A100-seconds, and it contributed a step in the community's long-running nanoGPT speedrun chain
+      (one record along that chain fell from 31.4 to 24.9 minutes using Muon — part of an 84-record, 45-minute
+      to 1.3-minute lineage, most of which is <em>not</em> attributable to Muon alone). The more controlled number:
+      a 1.5B-parameter model reached GPT-2-XL-level HellaSwag accuracy in 10 H100-hours under Muon versus 13.3
+      under AdamW — roughly 25% less compute for the same result. Moonshot AI's scale-up study ("Muon is Scalable
+      for LLM Training," arXiv:2502.16982) fit a scaling law across 399M–1.5B parameter models and reported
+      <strong>Muon needing only about 52% of AdamW's training FLOPs</strong> to match it — call it roughly 2×
+      compute efficiency at that scale, though this hasn't been independently confirmed at trillion-parameter
+      scale.
+    </p>
+    <p>
+      That trillion-parameter scale is exactly where Muon met a new failure mode: attention logits occasionally
+      exploding mid-training. Moonshot's <strong>Kimi K2</strong> (1.04T total / 32B active parameters, a
+      mixture-of-experts model trained on 15.5T tokens, arXiv:2507.20534) fixed it with <strong>MuonClip</strong> —
+      after each Muon update, compute the largest attention logit produced by each attention head, and if it
+      exceeds a threshold ($\tau=100$), rescale that head's query and key projection weights down by
+      $\gamma_h=\min(1, \tau/S_{\max}^h)$. Applied per-head rather than globally, so healthy heads are left alone.
+      Across the full 15.5T-token run, Kimi K2 reported <strong>zero loss spikes</strong>; only 12.7% of attention
+      heads ever triggered the clip, and even those stopped needing it after roughly 70,000 steps, once training
+      stabilized on its own.
+    </p>
+
+    <h3>Aurora: fixing Muon's blind spot on rectangular matrices</h3>
+    <p>
+      Muon's orthogonalization is exact for square matrices, but most transformer weight matrices aren't
+      square — an MLP up-projection might map $d$ dimensions to $4d$. On a genuinely rectangular matrix,
+      equalizing singular values still leaves the resulting update's individual <em>rows</em> at very uneven
+      norms — some neurons keep receiving a healthy update, others receive next to nothing and stop learning
+      almost entirely, a failure <strong>Tilde Research</strong> calls "neuron death." Their fix,
+      <strong>Aurora</strong> (Dewulf, Pai, Yang, Zhang &amp; Keigwin, "Aurora: A Leverage-Aware Optimizer for
+      Rectangular Matrices," Tilde Research, May 2026 — blog.tilderesearch.com/blog/aurora,
+      github.com/tilde-research/aurora-release), adds a second constraint on top of Muon's: not just
+      semi-orthogonal, but every row normalized to the same length ($\sqrt{n/m}$ for an $n\times m$ matrix),
+      enforced by alternating between row-normalization and a damped polar-factor step until both hold at once.
+    </p>
+    <p>
+      This is brand new — released as a blog post and open-source repo, not yet a peer-reviewed paper — so treat
+      the numbers as Tilde's own reported results rather than independently confirmed. On a 1.1B-parameter model
+      trained on roughly 100B tokens, they report a training loss of <strong>2.26</strong> against
+      <strong>2.31</strong> for Muon and <strong>2.33</strong> for NorMuon (a related variant), a HellaSwag score
+      of <strong>67.6%</strong> (about 2.5 points above the baselines), and an MMLU score of <strong>37.9%</strong>
+      (nearly 11 points above plain Muon at the same scale) — plus a new nanoGPT speedrun record. It's exactly the
+      kind of claim §5 is about: promising, concrete, and not yet independently reproduced.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="scale">
+    <h2>4. What's special about optimizing at large-model scale</h2>
+    <p>
+      Everything above is true regardless of model size. Four things change qualitatively once the model has
+      tens or hundreds of billions of parameters, and none of them are visible from a small-scale ablation.
+    </p>
+    <h3>Memory stops being an afterthought</h3>
+    <p>
+      Adam's extra state — the momentum and second-moment buffers — is exactly as large as the model itself,
+      twice over. For a 70B-parameter model in bf16, that's roughly <strong>280 GB</strong> of optimizer state
+      alone, before the parameters, gradients, or activations. This single fact is why Adafactor exists (T5 was
+      trained with it specifically to avoid this cost), why 8-bit optimizer states are common in practice, and
+      why Lion's one-buffer design turned into a real hardware number: Google reports AdamW needing at least 16
+      TPU v4 chips to fit ViT-B/16 at batch size 4096, where Lion's smaller state needs only 8.
+    </p>
+
+    <div class="widget-frame" id="memory-overhead">
+      <p class="widget-title">Optimizer state memory</p>
+      <p class="widget-sub">For a model with N parameters, how much extra memory does each optimizer's state
+      cost — and why that number alone has driven real architecture decisions.</p>
+    </div>
+
+    <h3>There's a real ceiling on how much parallelism buys you</h3>
+    <p>
+      Bigger batches mean more GPUs working in parallel per step, which should mean faster wall-clock training —
+      up to a point. OpenAI's gradient noise scale (McCandlish, Kaplan, Amodei et al., arXiv:1812.06162) gives that
+      point a name: the <strong>critical batch size</strong>, estimated from the ratio of gradient variance to
+      gradient magnitude, $\mathcal{B}_{\text{simple}} = \mathrm{tr}(\Sigma)/\|G\|^2$. Below it, doubling the batch
+      size roughly halves the steps needed for free; above it, doubling the batch buys a shrinking fraction of
+      that speedup while doubling the compute bill. The critical batch size itself isn't fixed — it grows by an
+      order of magnitude or more over the course of training, and varies enormously by task: on the order of a
+      few thousand for small image classifiers, on the order of 100,000 tokens for language models, and up into
+      the tens of millions of frames for large-scale RL agents (OpenAI's own Dota 5v5 agent). This is a genuinely
+      large-model-scale concern: small-scale experiments simply never reach the batch sizes where this trade-off
+      bites.
+    </p>
+
+    <div class="widget-frame" id="critical-batch-size">
+      <p class="widget-title">The critical batch size</p>
+      <p class="widget-sub">Drag the batch size and watch the trade-off between steps needed (wall-clock) and
+      total examples processed (compute) — and where the knee sits.</p>
+    </div>
+
+    <h3>The best learning rate moves when the model gets bigger — unless you fix that</h3>
+    <p>
+      Under the standard way of initializing and scaling a network, the learning rate that works best at one
+      width doesn't transfer to a wider version of the same architecture — which means every new model size
+      has traditionally needed its own expensive hyperparameter sweep. <strong>muP</strong> (maximal update
+      parametrization; Yang, Hu et al., Microsoft, "Tensor Programs V," arXiv:2203.03466) reparametrizes
+      initialization and per-layer learning rates so that the optimal hyperparameters become <em>provably
+      independent of width</em>. The concrete payoff the paper reports: tuning hyperparameters on a 40M-parameter
+      proxy model under muP and transferring them zero-shot to a 6.7B-parameter target <em>beat</em> the
+      published, separately-tuned GPT-3-scale numbers — using only about <strong>7% of the total pretraining
+      compute</strong> that would otherwise have gone into the hyperparameter search itself.
+    </p>
+
+    <h3>Loss spikes are a real, recurring operational problem</h3>
+    <p>
+      At scale, training loss doesn't always decrease smoothly — it occasionally spikes, sometimes badly enough
+      to derail the run. Google's PaLM report (Chowdhery et al., arXiv:2204.02311) is unusually candid about
+      this: the loss spiked roughly <strong>20 times</strong> over the full training run, and each time the fix
+      was operational, not mathematical — restart from a checkpoint roughly 100 steps before the spike, skip the
+      roughly 200–500 data batches that seemed to trigger it, and resume. It's worth correcting a common piece of
+      folklore here: the fix is <em>not</em> to raise Adam's $\epsilon$. Later studies that isolated this
+      specifically (Wortsman et al., arXiv:2309.14322; Molybog et al., arXiv:2304.09871) found the opposite —
+      the default $\epsilon=10^{-8}$ is already too <em>large</em> relative to the tiny gradient magnitudes large,
+      well-scaled models produce, and raising it (to, say, $10^{-6}$) makes instability worse, not better;
+      lowering it (toward $10^{-15}$) is what actually helps.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="evaluating">
+    <h2>5. How to evaluate an optimizer</h2>
+    <p>
+      Every year brings a handful of papers claiming a new optimizer beats Adam. Almost none of those claims
+      survive contact with a fair, independent comparison — and the two efforts that actually ran one are worth
+      knowing by name.
+    </p>
+    <p>
+      <strong>"Descending through a Crowded Valley"</strong> (Schmidt, Schneider &amp; Hennig, ICML 2021,
+      arXiv:2007.01547) is the closest thing the field has to a controlled trial: 15 optimizers, evaluated across
+      8 different deep learning problems, over more than <strong>50,000</strong> individual training runs with a
+      standardized tuning budget for every method. Their conclusion, close to verbatim: <em>"Adam remains a
+      strong contender, with newer methods failing to significantly and consistently outperform it."</em> That
+      isn't "nothing has improved since 2015" — it's that most proposed improvements only win on the narrow
+      setting they were introduced to solve, and lose their edge (or lose outright) the moment the comparison
+      broadens.
+    </p>
+    <p>
+      <strong>MLCommons AlgoPerf</strong> (Dahl et al., arXiv:2306.07179) turns this into an ongoing, standardized
+      competition rather than a one-time study: fixed workloads, a fixed target loss, and a scored measurement of
+      wall-clock time to reach it, under two rulesets — an <em>external-tuning</em> track (a fixed, generous
+      hyperparameter search budget) and a <em>self-tuning</em> track (no search allowed at all, the algorithm has
+      to just work). In the 2024 competition, the external-tuning winner was a distributed implementation of
+      Shampoo (from Meta), roughly <strong>28% faster</strong> than the NadamW baseline; the self-tuning winner
+      was Schedule-Free AdamW, roughly <strong>8–10% faster</strong> than baseline with no tuning at all. Both
+      numbers are real, earned improvements — and both are single-digit-to-thirty-percent gains after a genuinely
+      fair fight, a useful anchor against any claim of a 2× or 5× improvement that didn't go through a comparison
+      this rigorous.
+    </p>
+    <p>
+      The practical checklist this suggests: does the comparison hold the tuning budget fixed across methods
+      (not "well-tuned ours vs. default-hyperparameter theirs")? Does it test more than one model family and
+      more than one dataset? Does it report wall-clock time and not just steps (an optimizer with 3× the
+      per-step cost needs a 3×+ step-count win to actually be faster)? And does anyone other than the method's
+      own authors reproduce the result? Muon and Aurora, above, are honest about exactly where they stand on
+      that last question today.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="design-principles">
+    <h2>6. Common design principles</h2>
+    <p>
+      Pull back far enough and every optimizer in this piece is a combination of a small number of recurring
+      moves, applied at a different structural level (per-parameter, per-layer, per-matrix) and traded off
+      against a different cost:
+    </p>
+    <table class="results">
+      <thead>
+        <tr><th>Design move</th><th>What it buys</th><th>Who uses it</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="cat">Average gradients over time</td>
+          <td>Damps noise, accelerates consistent directions</td>
+          <td>Momentum, Nesterov, Adam, Lion, Muon</td>
+        </tr>
+        <tr>
+          <td class="cat">Adaptive per-parameter scale</td>
+          <td>Normalizes away curvature/gradient-magnitude differences across parameters</td>
+          <td>AdaGrad, RMSprop, Adam, Adafactor</td>
+        </tr>
+        <tr>
+          <td class="cat">Exact correction for a known bias</td>
+          <td>Fixes the zero-initialization transient without waiting it out</td>
+          <td>Adam's bias correction</td>
+        </tr>
+        <tr>
+          <td class="cat">Decouple regularization from adaptivity</td>
+          <td>Stops the adaptive term from silently distorting weight decay</td>
+          <td>AdamW, Lion</td>
+        </tr>
+        <tr>
+          <td class="cat">Operate on the whole matrix, not per-element</td>
+          <td>Sees structure (rank, singular directions) invisible to per-parameter methods</td>
+          <td>Shampoo, SOAP, Muon, Aurora</td>
+        </tr>
+        <tr>
+          <td class="cat">Cheap iterative approximation of an expensive op</td>
+          <td>Makes an otherwise-intractable matrix operation affordable every step</td>
+          <td>Newton-Schulz (Muon, Aurora), factored second moments (Adafactor)</td>
+        </tr>
+        <tr>
+          <td class="cat">Trust-ratio / layer-wise rescaling</td>
+          <td>Keeps very large batches stable by matching update size to weight norm per layer</td>
+          <td>LARS, LAMB</td>
+        </tr>
+        <tr>
+          <td class="cat">Discover the update rule, don't hand-design it</td>
+          <td>Finds counterintuitive but effective forms (e.g. sign-based updates) a human might not try</td>
+          <td>Lion (symbolic program search)</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">None of these moves are free — every row above trades some combination of memory, compute,
+    or implementation complexity for the property it buys. §1's four axes are the ledger every row gets weighed
+    against.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>7. Why this all works</h2>
+    <p>
+      Strip away the specific formulas and there's one underlying idea: a raw gradient is a single noisy sample
+      from a distribution, and almost everything in this piece is a different way of extracting a more reliable
+      signal from a short history of those samples before committing to a step.
+    </p>
+    <h3>Time-averaging trades staleness for lower variance</h3>
+    <p>
+      Momentum's exponential average is a bet that the gradient distribution changes slowly enough that recent
+      history is still informative — true along a consistent slope, false right at a sharp bend, which is
+      exactly why momentum overshoots corners. Adam's second moment makes the same bet about gradient
+      <em>magnitude</em> rather than direction.
+    </p>
+    <h3>Adaptivity is an implicit, cheap curvature estimate</h3>
+    <p>
+      A parameter with consistently large gradients is, roughly, a parameter sitting in a steep direction of the
+      loss; dividing by that history is a rough stand-in for the second-order (Newton's method-style)
+      preconditioning that would require the full, computationally infeasible Hessian. Adam approximates this
+      per-parameter (a diagonal approximation); Shampoo, SOAP, and Muon approximate it per-matrix (capturing
+      cross-parameter correlations a diagonal method structurally cannot see) at higher computational cost.
+    </p>
+    <h3>Every fix here is fixing a specific, nameable failure of the fix before it</h3>
+    <p>
+      SGD → Momentum fixes oscillation in narrow ravines. AdaGrad → RMSprop fixes permanent learning-rate decay.
+      Adam's bias correction fixes a zero-initialization transient. AdamW fixes weight decay's interaction with
+      adaptivity. Muon fixes Adam's blindness to matrix structure. Aurora fixes Muon's blindness to rectangular
+      shape. This is a genealogy, not a pile of unrelated tricks — nearly every method here exists because someone
+      found the exact failure mode of its predecessor and wrote the smallest fix that addressed it.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>8. What it means</h2>
+    <p>
+      The honest state of the field in 2026: Adam and AdamW remain the default for good reason — decades of
+      accumulated tuning wisdom, robustness across an enormous range of architectures and scales, and the
+      "Crowded Valley" result that most challengers don't consistently beat it. Muon is the first serious,
+      independently-adopted (Kimi K2, at trillion-parameter scale) challenger in a decade, precisely because it
+      attacks a structural blind spot — matrix shape — that per-parameter methods cannot see by construction, not
+      because it tunes the same knobs harder. Aurora, days old as pieces of technical writing go, is either the
+      next link in that chain or a result that won't replicate outside its own repo — and the honest answer, per
+      §5, is that we don't know yet.
+    </p>
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Does orthogonalization hold up at truly extreme scale?</strong> MuonClip's fix for Kimi K2
+      suggests yes, with a patch — but "the patch we needed at 1T parameters" is exactly the kind of surprise
+      that tends to recur at the next order of magnitude.</li>
+      <li><strong>Memory-vs-precision trade-offs are still being actively renegotiated.</strong> 8-bit optimizer
+      states, factored second moments, and single-buffer methods like Lion and Muon are all reactions to the
+      same pressure — optimizer state is now a first-class memory citizen, not a rounding error.</li>
+      <li><strong>Independent replication is the bottleneck, not new ideas.</strong> The field produces new
+      optimizer papers constantly; it produces "Crowded Valley"-style fair comparisons rarely, because they're
+      expensive and unglamorous. That asymmetry is exactly why most claimed improvements quietly disappear.</li>
+    </ul>
+    <h3>The bottom line</h3>
+    <p>
+      An optimizer is a compressed hypothesis about the shape of the loss landscape and the statistics of its own
+      gradients — plain SGD assumes nothing, Adam assumes gradient scale varies parameter-by-parameter, Muon
+      assumes it varies direction-by-direction within a matrix, Aurora assumes it also varies row-by-row within
+      a rectangular one. Each assumption buys real speed when it holds and real risk when it doesn't, which is
+      exactly why the right response to any new optimizer claim is still the one from §5: what's the fair
+      comparison, and has anyone outside the method's own authors run it?
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Further reading, by topic — foundations: <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">Adam</a> ·
+      <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">AdamW</a> ·
+      <a href="https://arxiv.org/abs/1904.09237" target="_blank" rel="noopener">AMSGrad</a> — new optimizers:
+      <a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noopener">Muon (blog)</a> ·
+      <a href="https://arxiv.org/abs/2502.16982" target="_blank" rel="noopener">Muon is Scalable for LLM Training</a> ·
+      <a href="https://arxiv.org/abs/2507.20534" target="_blank" rel="noopener">Kimi K2 / MuonClip</a> ·
+      <a href="https://blog.tilderesearch.com/blog/aurora" target="_blank" rel="noopener">Aurora (Tilde Research)</a> —
+      memory &amp; large batch: <a href="https://arxiv.org/abs/2302.06675" target="_blank" rel="noopener">Lion</a> ·
+      <a href="https://arxiv.org/abs/1804.04235" target="_blank" rel="noopener">Adafactor</a> ·
+      <a href="https://arxiv.org/abs/1802.09568" target="_blank" rel="noopener">Shampoo</a> ·
+      <a href="https://arxiv.org/abs/2409.11321" target="_blank" rel="noopener">SOAP</a> ·
+      <a href="https://arxiv.org/abs/1708.03888" target="_blank" rel="noopener">LARS</a> ·
+      <a href="https://arxiv.org/abs/1904.00962" target="_blank" rel="noopener">LAMB</a> — scale:
+      <a href="https://arxiv.org/abs/2203.03466" target="_blank" rel="noopener">muP</a> ·
+      <a href="https://arxiv.org/abs/1812.06162" target="_blank" rel="noopener">Gradient noise scale</a> ·
+      <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">PaLM</a> — evaluation:
+      <a href="https://arxiv.org/abs/2007.01547" target="_blank" rel="noopener">Descending through a Crowded Valley</a> ·
+      <a href="https://arxiv.org/abs/2306.07179" target="_blank" rel="noopener">MLCommons AlgoPerf</a>
+    </p>
+    <p class="tiny">Figures and dates throughout are drawn from the cited papers'/posts' own reported numbers.
+    Muon and Aurora in particular are recent, fast-moving, and in Aurora's case not yet peer-reviewed — treat
+    their reported results as the authors' own account rather than independently re-verified ground truth.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

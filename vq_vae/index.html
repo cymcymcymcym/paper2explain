@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VQ-VAE: Neural Discrete Representation Learning — an interactive explainer</title>
+  <meta name="description" content="An interactive explainer of VQ-VAE (van den Oord, Vinyals, Kavukcuoglu, 2017): learning a discrete codebook with a straight-through gradient trick, and why discrete latents dodge posterior collapse."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vx': '{\\mathbf{x}}', '\\vz': '{\\mathbf{z}}', '\\ve': '{\\mathbf{e}}',
+        '\\sg': '{\\mathrm{sg}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>VQ-VAE: Neural Discrete Representation Learning</h1>
+    <p class="byline">
+      van den Oord, Vinyals, Kavukcuoglu &middot; DeepMind &middot; NeurIPS 2017 &middot;
+      <a href="https://arxiv.org/abs/1711.00937" target="_blank" rel="noopener">arXiv 1711.00937</a>
+    </p>
+    <p class="lede">
+      Ask a variational autoencoder for a continuous latent code and you get one for free — the reparameterization
+      trick makes it differentiable, and gradient descent does the rest. Ask for a <em>discrete</em> one — a
+      symbol, an index into a finite dictionary — and you hit a wall: `argmin` and `argmax` have no useful
+      gradient at all. VQ-VAE's answer is almost embarrassingly direct — just copy the gradient across the
+      lookup as if it weren't there — and it works well enough to learn, with zero supervision, a discrete code
+      for speech that lines up with real phonemes <strong>49.3% of the time against a 7.2% chance baseline</strong>,
+      compress a 128×128 ImageNet photo by <strong>42.6×</strong> before handing it to a prior, and dodge the
+      "posterior collapse" that breaks continuous VAEs paired with strong decoders — without even trying to.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook</a></li>
+      <li><a href="#collapse">The problem: discrete gradients and posterior collapse</a></li>
+      <li><a href="#quantization">The trick: vector quantization</a></li>
+      <li><a href="#straight-through">Learning through a lookup table</a></li>
+      <li><a href="#loss">Three loss terms, three jobs</a></li>
+      <li><a href="#codebook-learning">Learning the codebook: VQ loss vs. EMA</a></li>
+      <li><a href="#compression">The compression math</a></li>
+      <li><a href="#results">Results: images, audio, and video</a></li>
+      <li><a href="#why">Why this works</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="paper-figure">
+      <img src="assets/figures/method_diagram.png" alt="VQ-VAE architecture diagram: encoder produces z_e(x), nearest-neighbor lookup into embedding table produces z_q(x), decoder reconstructs x; right panel shows the gradient flowing from z_q(x) back to z_e(x)"/>
+      <figcaption>The whole model in one picture. Left: encoder → nearest-neighbor lookup → decoder. Right: the
+      encoder's output z<sub>e</sub>(x) snaps to its nearest codebook vector e<sub>2</sub>; the gradient
+      &nabla;<sub>z</sub>L (red) is copied straight back across the lookup.</figcaption>
+    </figure>
+    <p>
+      Language is discrete. Speech is a sequence of phonemes, not a continuous blur. Most of what a scene "is"
+      about — the objects in it — occupies a handful of symbolic slots, not a smooth manifold of pixel values.
+      And yet almost every deep generative model in 2017 represented its latent space as continuous, because
+      continuous spaces are what backpropagation is built for. VQ-VAE is DeepMind's answer to a specific,
+      practical question: can you build a VAE whose latent code is genuinely discrete — an index into a learned
+      dictionary — and still train it end-to-end with plain gradient descent?
+    </p>
+    <p>
+      The honest answer, and the reason this paper is worth reading closely three modalities and one very simple
+      trick later, is: yes, almost accidentally easily, provided you're willing to lie to the optimizer about
+      where the gradient came from.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="collapse">
+    <h2>1. The problem: discrete gradients and posterior collapse</h2>
+    <p>
+      A standard VAE encodes $\vx$ into a distribution $q(\vz|\vx)$, decodes a sample back into $p(\vx|\vz)$, and
+      trains both jointly by backpropagating through a sampling step — made possible by the reparameterization
+      trick, which only works because the posterior is continuous (usually Gaussian). Swap in a discrete
+      categorical posterior and that trick breaks: sampling from a categorical distribution, or taking an
+      $\arg\min$/$\arg\max$, has zero useful gradient. This is the reason discrete latent variables had, up to
+      this point, proven so hard to train in deep networks.
+    </p>
+    <p>
+      There's a second, subtler problem VQ-VAE sidesteps almost as a side effect. Pair a VAE with a sufficiently
+      powerful decoder — a PixelCNN, say — and the decoder can often model $p(x)$ well enough on its own that it
+      simply ignores the latent code entirely. This is <strong>posterior collapse</strong>: the KL term in the
+      ELBO pushes $q(\vz|\vx)$ toward the prior, the decoder doesn't need $\vz$ to reconstruct well, and the
+      latents end up carrying no information at all — precisely the failure mode you'd worry about most when
+      pairing a VAE with an autoregressive PixelCNN decoder, which is exactly the setup this paper wants to use.
+    </p>
+    <aside class="callout">
+      <strong>Why this matters beyond VQ-VAE.</strong> Posterior collapse and non-differentiable discrete
+      sampling are two separate problems that happen to share a fix here. Once you commit to a deterministic
+      nearest-neighbor posterior with a uniform prior, the KL term becomes a constant ($\log K$) — it can't push
+      anything toward ignoring the latents, because it no longer depends on the encoder at all.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="quantization">
+    <h2>2. The trick: vector quantization</h2>
+    <p>
+      VQ-VAE replaces the usual Gaussian posterior with something much simpler. Define an embedding table
+      $\ve \in \mathbb{R}^{K\times D}$ — $K$ vectors, each of dimension $D$, the model's entire "vocabulary." The
+      encoder maps $\vx$ to a continuous vector $z_e(\vx)$, exactly like a normal autoencoder. Then, instead of
+      sampling, the model just looks up the nearest codebook vector:
+    </p>
+    <p class="eq">$$ z_q(\vx) = \ve_k, \qquad k = \arg\min_j \| z_e(\vx) - \ve_j \|_2 $$</p>
+    <p>
+      and the posterior is deterministic and one-hot: probability 1 on whichever $k$ minimizes that distance,
+      zero everywhere else. With a uniform categorical prior over the $K$ codes, the ELBO's KL term collapses to
+      the constant $\log K$ — it drops out of the training objective entirely. $z_q(\vx)$, not the raw encoder
+      output, is what actually gets passed to the decoder.
+    </p>
+    <p>
+      Drag the widget below to feel what this operation actually does: the encoder output can be anywhere in a
+      continuous space, but the decoder only ever sees one of $K$ fixed points.
+    </p>
+    <div class="widget-frame" id="quantize-drag">
+      <p class="widget-title">Nearest-neighbor quantization</p>
+      <p class="widget-sub">Drag the encoder output. It always snaps to the nearest codebook vector — toggle
+      Voronoi cells to see the full partition of the space.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="straight-through">
+    <h2>3. Learning through a lookup table</h2>
+    <p>
+      Here's the actual problem: $\arg\min$ is piecewise-constant. Nudge $z_e(\vx)$ a tiny amount and, almost
+      everywhere, $z_q(\vx)$ doesn't move at all — it's stuck on the same codebook vector until the nudge is
+      large enough to cross a Voronoi boundary. The true gradient of the reconstruction loss with respect to
+      $z_e(\vx)$, routed through this operation, is zero almost everywhere and undefined at the boundaries. If
+      you used it literally, the encoder would never receive a training signal.
+    </p>
+    <p>
+      VQ-VAE's fix, borrowed from Bengio et al.'s straight-through estimator for other discrete operations: during
+      the forward pass, use $z_q(\vx)$; during the backward pass, pretend the whole quantization step was the
+      identity function, and copy the gradient $\nabla_z L$ computed at $z_q(\vx)$ straight back to $z_e(\vx)$,
+      unaltered. It's not the true gradient of anything — it's a deliberate approximation. But because
+      $z_e(\vx)$ and $z_q(\vx)$ live in the exact same $D$-dimensional space, that borrowed gradient still points
+      in a locally sensible direction: "move your output this way and the reconstruction gets better," which is
+      precisely the information the encoder needs, even filtered through the wrong codebook vector.
+    </p>
+    <p>
+      This is exactly what the manim animation and the widget above are both showing: the encoder output drifts,
+      occasionally crossing into a different codebook vector's territory, and every step the same borrowed
+      gradient is what's pushing it.
+    </p>
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/quantize.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">The encoder output drifts through the embedding space, its nearest codebook vector
+      changing discontinuously as it crosses Voronoi boundaries — while the same straight-through gradient keeps
+      getting copied back from whichever code it currently lands on.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="loss">
+    <h2>4. Three loss terms, three jobs</h2>
+    <p>
+      The straight-through trick has a direct consequence: because the gradient skips over $z_q(\vx)$ entirely,
+      the codebook vectors $\ve_i$ receive <em>no</em> gradient from the reconstruction loss at all. Something
+      else has to train them. VQ-VAE's full objective has three terms, each updating a different, disjoint
+      subset of the model's parameters:
+    </p>
+    <p class="eq">$$ L = \underbrace{\log p(\vx \mid z_q(\vx))}_{\text{reconstruction}} + \underbrace{\|\sg[z_e(\vx)] - \ve\|_2^2}_{\text{codebook}} + \beta\underbrace{\|z_e(\vx) - \sg[\ve]\|_2^2}_{\text{commitment}} $$</p>
+    <p>
+      where $\sg[\cdot]$ is the stop-gradient operator — identity on the forward pass, zero gradient on the
+      backward pass. The <strong>reconstruction</strong> term trains the decoder outright, and the encoder via
+      the straight-through path. The <strong>codebook</strong> term is a plain $\ell_2$ pull that moves each
+      $\ve_i$ toward the encoder outputs currently assigned to it — a form of online dictionary learning (it's
+      literally the loss $k$-means minimizes) — with the stop-gradient on $z_e(\vx)$ making sure this term never
+      touches the encoder. The <strong>commitment</strong> term pulls the other way: it keeps the encoder from
+      drifting arbitrarily far from its assigned code (nothing in the setup otherwise bounds how large
+      $z_e(\vx)$ can grow, since the embedding space has no fixed scale), weighted by $\beta$ — the paper reports
+      results are stable for $\beta$ anywhere from 0.1 to 2.0, and uses $\beta=0.25$ throughout.
+    </p>
+    <div class="widget-frame" id="loss-breakdown">
+      <p class="widget-title">Which term trains what</p>
+      <p class="widget-sub">Click each term to see exactly which parameters it updates — notice how none of the
+      three overlap.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="codebook-learning">
+    <h2>5. Learning the codebook: VQ loss vs. EMA</h2>
+    <p>
+      The codebook loss above is one way to train $\ve$ — plain gradient descent on an $\ell_2$ pull. But the
+      paper points out its own loss term is really approximating the closed-form optimum of a $k$-means-style
+      objective: if $\{z_{i,1},\ldots,z_{i,n_i}\}$ are the encoder outputs currently assigned to code $i$, the
+      value of $\ve_i$ that minimizes their squared distance is simply their mean. You can't compute that exactly
+      online — minibatches only ever see a slice of the assignments — so the appendix proposes tracking it with
+      an <strong>exponential moving average</strong> instead:
+    </p>
+    <p class="eq">$$ N_i^{(t)} = \gamma N_i^{(t-1)} + (1-\gamma)\,n_i^{(t)}, \qquad m_i^{(t)} = \gamma m_i^{(t-1)} + (1-\gamma)\sum_j z^{(t)}_{i,j}, \qquad \ve_i^{(t)} = \frac{m_i^{(t)}}{N_i^{(t)}} $$</p>
+    <p>
+      with $\gamma=0.99$ reported to work well. This EMA update wasn't used for the experiments in the paper
+      itself (it's presented in the appendix as an alternative), but it became the standard way essentially every
+      later VQ-VAE-style model trains its codebook — it removes one gradient-based loss term entirely and tends
+      to be more stable in practice. The widget below runs the exact update rule above.
+    </p>
+    <div class="widget-frame" id="ema-update">
+      <p class="widget-title">EMA codebook tracking</p>
+      <p class="widget-sub">Step through minibatches and watch a codebook vector track a slowly drifting true
+      mean. Drag &gamma; to trade off smoothness against responsiveness.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="compression">
+    <h2>6. The compression math</h2>
+    <p>
+      Every discrete code is a fixed, countable amount of information: $\log_2 K$ bits per latent, times however
+      many latents you use. For the paper's headline ImageNet experiment — a $128\times128\times3$ image (8 bits
+      per channel) encoded to a $32\times32\times1$ grid of codes with $K=512$ — that's
+      $\frac{128\cdot128\cdot3\cdot8}{32\cdot32\cdot\log_2 512} \approx 42.6\times$ smaller than the raw pixels,
+      before a prior model ever gets involved. That reduction isn't just a storage trick — it's what makes it
+      practical to fit a powerful autoregressive prior (a PixelCNN) over the latent grid instead of over raw
+      pixels, both speeding up training/sampling and letting the prior spend its capacity on global structure
+      instead of low-level pixel statistics.
+    </p>
+    <div class="widget-frame" id="compression-calc">
+      <p class="widget-title">Compression ratio calculator</p>
+      <p class="widget-sub">The exact formula above — adjust image size, downsampling factor, and codebook size
+      and watch the ratio update live.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>7. Results: images, audio, and video</h2>
+    <h3>Images</h3>
+    <p>
+      On CIFAR-10, with matched architectures, a continuous VAE reaches <strong>4.51 bits/dim</strong>, VQ-VAE
+      reaches <strong>4.67 bits/dim</strong>, and VIMCO (a discrete-latent baseline with an independent
+      categorical prior) trails at <strong>5.14 bits/dim</strong> — the paper's own framing is that VQ-VAE is the
+      first discrete-latent model to seriously challenge continuous VAEs on likelihood, closing nearly all of the
+      gap that previous discrete approaches left open.
+    </p>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/imnet_orig.png" alt="Original 128x128 ImageNet images"/>
+      <img src="assets/figures/imnet_recon.png" alt="VQ-VAE reconstructions from a 32x32x1 discrete latent space"/>
+      <figcaption>Left: original 128×128×3 ImageNet images. Right: reconstructions from the 32×32×1, K=512
+      discrete latent space — 42.6× smaller, and only slightly blurrier than the originals.</figcaption>
+    </figure>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/sample_kitfox.png" alt="PixelCNN-sampled kit fox"/>
+      <img src="assets/figures/sample_whale.png" alt="PixelCNN-sampled grey whale"/>
+      <figcaption>Samples generated by fitting a PixelCNN prior over the discrete latent grid <em>after</em>
+      VQ-VAE training, then decoding — not reconstructions, genuinely new images.</figcaption>
+    </figure>
+    <p>
+      A more extreme test: compress an 84×84 DeepMind Lab frame down to just <strong>three</strong> latent codes
+      (27 bits total, less than a single float32) with a second-stage VQ-VAE stacked on the first. This is
+      exactly the regime where a VAE with a powerful PixelCNN decoder is expected to suffer posterior collapse —
+      the decoder is powerful enough to ignore three symbols entirely and still produce plausible-looking rooms.
+      It doesn't:
+    </p>
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/lab3latents_orig.png" alt="Original DeepMind Lab frames"/>
+      <img src="assets/figures/lab3latents_sample.png" alt="Reconstructions from just 3 discrete latents"/>
+      <figcaption>Top: originals. Bottom: reconstructions using only 3 discrete codes for the whole scene. Room
+      layout and wall placement survive; textures are regenerated procedurally by the prior rather than stored —
+      exactly what you'd expect from a model that is actually using its (tiny) latent budget.</figcaption>
+    </figure>
+
+    <h3>Audio</h3>
+    <p>
+      On VCTK (109 speakers), an encoder with 6 strided convolutions compresses raw audio <strong>64×</strong>,
+      down to a single 512-way discrete stream, with the decoder additionally conditioned on a one-hot speaker
+      ID. Reconstructions preserve the spoken content but not the exact waveform or prosody — evidence the
+      discrete code is capturing <em>what</em> was said, invariant to low-level acoustic detail, entirely without
+      linguistic supervision.
+    </p>
+    <figure class="paper-figure three-up">
+      <img src="assets/figures/wav_orig.png" alt="Original waveform"/>
+      <img src="assets/figures/wav_recon.png" alt="Reconstruction, same speaker"/>
+      <img src="assets/figures/wav_transfer.png" alt="Reconstruction, different speaker id"/>
+      <figcaption>Left to right: original waveform, reconstruction with the original speaker ID, reconstruction
+      with a <em>different</em> speaker ID — same spoken content, a different voice. The discrete code factors
+      out speaker identity entirely on its own.</figcaption>
+    </figure>
+    <p>
+      The sharpest number in the paper: on a 460-speaker dataset with 128× compression, the model's 128 possible
+      discrete codes were matched one-to-one against ground-truth phonemes never used in training. The best
+      single-code-to-phoneme mapping reached <strong>49.3%</strong> classification accuracy on a 41-way phoneme
+      task, against a <strong>7.2%</strong> most-likely-class baseline — unsupervised codes discovering a rough
+      phoneme-level structure of language, purely from the statistics of raw sound.
+    </p>
+
+    <h3>Video</h3>
+    <p>
+      Trained on DeepMind Lab frames with an action-conditioned prior, VQ-VAE can "imagine" forward: generate an
+      entire sequence of future latents autoregressively, conditioned only on a stream of actions, and decode to
+      pixels <em>only at the very end</em> — no frame is ever generated except the last, and no intermediate
+      pixel-space rollout happens at all.
+    </p>
+    <figure class="paper-figure">
+      <img src="assets/figures/video_figure.png" alt="Video generation: 6 conditioning frames followed by 10 generated frames under forward and right actions"/>
+      <figcaption>First 6 real frames, followed by 10 frames generated purely in latent space under a repeated
+      "move forward" (top) or "move right" (bottom) action, decoded to pixels only after the full latent sequence
+      is sampled.</figcaption>
+    </figure>
+
+    <table class="results">
+      <thead>
+        <tr><th>Setting</th><th>Metric</th><th>VQ-VAE</th><th>Comparison</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="3" class="cat">CIFAR-10 likelihood</td>
+          <td>bits/dim (↓)</td>
+          <td>4.67</td>
+          <td>4.51 <em>(continuous VAE)</em></td>
+        </tr>
+        <tr>
+          <td>bits/dim (↓)</td>
+          <td class="win"><strong>4.67</strong></td>
+          <td>5.14 <em>(VIMCO, discrete)</em></td>
+        </tr>
+        <tr>
+          <td>bits/dim (↓)</td>
+          <td>4.67</td>
+          <td>4.54 <em>(Deep Conv VAE)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">ImageNet 128×128×3</td>
+          <td>compression ratio</td>
+          <td class="win"><strong>42.6×</strong></td>
+          <td>32×32×1 grid, K=512</td>
+        </tr>
+        <tr>
+          <td class="cat">Speech (LibriSpeech, 460 spk.)</td>
+          <td>phoneme classification acc.</td>
+          <td class="win"><strong>49.3%</strong></td>
+          <td>7.2% <em>(chance baseline)</em></td>
+        </tr>
+        <tr>
+          <td class="cat">Speech (VCTK, 109 spk.)</td>
+          <td>waveform compression</td>
+          <td class="win"><strong>64×</strong></td>
+          <td>+ zero-shot speaker conversion</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">All likelihoods are lower bounds. Full audio samples: the authors' companion page,
+    linked from the paper.</p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="why">
+    <h2>8. Why this works</h2>
+    <p>
+      Three separate design choices reinforce each other here, and it's worth being clear about why none of them
+      is optional.
+    </p>
+    <h3>The deterministic posterior kills the KL term, which kills posterior collapse</h3>
+    <p>
+      Posterior collapse happens when the KL-to-prior term in the ELBO can be minimized by making the posterior
+      match the prior — i.e., by having the encoder output carry no information. Once the posterior is a
+      deterministic one-hot argmin and the prior is uniform, the KL term is the fixed constant $\log K$, full
+      stop. There's no way to "cheat" toward the prior, because the model was never rewarded for approaching it
+      in the first place.
+    </p>
+    <h3>Sharing the embedding space makes the borrowed gradient meaningful</h3>
+    <p>
+      The straight-through estimator is a hack in general — copying a gradient across an arbitrary
+      non-differentiable operation can easily point in a useless or actively harmful direction. It works here
+      specifically because $z_e(\vx)$ and $z_q(\vx)$ are guaranteed to live in the same $D$-dimensional vector
+      space by construction. The gradient computed "as if $z_q(\vx)$ could move freely" is, to first order, still
+      approximately correct for $z_e(\vx)$, precisely because they're never far apart (the commitment loss makes
+      sure of that).
+    </p>
+    <h3>Separating "what trains what" avoids the usual VAE failure modes</h3>
+    <p>
+      Because the three loss terms train disjoint parameter sets with no gradient interference between them, none
+      of the usual VAE balancing acts (tuning a KL weight against a reconstruction weight to avoid collapse or
+      blurry samples) apply in the same way. The one hyperparameter that remains, $\beta$, only controls how
+      tightly the encoder commits to its codes — and the paper reports the results are largely insensitive to it.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>9. What it means</h2>
+    <p>
+      VQ-VAE's real legacy isn't the CIFAR-10 bits/dim number — it's the two-stage recipe it establishes and that
+      an enormous amount of later generative modeling work adopts wholesale: first learn a discrete tokenizer
+      (compress raw data to a grid of codebook indices), then train a separate, powerful autoregressive or
+      diffusion prior over those tokens instead of over raw pixels or audio samples. VQGAN adds an adversarial
+      and perceptual loss on top of the same quantization mechanism; DALL·E's original image tokenizer is a
+      close cousin; the pattern of "discretize first, model the discrete tokens second" now underlies a large
+      fraction of image, audio, and video generation pipelines that came after this paper.
+    </p>
+    <h3>Open problems the paper names itself</h3>
+    <ul>
+      <li><strong>The prior is trained after, not jointly with, the VQ-VAE.</strong> The paper explicitly flags
+      joint training of the prior and the encoder/decoder as future work that "could strengthen results" —
+      something later tokenizer-based models still mostly don't do, for practical rather than principled reasons.</li>
+      <li><strong>MSE reconstruction loss caps visual fidelity.</strong> The paper notes a more perceptual loss
+      (a GAN, specifically) would likely sharpen reconstructions — exactly the fix VQGAN makes two years later.</li>
+      <li><strong>The straight-through estimator is a heuristic, not a principled gradient.</strong> It works
+      well here, but nothing guarantees it always will; later work (including this project's own explainer on
+      VICReg/SIGReg-style anti-collapse regularizers) explores training discrete or discretization-adjacent
+      representations without approximating a gradient that doesn't really exist.</li>
+    </ul>
+    <h3>The bottom line</h3>
+    <p>
+      VQ-VAE's central move is almost suspiciously simple for how far it goes: take the one operation
+      backpropagation genuinely cannot handle — a hard lookup — and just lie about its gradient, in a space
+      constructed specifically to make that lie approximately true. Everything else in the paper — the codebook
+      loss, the commitment term, the choice of a uniform prior — exists to keep that one approximation stable
+      enough to train. That it also happens to sidestep posterior collapse, compress images 42× before a prior
+      ever sees them, and discover phoneme structure in raw audio with no supervision at all is what turned a
+      clever gradient trick into one of the load-bearing ideas of modern generative modeling.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Paper: <a href="https://arxiv.org/abs/1711.00937" target="_blank" rel="noopener">arXiv:1711.00937</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

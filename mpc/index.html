@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Model Predictive Control: planning by replanning — from LQR to CEM and MPPI</title>
+  <meta name="description" content="An interactive tour of optimal control: LQR and the Riccati equation, the receding-horizon loop, iLQR, and the sampling-based planners — CEM and MPPI — that now drive robots."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vx': '{\\mathbf{x}}', '\\vu': '{\\mathbf{u}}',
+        '\\veps': '{\\boldsymbol{\\varepsilon}}',
+        '\\vmu': '{\\boldsymbol{\\mu}}', '\\vSigma': '{\\boldsymbol{\\Sigma}}',
+        '\\argmin': '{\\operatorname*{arg\\,min}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Model Predictive Control: planning by replanning — from LQR to CEM and MPPI</h1>
+    <p class="byline">
+      A field guide through <strong>LQR</strong>, <strong>MPC</strong>, <strong>iLQR</strong>,
+      <strong>CEM</strong>, and <strong>MPPI</strong> &middot; Kalman 1960 → GPU sampling 2026 &middot;
+      <a href="https://arxiv.org/abs/1707.02342" target="_blank" rel="noopener">MPPI 1707.02342</a> ·
+      <a href="https://arxiv.org/abs/1805.12114" target="_blank" rel="noopener">PETS 1805.12114</a> ·
+      <a href="https://arxiv.org/abs/2212.00541" target="_blank" rel="noopener">MJPC 2212.00541</a> ·
+      <a href="https://arxiv.org/abs/2310.16828" target="_blank" rel="noopener">TD-MPC2 2310.16828</a>
+    </p>
+    <p class="lede">
+      A 22&nbsp;kg model car drifts around a dirt track at the edge of tire friction, steered by nothing
+      but a GPU simulating <em>1,200 possible futures every 25 milliseconds</em>. A chemical plant has been
+      running the same trick since 1979. The trick is <strong>model predictive control</strong>: don't learn
+      a policy, don't solve the problem once — <em>plan a short distance ahead, act on the first step, throw
+      the plan away, and plan again</em>. This is the story of that loop, and of the three families of
+      optimizers that can live inside it: the exact one (LQR), the gradient one (iLQR), and the
+      sampling ones — CEM and MPPI — that took over robotics precisely <em>because</em> they don't need gradients.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The loop that drives everything</a></li>
+      <li><a href="#problem">1. One problem, three solver families</a></li>
+      <li><a href="#lqr">2. LQR: the one case with an exact answer</a></li>
+      <li><a href="#loop">3. The receding horizon: feedback without a policy</a></li>
+      <li><a href="#constraints">4. Constraints: why industry pays for MPC</a></li>
+      <li><a href="#ilqr">5. iLQR: gradients for nonlinear worlds</a></li>
+      <li><a href="#gradients-fail">6. Where gradients break</a></li>
+      <li><a href="#cem">7. CEM: survival of the elites</a></li>
+      <li><a href="#mppi">8. MPPI: every sample gets a vote</a></li>
+      <li><a href="#modern">9. The modern synthesis: sampling MPC meets learned models</a></li>
+      <li><a href="#bottom-line">The cheat sheet</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/autorally_track.png" alt="AutoRally 1/5-scale autonomous vehicles on a dirt track"/>
+      <figcaption>
+        The AutoRally testbed at Georgia Tech: 1/5-scale, 22&nbsp;kg autonomous cars built to be driven at the
+        limits of friction on dirt. Everything — state estimation, dynamics rollouts, control — runs onboard.
+        The controller is MPPI, a sampling-based MPC algorithm and one of the two heroes of this post.
+        (Williams et al., 2017.)
+      </figcaption>
+    </figure>
+
+    <p>
+      Ask a roboticist in 2026 how their robot decides what to do next and, remarkably often, the answer is
+      the same loop: <em>simulate a bunch of short futures, score them, act on the best beginning, repeat</em>.
+      The quadruped recovering from a shove, the drone threading a forest, the manipulation policy fine-tuning
+      a grasp, the RL agent that learned a world model from pixels — under the hood, a planner is being re-run
+      dozens of times per second.
+    </p>
+    <p>
+      That loop has a name — <strong>model predictive control</strong> (MPC) — and a curious history. It was not
+      invented by roboticists or machine learners. It came out of oil refineries in the late 1970s, where
+      engineers at Shell wanted controllers that could respect hard limits on valves and temperatures, something
+      the elegant textbook theory couldn't do. Their solution was almost embarrassingly pragmatic: put the
+      plant's model in a computer, optimize the next few minutes of inputs, apply the first one, and re-optimize
+      a minute later. Theory spent the next two decades catching up to why that works so well.
+    </p>
+    <p>
+      There is one conceptual confusion worth clearing at the door, because it trips up almost everyone coming
+      from machine learning. You will hear MPC described as "a gradient-free optimizer," or contrasted with
+      gradient descent. <strong>MPC is not an optimization algorithm at all.</strong> It is a <em>strategy</em> — a
+      loop that repeatedly poses a short optimization problem and executes only the first step of each answer.
+      What solves that inner problem is a separate, swappable choice: an exact matrix recursion (LQR), a
+      gradient method (iLQR), or a sampling method (CEM, MPPI). This post builds all four, in that order,
+      with the loop itself in the middle — because the loop is the part that survives every substitution.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="problem">
+    <h2>1. One problem, three solver families</h2>
+    <p>
+      Everything in this post is an answer to a single question. You have a <strong>state</strong>
+      $\vx_t$ — the robot's joint angles and velocities, the car's pose and speed, the reactor's temperatures.
+      You have <strong>actions</strong> $\vu_t$ — motor torques, steering and throttle, valve openings. And you
+      have a <strong>model</strong>: a function $f$ that predicts the next state from the current one,
+      $\vx_{t+1} = f(\vx_t, \vu_t)$. The model might be Newton's laws, a fluid simulator, or a neural network
+      trained on experience — for now it's just a black box you can roll forward. The question:
+      <em>which sequence of actions should I take?</em> Formally, over a <strong>horizon</strong> of $H$ steps:
+    </p>
+    <p class="eq">$$
+      \min_{\vu_0, \dots, \vu_{H-1}} \;\; \sum_{t=0}^{H-1} c(\vx_t, \vu_t) \;+\; c_H(\vx_H)
+      \qquad \text{s.t.} \quad \vx_{t+1} = f(\vx_t, \vu_t),
+    $$</p>
+    <p>
+      where $c$ is a running cost (distance from the goal, energy spent, "am I inside the obstacle") and $c_H$ is
+      a terminal cost on where you end up. This is the <strong>finite-horizon optimal control problem</strong>,
+      and it is the constant of this post: every algorithm below is a different way of attacking this same
+      minimization. Notice what kind of object the answer is: a concrete sequence of $H$ actions — an
+      <em>open-loop plan</em> — not a policy $\pi(\vx)$ that maps any state to an action. Keep that distinction
+      in mind; it becomes the central tension of section 3.
+    </p>
+    <p>
+      The solvers split into three families by what they ask of $f$ and $c$:
+    </p>
+    <ul>
+      <li><strong>Analytic.</strong> If the dynamics are linear and the cost is quadratic, the problem has a
+        closed-form solution — no iteration, no search. This is LQR, and it is the only case this clean.</li>
+      <li><strong>Gradient-based.</strong> If $f$ and $c$ are smooth, differentiate through the rollout and
+        improve the plan iteratively: iLQR/DDP, SQP, interior-point methods. Fast, precise — and dependent on
+        derivatives existing and being informative.</li>
+      <li><strong>Sampling-based.</strong> Treat the whole rollout as a black box: throw candidate action
+        sequences at the model, score the results, and use the scores to propose better candidates. CEM and
+        MPPI. All they need is a fast forward simulator.</li>
+    </ul>
+    <p>
+      Three families, one problem. We start with the exact one, because its two matrices — $Q$ and $R$ — teach
+      the cost-shaping intuition that every method downstream inherits.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="lqr">
+    <h2>2. LQR: the one case with an exact answer</h2>
+    <p>
+      In 1960, Rudolf Kalman showed that one special case of the problem above collapses into linear algebra.
+      Let the dynamics be linear, $\vx_{t+1} = A\vx_t + B\vu_t$, and the cost be quadratic,
+    </p>
+    <p class="eq">$$
+      J \;=\; \sum_{t} \; \vx_t^\top Q\, \vx_t \;+\; \vu_t^\top R\, \vu_t,
+    $$</p>
+    <p>
+      with $Q$ penalizing state error and $R$ penalizing control effort. This is the
+      <strong>linear-quadratic regulator</strong>. Solve it by dynamic programming from the end of the horizon
+      backwards: the cost-to-go stays quadratic, $V_t(\vx) = \vx^\top P_t\, \vx$, with $P_t$ given by the
+      <strong>Riccati recursion</strong>
+    </p>
+    <p class="eq">$$
+      P_t \;=\; Q + A^\top P_{t+1} A \;-\; A^\top P_{t+1} B \left(R + B^\top P_{t+1} B\right)^{-1} B^\top P_{t+1} A,
+    $$</p>
+    <p>
+      and the optimal action turns out to be a <em>linear feedback law</em>:
+      $\vu_t = -K_t \vx_t$ with $K_t = (R + B^\top P_{t+1} B)^{-1} B^\top P_{t+1} A$. Pause on how strong this
+      is. You don't get a plan — you get a <strong>policy</strong>, a gain matrix valid from <em>any</em> state.
+      Disturb the system, and the same $K$ pushes it back. No replanning needed, because the solution already
+      covers every contingency. This is why LQR (and its continuous-time sibling) sits inside flight
+      controllers, hard-drive heads, and segways: it is feedback in its purest, cheapest form.
+    </p>
+    <p>
+      The knobs $Q$ and $R$ are the designer's entire vocabulary, and their <em>ratio</em> is what matters:
+      big $Q$ says "get to the target fast, spend whatever actuation it takes"; big $R$ says "be gentle, take
+      your time." Feel the trade-off yourself:
+    </p>
+
+    <div class="widget-frame" id="lqr-lab">
+      <p class="widget-title">The LQR lab</p>
+      <p class="widget-sub">A double integrator (a cart you push with force) regulated to the origin by the exact
+        LQR gain. Drag the $Q$ and $R$ sliders and watch the trajectory, the control signal, and the computed gain
+        $K$ respond. Click the plot to restart from a new initial state.</p>
+    </div>
+
+    <p>
+      So if LQR hands us a perfect feedback policy, why isn't control theory finished? Because both of its
+      adjectives are lies about the real world. Dynamics are not linear — a robot arm's inertia changes with
+      configuration, tires saturate, contact makes and breaks. And quadratic cost cannot say the two things
+      engineers most need to say: <em>"never exceed this"</em> and <em>"stay out of there."</em> A quadratic
+      penalty on valve opening discourages large openings; it cannot forbid 105%. Fixing those two lies, in two
+      different ways, generates everything else in this post.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="loop">
+    <h2>3. The receding horizon: feedback without a policy</h2>
+    <p>
+      Suppose the model or cost is too awkward for an exact policy, so you fall back to computing an open-loop
+      plan $\vu_0, \dots, \vu_{H-1}$ and executing it. This fails in a characteristic way: the plan is a bet on
+      the model, and reality drifts from the model a little more at every step. Wind gusts, wheel slip, a
+      neural dynamics model that is 2% wrong per step — by step thirty, your carefully optimized action
+      sequence is being applied to a state it was never meant for. Open-loop plans die on contact with reality.
+    </p>
+    <p>
+      MPC's fix is blunt and brilliant: <strong>never trust a plan for more than one step.</strong>
+    </p>
+    <pre class="code"><code>loop at every control tick:
+    x ← measure current state
+    U* ← argmin over u_0..u_{H-1} of Σ cost, subject to x_{t+1} = f(x_t, u_t)   # any solver
+    apply u_0* only
+    (warm start: shift U* one step, reuse it as next tick's initial guess)</code></pre>
+    <p>
+      The horizon <em>recedes</em>: you always look $H$ steps ahead from wherever you actually are, like
+      headlights that move with the car. Each replan folds the newest measurement back into the decision — so
+      although every individual plan is open-loop, <em>the loop as a whole is a feedback controller</em>. That
+      is the conceptual heart of MPC, and the answer to where its robustness comes from: not from any one plan
+      being right, but from no plan being trusted long enough to be badly wrong.
+    </p>
+
+    <figure class="paper-figure">
+      <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+        <source src="assets/videos/receding_horizon.mp4" type="video/mp4"/>
+      </video>
+      <figcaption>
+        The receding-horizon loop, animated with a sampling-based planner (this is literally MPPI running —
+        the code that generated this animation implements it). Faint lines: sampled rollouts through the model,
+        brighter&nbsp;=&nbsp;lower cost. Orange: the cost-weighted plan. Blue: the path actually driven. Only the
+        first step of each plan is ever executed.
+      </figcaption>
+    </figure>
+
+    <p>
+      Two forces pull on the horizon length $H$. Too short and the controller is myopic — it can't see that the
+      cheap action now leads into a corner it can't escape. Too long wastes compute on a future the replanning
+      loop will revise anyway, and (with a learned model) accumulates model error over the rollout. Practical
+      systems use surprisingly short horizons — half a second to a few seconds — plus a terminal cost $c_H$
+      that stands in for everything beyond. Play with both failure modes:
+    </p>
+
+    <div class="widget-frame" id="receding-horizon">
+      <p class="widget-title">Receding horizon, live</p>
+      <p class="widget-sub">A point robot steering past an obstacle to a goal. Compare <em>open-loop</em> (plan
+        once, execute blindly) against <em>MPC</em> (replan every step) under disturbances you control. Then
+        shrink the horizon and watch MPC get myopic: with too little lookahead it hugs the obstacle or stalls.</p>
+    </div>
+
+    <aside class="callout">
+      <strong>Warm starting</strong> is MPC's quiet superpower. The problem you solve at tick $t{+}1$ is nearly
+      the one you solved at tick $t$ — so you shift last tick's solution by one step and start there. The
+      optimizer only has to compute the <em>correction</em>, which is why a "hard" optimization can run at
+      hundreds of hertz. Every serious MPC implementation — QP, iLQR, or sampling — does this.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="constraints">
+    <h2>4. Constraints: why industry pays for MPC</h2>
+    <p>
+      Here is the part the robotics-first telling usually skips: MPC conquered the process industries decades
+      before it touched a robot, and it did so for one reason — <strong>constraints</strong>. The 1979
+      Dynamic Matrix Control paper by Cutler and Ramaker (Shell) and its successors ran distillation columns
+      and crackers with dozens of coupled inputs, where the profitable operating point sits right against the
+      equipment limits: valves at their stops, temperatures at their maxima. LQR's quadratic vocabulary cannot
+      express "at most," so it must operate wastefully far from the limits. MPC states the limit and rides it.
+    </p>
+    <p>
+      Structurally, if the model is linear and the cost quadratic, adding linear inequalities
+      $\vu_{\min} \le \vu_t \le \vu_{\max}$, $G\vx_t \le h$ turns the inner problem into a
+      <strong>quadratic program</strong> (QP) — convex, reliably solvable in milliseconds by active-set or
+      interior-point methods. That package — linear model, quadratic cost, hard constraints, solved as a QP
+      every tick — is <em>linear MPC</em>, and it is arguably the most-deployed advanced control technique on
+      Earth: refineries and chemical plants by the thousands since the 1980s, and more recently convex-MPC
+      locomotion controllers on quadrupeds (MIT Cheetah 3 and its many descendants) and the onboard convex
+      solvers that guide rockets through powered descent — the "how did it land on the barge" algorithm is a
+      cousin of this loop.
+    </p>
+    <p>
+      It's worth saying explicitly, because it answers "why not just LQR everywhere": inside the constraint-free
+      interior, linear MPC with a long horizon <em>behaves like</em> LQR. What you're buying with the QP is
+      exactly the boundary behavior — planning that anticipates the saturation before hitting it, instead of
+      discovering it by clipping. And note the direction of the solver taxonomy here: this workhorse MPC is
+      thoroughly <em>gradient-based</em> — a QP solver is Newton's method with bookkeeping. Anyone who tells you
+      MPC means sampling has only seen the robotics half of the story.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="ilqr">
+    <h2>5. iLQR: gradients for nonlinear worlds</h2>
+    <p>
+      Now un-lie the other adjective: real dynamics are nonlinear. The gradient family's move is the oldest in
+      numerical optimization — <em>if the problem isn't linear-quadratic, pretend it is, locally, and iterate</em>.
+      The <strong>iterative LQR</strong> algorithm (iLQR; Li &amp; Todorov 2004, tightening Mayne's 1966
+      differential dynamic programming) runs a loop of three steps:
+    </p>
+    <pre class="code"><code>given a nominal trajectory (x̄, ū):
+  1. roll out f, linearize:   δx_{t+1} ≈ A_t δx_t + B_t δu_t      (Jacobians of f)
+     quadratize the cost around (x̄, ū)
+  2. backward pass: solve the resulting LQR exactly (Riccati) →
+     feedforward correction k_t + feedback gains K_t
+  3. forward pass: apply u_t = ū_t + α k_t + K_t (x_t − x̄_t), get a better trajectory
+  repeat until converged</code></pre>
+    <p>
+      Each iteration is one exact LQR solve on the local approximation — so everything section 2 built gets
+      reused as the inner engine of a nonlinear method. iLQR converges in a handful of iterations near a good
+      solution, scales to high-dimensional states, and even hands you local feedback gains $K_t$ for free
+      between replans. Wrapped in a receding-horizon loop, iLQR-MPC has flown aggressive quadrotor maneuvers,
+      driven full-size cars, and controlled humanoids. When your model is smooth and you have its Jacobians,
+      it is very hard to beat: a thousand-fold fewer model evaluations than any sampling method for the same
+      solution quality.
+    </p>
+    <p>
+      The catch is in the premise: <em>when your model is smooth</em>. Every step of the derivation leans on
+      Jacobians of $f$ that exist and mean something. Time to break that.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="gradients-fail">
+    <h2>6. Where gradients break</h2>
+    <p>
+      Three things quietly went wrong with the gradient program as robotics moved to legs, hands, and learned models.
+    </p>
+    <p>
+      <strong>Contact.</strong> A foot strikes the ground; a finger closes on a mug. The dynamics on either side
+      of the impact are different functions, glued discontinuously. Near the seam, Jacobians either don't exist
+      or are wildly misleading — a micrometer perturbation flips "touching" to "not touching" and the gradient
+      sees a cliff or nothing at all. Contact-rich control is a minefield of exactly the events that matter most.
+    </p>
+    <p>
+      <strong>Discontinuous costs.</strong> The costs engineers actually want are indicator-shaped: crashed or
+      not, on the track or off it. The AutoRally cost we'll meet in section 8 contains a literal indicator
+      function — a huge impulse penalty for leaving the track — whose gradient is zero everywhere it's defined
+      and useless where it isn't. The gradient program says "smooth that penalty," and every smoothing is a small
+      lie about where the boundary is; sampling methods get to keep the true cost.
+    </p>
+    <p>
+      <strong>Learned and simulated models.</strong> When $f$ is a physics engine stepping collisions, its
+      derivatives range from unavailable to treacherous. When $f$ is a neural network, gradients exist but a
+      network fit to data is bumpy at fine scales — and an optimizer following those gradients will happily
+      exploit the model's errors, planning trajectories that are optimal in the network's hallucinated physics
+      and nonsense in reality.
+    </p>
+    <p>
+      The zeroth-order response: stop differentiating; only <em>evaluate</em>. Roll out candidate action
+      sequences, look at their total costs, and let the scores — not the slopes — guide the search. What
+      sampling loses per-evaluation it wins back in robustness (a rollout through a discontinuity is still a
+      perfectly valid rollout) and in parallelism: a GPU evaluates a thousand rollouts in the time it evaluates
+      one chain of Jacobians. Watch the two philosophies race:
+    </p>
+
+    <div class="widget-frame" id="landscape-race">
+      <p class="widget-title">Gradient vs. sampling</p>
+      <p class="widget-sub">One cost landscape, two optimizers: gradient descent (follows the slope) and CEM
+        (samples, keeps elites, refits). Toggle the landscape — <em>smooth</em>, <em>cliffed</em>, or
+        <em>multimodal</em> — and re-run. Gradient descent is fastest exactly where the world is nice, and only there.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="cem">
+    <h2>7. CEM: survival of the elites</h2>
+    <p>
+      The <strong>cross-entropy method</strong> is the plainest useful answer to "how should scores guide the
+      search?" It began life far from robots — Rubinstein, 1997, estimating vanishingly rare events in
+      queueing systems — and its optimization form is four lines. Maintain a Gaussian over entire action
+      sequences $U = (\vu_0, \dots, \vu_{H-1})$, viewed as one flat vector; then repeat:
+    </p>
+    <pre class="code"><code>μ, σ ← initial guess (e.g., last tick's shifted plan)
+repeat n_iters times:
+    sample K sequences  U_k ~ N(μ, diag(σ²))
+    roll out each through f, compute total cost S_k
+    elites ← the M lowest-cost samples          # M/K ≈ 10%
+    μ ← mean(elites),  σ ← std(elites)          # refit to the winners
+return μ</code></pre>
+    <p>
+      Sample, select, refit. The Gaussian starts wide — spraying the whole space of maneuvers — and each refit
+      contracts it around the region that scored well, an annealing schedule the method sets for itself. The
+      name comes from the theory: refitting to elites minimizes the cross-entropy between the sampling
+      distribution and an idealized distribution over low-cost outcomes. In practice its charm is that there is
+      nothing to tune but population size and elite fraction, and nothing it demands of $f$ and $c$ but
+      evaluability. Cliffs, indicators, contact seams, neural networks: all just rollouts.
+    </p>
+
+    <div class="widget-frame" id="cem-lab">
+      <p class="widget-title">CEM, step by step</p>
+      <p class="widget-sub">A 2-D cost landscape with a false (local) minimum. Step the iterations and watch the
+        cloud of samples, the elites, and the refitted Gaussian contract onto the optimum. Then shrink the
+        population or the elite fraction until it collapses onto the wrong basin — CEM's one classic failure.</p>
+    </div>
+
+    <p>
+      CEM's weaknesses are the mirror of its simplicity. The hard elite cutoff throws away the information in
+      every non-elite sample — a rollout just below the cutoff line contributes exactly as much as a
+      catastrophic one, namely nothing. Iterating sample→refit several times per control tick multiplies the
+      rollout budget. And a variance that shrinks too fast becomes overconfident and locks onto the wrong mode
+      (you just watched it happen in the widget, if you pushed the sliders). Still, plugged into the
+      receding-horizon loop as the inner solver, CEM became the default planner of the model-based RL
+      renaissance — PETS and PlaNet both plan with it — because when your dynamics model is a neural network
+      you'd rather not trust the gradients of, "just evaluate it" is exactly the right relationship to have
+      with your model.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="mppi">
+    <h2>8. MPPI: every sample gets a vote</h2>
+    <p>
+      <strong>Model predictive path integral</strong> control — Williams, Aldrich, and Theodorou at Georgia
+      Tech, mid-2010s — is CEM's sophisticated sibling, and the fix for the hard cutoff. Instead of anointing
+      elites and averaging them equally, MPPI lets <em>every</em> rollout vote, with a weight that decays
+      exponentially in its cost. Perturb the current plan $U$ with noise sequences $\veps_k$, roll out, then:
+    </p>
+    <p class="eq">$$
+      w_k \;=\; \frac{\exp\!\left(-S_k/\lambda\right)}{\sum_{j=1}^{K} \exp\!\left(-S_j/\lambda\right)},
+      \qquad\quad
+      U \;\leftarrow\; U + \sum_{k=1}^{K} w_k\, \veps_k .
+    $$</p>
+    <p>
+      A softmax over trajectory costs. The <strong>temperature</strong> $\lambda$ interpolates between the two
+      dumbest algorithms you could imagine: as $\lambda \to 0$ the weights collapse onto the single best rollout
+      (greedy argmax — brittle), and as $\lambda \to \infty$ every rollout counts equally (the update averages
+      pure noise and goes nowhere). In between, the update is a smooth, information-weighted consensus of
+      everything the sampler learned this tick. Where CEM needs several shrinking iterations, MPPI typically
+      takes <em>one</em> weighted step per control tick and lets the receding-horizon loop do the iterating —
+      the warm-started plan is refined 40 times a second anyway, so each tick only needs to improve it, not solve it.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <div>
+        <img src="assets/figures/mppi_lambda.png" alt="Exponential weight vs trajectory cost for different temperatures"/>
+      </div>
+      <div>
+        <img src="assets/figures/mppi_track_laps.png" alt="MPPI trajectories around the AutoRally oval track, colored by speed"/>
+      </div>
+      <figcaption>
+        Left: the whole algorithm in one picture — weight vs. rollout cost for different $\lambda$; small
+        $\lambda$ is nearly argmax, large $\lambda$ is nearly uniform (Williams et al., 2017). Right: what it buys —
+        AutoRally laps under MPPI with a learned neural dynamics model, red segments above 7&nbsp;m/s, cornering
+        at the edge of friction on dirt.
+      </figcaption>
+    </figure>
+
+    <p>
+      The theory behind the softmax is genuinely pretty: for stochastic systems, the optimal distribution over
+      trajectories can be written in closed form as $q^*(\tau) \propto p(\tau)\, e^{-S(\tau)/\lambda}$ — reweight
+      what the noisy system does for free by the exponentiated cost — and the MPPI update is importance sampling
+      toward that target. This "free-energy / path-integral" view is where the name comes from, and it's also a
+      bridge to modern ML: the same exponential-reweighting template appears in soft-RL (the soft Bellman
+      backup), in reward-weighted regression, and in the way test-time search sharpens toward low-energy
+      solutions. But you don't need the derivation to use the method, and most users never touch it.
+    </p>
+    <p>
+      What made MPPI famous is where it ran. The AutoRally results are worth spelling out: a 1/5-scale, 22&nbsp;kg
+      car, top speed 113&nbsp;km/h, with <em>everything onboard</em> — and the controller samples
+      <strong>1,200 rollouts of 2.5 seconds, 40 times per second</strong>, about 4.8&nbsp;million queries to the
+      full nonlinear dynamics <em>every second</em>, on a GTX&nbsp;750&nbsp;Ti (a $150 graphics card). The cost
+      function contains a literal indicator penalty for leaving the track — the discontinuity gradients can't
+      touch — and the dynamics model in the strongest runs is a neural network fit to driving data. Sampling
+      breadth substitutes for derivative information, and the GPU makes breadth cheap.
+    </p>
+
+    <div class="widget-frame" id="mppi-lab">
+      <p class="widget-title">The temperature knob</p>
+      <p class="widget-sub">MPPI planning one tick around an obstacle: rollouts colored by their weight
+        $w_k$, the weighted-average plan in orange. Slide $\lambda$ from cold (argmax on the single best
+        rollout) to hot (average of everything, obstacle be damned) and find the band where consensus works.
+        Resample to see how the plan varies tick to tick.</p>
+    </div>
+
+    <p>
+      CEM or MPPI, then? They are two rules for the same "perturb → rollout → combine" tick, and the honest
+      comparison (Williams et al. ran it on the same car) usually favors MPPI's soft weighting for control:
+    </p>
+    <table class="results">
+      <thead><tr><th></th><th>CEM</th><th>MPPI</th></tr></thead>
+      <tbody>
+        <tr><td class="cat">selection</td><td>hard top-$M$ elite cutoff</td><td class="win">soft exponential weight on all $K$</td></tr>
+        <tr><td class="cat">information used</td><td>rank only (in/out of elite set)</td><td class="win">full cost values</td></tr>
+        <tr><td class="cat">iterations per tick</td><td>several (sample → refit → resample)</td><td class="win">typically one weighted update</td></tr>
+        <tr><td class="cat">variance</td><td class="win">adapts automatically (refit σ)</td><td>fixed by hyperparameter</td></tr>
+        <tr><td class="cat">tuning</td><td class="win">population + elite fraction, robust</td><td>λ and noise σ need care</td></tr>
+        <tr><td class="cat">natural home</td><td>offline / low-rate planning, model-based RL</td><td class="win">high-rate receding-horizon control</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="modern">
+    <h2>9. The modern synthesis: sampling MPC meets learned models</h2>
+    <p>
+      The reason this fifty-year-old toolbox is having a second youth is that sampling MPC and learned dynamics
+      models are almost suspiciously compatible. A neural network model wants an optimizer that (a) never asks
+      for trustworthy derivatives, (b) evaluates in large batches — precisely how GPUs like to run networks —
+      and (c) is re-run constantly, so no single hallucinated plan is ever trusted for long. That is a
+      description of CEM and MPPI. The receding-horizon loop even doubles as an error-correction mechanism
+      for the model itself: replanning from the <em>measured</em> state discards the model's accumulated drift
+      every tick.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/pets_diagram.png" alt="PETS pipeline: ensemble dynamics model, trajectory propagation, planning via MPC"/>
+      <figcaption>
+        PETS (Chua et al., 2018): learn an <em>ensemble</em> of probabilistic dynamics models from experience
+        (left), propagate candidate action sequences as particle bundles through the ensemble to respect
+        uncertainty (middle), and plan with CEM inside an MPC loop (right). No policy network anywhere —
+        the planner <em>is</em> the agent.
+      </figcaption>
+    </figure>
+
+    <p>
+      <strong>PETS</strong> made the case quantitatively: with an uncertainty-aware ensemble model and CEM
+      planning, it matched the asymptotic performance of model-free RL on standard benchmarks using
+      <strong>8× fewer samples than SAC and 125× fewer than PPO</strong> on half-cheetah. <strong>PlaNet</strong>
+      moved the same recipe into a <em>latent</em> state learned from pixels — CEM planning in the latent space of
+      a world model. <strong>TD-MPC2</strong> is the current form of the idea: an MPPI-style planner in latent
+      space, with a learned value function as the terminal cost $c_H$ — RL amortizing the far future so the
+      planner only needs a short horizon — and one set of hyperparameters controlling 80 tasks. And DeepMind's
+      <strong>MJPC</strong> showed how low the floor is: its "predictive sampling" baseline — sample around the
+      current plan, keep the single best rollout, repeat — is CEM with an elite set of one, and it
+      interactively controls humanoids and dexterous hands on a laptop CPU.
+    </p>
+
+    <figure class="paper-figure two-up">
+      <div>
+        <img src="assets/figures/mjpc_gui.png" alt="MuJoCo MPC GUI showing a walker with sample traces and policy trace"/>
+      </div>
+      <div>
+        <img src="assets/figures/tdmpc2_tasks.png" alt="Montage of TD-MPC2 control tasks"/>
+      </div>
+      <figcaption>
+        Left: MuJoCo MPC (Howell et al., 2022) mid-decision — white sample traces, magenta current plan; the
+        receding-horizon widget above, industrialized. Right: a slice of the 80 tasks a single TD-MPC2
+        configuration handles with an MPPI-style planner inside a learned world model (Hansen et al., 2024).
+      </figcaption>
+    </figure>
+
+    <p>
+      It is worth placing this loop against its great rival: the <strong>amortized policy</strong>. A policy
+      network $\pi_\theta(\vx)$ does its optimization at training time, over parameters, and answers at test time
+      in one forward pass — fast, but frozen. MPC optimizes at decision time, over actions, and can respond to a
+      new obstacle, a changed cost, a damaged actuator <em>this tick</em> — at the price of onboard compute.
+      The field's answer is increasingly "both": a policy proposes, a sampling planner refines (TD-MPC2's
+      policy seeds its MPPI samples), value functions truncate horizons, and test-time-search systems like the
+      energy-based policies covered <a href="../ebt_policy/index.html">elsewhere on this site</a> blur the line
+      entirely — inference-as-optimization is MPC's core move wearing a new name.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottom-line">
+    <h2>The cheat sheet</h2>
+    <p>Given a control problem, the decision tree the field actually uses:</p>
+    <table class="results">
+      <thead><tr><th>your problem</th><th>reach for</th><th>why</th></tr></thead>
+      <tbody>
+        <tr><td class="cat">linear dynamics, quadratic cost, no constraints</td><td class="win">LQR</td><td>exact policy from a Riccati solve; nothing else comes close</td></tr>
+        <tr><td class="cat">linear-ish, hard input/state limits</td><td class="win">linear MPC (QP)</td><td>constraints as first-class citizens; the industrial workhorse</td></tr>
+        <tr><td class="cat">smooth nonlinear, good model, need precision</td><td class="win">iLQR / DDP in MPC</td><td>gradient efficiency: converges in few rollouts, gains for free</td></tr>
+        <tr><td class="cat">contact, discontinuous cost, learned model</td><td class="win">MPPI (or CEM) in MPC</td><td>derivative-free, embarrassingly parallel, keeps the true cost</td></tr>
+        <tr><td class="cat">offline planning / model-based RL inner loop</td><td class="win">CEM</td><td>self-annealing, nearly tuning-free, robust</td></tr>
+        <tr><td class="cat">millisecond reflexes, no onboard compute</td><td class="win">amortized policy (+ optional MPC refinement)</td><td>optimization moved to training time</td></tr>
+      </tbody>
+    </table>
+    <h3>The bottom line</h3>
+    <p>
+      Strip away fifty years of notation and the story is one loop and three engines. The loop — plan a short
+      horizon, act on the first step, replan from what actually happened — converts any trajectory optimizer
+      into a feedback controller, which is why it has outlived every particular choice of optimizer inside it.
+      The engines trade model knowledge for evaluations: Riccati when the world is linear-quadratic, Jacobians
+      when it is smooth, and raw parallel simulation when it is neither. CEM and MPPI are not exotic — they are
+      the two simplest rules for turning a batch of scored guesses into a better guess, elite averaging and
+      softmax voting, made viable by the same hardware trend that built deep learning. So: is MPC a
+      gradient-free optimization algorithm? No — MPC is the loop. Gradient-free is one of three things you can
+      put inside it, and knowing which engine fits which world is most of what "doing control" means now.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Key papers: <a href="https://arxiv.org/abs/1707.02342" target="_blank" rel="noopener">Information-Theoretic MPC / MPPI (1707.02342)</a> ·
+      <a href="https://arxiv.org/abs/1805.12114" target="_blank" rel="noopener">PETS (1805.12114)</a> ·
+      <a href="https://arxiv.org/abs/2212.00541" target="_blank" rel="noopener">MJPC / Predictive Sampling (2212.00541)</a> ·
+      <a href="https://arxiv.org/abs/2310.16828" target="_blank" rel="noopener">TD-MPC2 (2310.16828)</a>
+    </p>
+    <p class="tiny">All figures © the original authors, used here for educational explanation.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>
