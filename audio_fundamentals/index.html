@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sound, from Air to Tokens: an audio crash course</title>
+  <meta name="description" content="What audio physically is, how it is represented, the tools that define the field, what makes speech different from music, the foundational work before and after deep learning, and how to actually evaluate audio quality — with five interactive widgets you can hear."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">A crash course &amp; roadmap</p>
+    <h1>Sound, from Air to Tokens: an audio crash course</h1>
+    <p class="byline">
+      For the ML person who has never worked with audio &middot; no signal-processing background assumed &middot;
+      physics → representation → tools → speech vs. music → the canon → evaluation
+    </p>
+    <p class="lede">
+      Audio looks like the easiest modality. An image is a million numbers arranged in a grid; a sound is just a
+      list. One number, over and over, 44,100 times a second. And yet people who walk into audio from vision spend
+      their first month confused: the loss goes down and the output sounds like static, the model nails the
+      spectrogram and produces robotic buzzing, the metric says 4.2 and the sample is unlistenable. The reason is
+      that a waveform is a <em>terrible</em> representation of what you actually care about, and almost everything
+      the field has built — the Fourier transform, the mel scale, MFCCs, neural codecs — is a workaround for that
+      one fact. This post builds the mental models, in order, and lets you <strong>hear</strong> every one of them.
+    </p>
+    <p class="lede" style="margin-top:14px">
+      <strong>Turn your sound on.</strong> All five widgets below make noise on purpose.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">Why audio feels harder than it looks</a></li>
+      <li><a href="#physics">1. What sound physically is</a></li>
+      <li><a href="#numbers">2. From a wave to a list of numbers</a></li>
+      <li><a href="#fourier">3. The one tool: Fourier, and its discontents</a></li>
+      <li><a href="#phase">4. Phase, the neglected half</a></li>
+      <li><a href="#kinds">5. Speech, music, and everything else</a></li>
+      <li><a href="#before">6. The canon before deep learning</a></li>
+      <li><a href="#after">7. The canon after deep learning</a></li>
+      <li><a href="#eval">8. How to evaluate audio quality</a></li>
+      <li><a href="#intuitions">9. Insights to keep</a></li>
+      <li><a href="#bottom">The bottom line</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <p>
+      Here is the situation. You train a model to predict a waveform. You use mean squared error, because that is
+      what you always use. The loss drops beautifully. You listen to a sample and it is noise. Not "slightly wrong"
+      noise — <em>completely unrelated</em> noise, that nevertheless has a lower MSE than a perfect reconstruction
+      shifted by half a millisecond would.
+    </p>
+    <p>
+      That is not a bug in your training loop. It is the central fact of audio: <strong>the numbers in a waveform
+      are not the thing you perceive.</strong> Shift a waveform by a fraction of a period and every sample changes
+      sign while the sound is bit-for-bit identical to your ear. Multiply the high frequencies by a phase ramp and
+      the plot looks like garbage while the sound is unchanged. Conversely, two signals whose waveforms differ by a
+      rounding error can sound completely different. Distance in sample space has almost nothing to do with distance
+      in perceptual space.
+    </p>
+    <p>
+      Every tool in this post exists to build a representation where distance means something. So we will go in
+      order: what sound physically <em>is</em>, how it becomes numbers, the transform that dominates the field and
+      the price it charges, why speech and music demand different things, what people built before and after deep
+      learning, and — the part everyone skips and then regrets — how to tell whether the thing you made is any good.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="physics">
+    <h2>1. What sound physically is</h2>
+    <p>
+      Sound is not a substance that travels. It is a <em>pattern of pressure</em> that travels through a substance.
+      A speaker cone pushes forward and crowds the air molecules in front of it; that crowding pushes the next
+      layer, which pushes the next. What propagates is the compression, not the air. The molecules themselves just
+      jiggle back and forth around where they already were, by micrometres.
+    </p>
+    <p>
+      This makes sound a <strong>longitudinal</strong> wave: the jiggling is along the direction of travel, unlike
+      light, where the oscillation is perpendicular. It also makes sound a <strong>scalar field</strong> — at any
+      point in space and time there is exactly one number, the local pressure deviation $p(x, t)$ from ambient. A
+      microphone at one point in a room measures that single number over time. This is why audio is one-dimensional:
+      not because sound is simple, but because we sample a scalar field at a point.
+    </p>
+    <p>
+      A few numbers worth having in your head. Sound travels at about <strong>343 m/s</strong> in air at room
+      temperature, which is why a 1 kHz tone has a wavelength of 34 cm — comparable to the size of your head, which
+      is exactly why your two ears can localize it. Human hearing spans roughly <strong>20 Hz to 20 kHz</strong>,
+      though the upper limit falls with age (past 40, 14 kHz is more typical). And the pressure amplitudes involved
+      are astonishingly small: the threshold of hearing is about 20 micropascals, roughly a <em>five-billionth</em>
+      of atmospheric pressure.
+    </p>
+
+    <h3>Why everything in audio is logarithmic</h3>
+    <p>
+      That threshold matters because the loudest sound you can tolerate is about a million times larger in amplitude.
+      A linear scale cannot usefully span that, so the field uses decibels throughout:
+    </p>
+    $$ L_p = 20 \log_{10}\!\left(\frac{p_{\text{rms}}}{p_{\text{ref}}}\right) \text{ dB SPL}, \qquad p_{\text{ref}} = 20\ \mu\text{Pa} $$
+    <p>
+      This puts the hearing threshold at 0 dB, conversation at 60 dB, a rock concert at 110 dB, and pain at 130 dB —
+      a 120 dB range compressed into a friendly little number line. The <em>reason</em> this works is that human
+      perception is itself approximately logarithmic: a constant ratio of intensities produces a constant perceived
+      step. Doubling the power is always about +3 dB and always sounds like the same amount louder, whether you
+      start at a whisper or a jet engine. Whenever you see a log in an audio pipeline — log-mel spectrograms,
+      log-magnitude losses, µ-law encoding — it is this fact, showing up again.
+    </p>
+
+    <h3>The ear is already a Fourier transform</h3>
+    <p>
+      Here is the single most useful piece of biology for an audio engineer. Inside the cochlea, a coiled fluid-filled
+      tube, runs the <strong>basilar membrane</strong>: stiff and narrow at one end, floppy and wide at the other. A
+      pressure wave entering the cochlea causes maximum displacement at the position whose mechanical resonance
+      matches the incoming frequency. High frequencies peak near the entrance, low frequencies near the far tip. Hair
+      cells along the membrane report <em>where</em> the motion is.
+    </p>
+    <p>
+      In other words, your ear does not send a waveform to your brain. It sends something much closer to a
+      <strong>spectrogram</strong>: a bank of roughly 3,500 overlapping band-pass filters, each reporting its own
+      energy over time. Two consequences follow immediately and shape the entire field. First, frequency analysis is
+      not a clever trick we invented — it is the representation the receiver actually uses, which is why it works so
+      well. Second, the mapping from frequency to position on the membrane is roughly <em>logarithmic</em>, so the
+      ear devotes far more resolution to 100–1000 Hz than to 10–11 kHz. That is the mel scale, five sections early.
+    </p>
+
+    <div class="widget-frame" id="wave-lab">
+      <p class="widget-title">Widget 1 · Build a sound from sine waves</p>
+      <p class="widget-sub">
+        Every periodic sound is a sum of harmonics. Drag the sliders to set the amplitude of each harmonic, and
+        press play to hear what you built. Watch how the waveform (left) and spectrum (right) respond — and notice
+        that a single sine sounds thin and electronic, while the same pitch with many harmonics sounds rich. That
+        difference is <em>timbre</em>, and it lives entirely in the harmonic amplitudes.
+      </p>
+    </div>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="numbers">
+    <h2>2. From a wave to a list of numbers</h2>
+    <p>
+      A microphone converts pressure to voltage continuously. To store it we must discretize twice: in
+      <strong>time</strong> (sampling) and in <strong>amplitude</strong> (quantization). Both choices have exact
+      theory behind them, and both bite you if you get them wrong.
+    </p>
+
+    <h3>Sampling and the Nyquist limit</h3>
+    <p>
+      Sample a continuous signal every $T = 1/f_s$ seconds and you get a sequence $x[n] = x(nT)$. The
+      Nyquist–Shannon theorem says something remarkable: if the original signal contains no energy at or above
+      $f_s/2$, then those samples contain <em>all</em> the information — the continuous signal can be reconstructed
+      exactly, with no loss whatsoever. Not approximately. Exactly.
+    </p>
+    <p>
+      The catch is the condition. If the signal <em>does</em> contain energy above $f_s/2$ (the <strong>Nyquist
+      frequency</strong>), that energy does not disappear — it folds back down into the audible range as a lower
+      frequency, permanently mixed with the real content and impossible to remove afterwards. A 30 kHz tone sampled
+      at 44.1 kHz reappears as a 14.1 kHz tone that was never there. This is <strong>aliasing</strong>, and it is
+      the reason every real ADC has an analog low-pass filter in front of it.
+    </p>
+    <p>
+      Now the sample rates make sense. CD audio is <strong>44.1 kHz</strong> — comfortably above $2 \times 20$ kHz,
+      with room for the filter to roll off. Video and professional audio use <strong>48 kHz</strong>. Speech
+      systems overwhelmingly use <strong>16 kHz</strong>, which caps content at 8 kHz: enough for full
+      intelligibility, since the phonetic information in speech lives mostly below 8 kHz, at a third of the data
+      rate. Telephony historically used <strong>8 kHz</strong>, capping at 4 kHz, which is why phone speech sounds
+      muffled and why <code>s</code> and <code>f</code> are so easy to confuse on a call — their energy lives above
+      the cutoff.
+    </p>
+
+    <div class="widget-frame" id="alias-lab">
+      <p class="widget-title">Widget 2 · Aliasing, seen and heard</p>
+      <p class="widget-sub">
+        Sweep the tone's frequency upward at a fixed sample rate and watch what the samples reconstruct. Below
+        Nyquist the reconstruction tracks the truth; above it, the reconstructed frequency <em>folds back down</em>
+        and starts falling as the true frequency rises. Press play to hear the fold — the pitch goes up, then
+        turns around and comes back down, even though the input never stopped rising.
+      </p>
+    </div>
+
+    <h3>Quantization and bit depth</h3>
+    <p>
+      Each sample must also be rounded to a finite set of levels. With $b$ bits you get $2^b$ levels, and the
+      rounding error behaves like added noise. The resulting signal-to-noise ratio has a famously clean form:
+    </p>
+    $$ \text{SNR}_{\max} \approx 6.02\,b + 1.76 \ \text{dB} $$
+    <p>
+      Every bit buys you about <strong>6 dB</strong> of dynamic range. This single line explains the standard
+      formats. 16-bit gives ~96 dB, enough to cover the range from a quiet room to a loud passage without audible
+      hiss — that is CD audio. 24-bit gives ~144 dB, more than the ear can use, but valuable <em>during</em>
+      production where you repeatedly gain-stage and do not want to accumulate noise. 8-bit gives ~48 dB, which is
+      audibly hissy — unless you spend the levels non-linearly.
+    </p>
+    <p>
+      That last trick is <strong>µ-law</strong> companding: pass the signal through a log-shaped curve before
+      quantizing, so the levels bunch up near zero where quiet detail lives. It buys 8-bit audio roughly the
+      perceived quality of 12-bit linear. It is a 1970s telephony standard, and it is exactly what WaveNet used in
+      2016 to turn waveform generation into a 256-way classification problem. Old ideas do not die in audio; they
+      get a new job.
+    </p>
+
+    <aside class="callout">
+      <strong>The data rate, for calibration.</strong> One minute of CD-quality stereo is
+      $44100 \times 16 \times 2 \times 60 \approx 85$ Mbit $\approx$ 10 MB. A 3-minute song is 30 MB raw, which is
+      why compression (MP3, AAC, Opus) mattered so much, and why a generative model over raw samples must produce
+      tens of thousands of tokens per second of output. That number is the reason neural audio <em>codecs</em>
+      became the pivotal technology of the last five years — hold that thought for §7.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="fourier">
+    <h2>3. The one tool: Fourier, and its discontents</h2>
+    <p>
+      If you learn one thing about audio processing, learn this: the field runs on the
+      <strong>short-time Fourier transform</strong>. Not the Fourier transform — the <em>short-time</em> one, and
+      the difference is where all the engineering lives.
+    </p>
+    <p>
+      The discrete Fourier transform takes $N$ samples and returns $N$ complex numbers, each the amplitude and phase
+      of one sinusoid:
+    </p>
+    $$ X[k] = \sum_{n=0}^{N-1} x[n]\, e^{-i 2\pi k n / N} $$
+    <p>
+      Applied to a whole song, this is useless. It tells you the song contains a lot of 440 Hz energy but nothing
+      about <em>when</em>. Music and speech are interesting precisely because their frequency content changes; a
+      global spectrum throws away the only thing that matters. So we chop the signal into short overlapping frames,
+      transform each one, and stack the results:
+    </p>
+    $$ X[m, k] = \sum_{n=0}^{N-1} x[n + mH]\, w[n]\, e^{-i 2\pi k n / N} $$
+    <p>
+      Here $N$ is the window length, $H$ is the hop between frames, and $w[n]$ is a <strong>window function</strong>.
+      The magnitude $|X[m,k]|$, plotted with time across and frequency up, is the <strong>spectrogram</strong> — the
+      single most important picture in audio.
+    </p>
+
+    <h3>Why the window function exists</h3>
+    <p>
+      Chopping the signal is not free. The DFT assumes the frame repeats forever, so if the waveform does not
+      complete a whole number of cycles inside the frame, the wrap-around creates a discontinuity — and a
+      discontinuity has energy at <em>every</em> frequency. A single pure tone smears across the entire spectrum.
+      This is <strong>spectral leakage</strong>. The fix is to multiply the frame by a window that tapers smoothly
+      to zero at both edges (Hann, Hamming, Blackman), so there is no discontinuity to smear. You pay with a
+      slightly wider main lobe — worse frequency resolution — in exchange for dramatically lower sidelobes.
+    </p>
+
+    <h3>The tradeoff you cannot escape</h3>
+    <p>
+      Now the fundamental limit. With a window of $N$ samples at rate $f_s$, your frequency bins are spaced
+      $\Delta f = f_s / N$ apart, and your time resolution is the window duration $\Delta t = N / f_s$. Multiply:
+    </p>
+    $$ \Delta t \cdot \Delta f = 1 $$
+    <p>
+      The product is constant. You cannot improve both. A long window resolves two nearby pitches beautifully but
+      blurs a drum hit across 50 milliseconds; a short window pins the drum hit to the millisecond but cannot tell
+      a C from a C-sharp. This is the <strong>Gabor limit</strong> — the same mathematics as the Heisenberg
+      uncertainty principle, and just as non-negotiable. Every spectrogram you have ever seen represents somebody's
+      choice on this curve. Speech systems typically pick 25 ms windows with a 10 ms hop, which is a deliberate bet
+      that phoneme-scale timing matters more than fine pitch resolution.
+    </p>
+
+    <div class="widget-frame" id="stft-lab">
+      <p class="widget-title">Widget 3 · The time–frequency tradeoff</p>
+      <p class="widget-sub">
+        The signal below contains a rising chirp, two steady tones a semitone apart, and three sharp clicks. Drag the
+        window length. Short windows: the clicks are crisp vertical lines, but the two tones merge into one fat
+        blur. Long windows: the tones separate into two clean lines, but the clicks smear into wide vertical bands.
+        There is no setting that gets both, and that is not an implementation flaw.
+      </p>
+    </div>
+
+    <h3>Mel, and why nobody uses raw spectrograms</h3>
+    <p>
+      A linear-frequency spectrogram wastes its resolution. Between 100 and 200 Hz — an octave, a huge perceptual
+      distance — a 1024-point STFT at 16 kHz gives you about 6 bins. Between 7000 and 7100 Hz, a barely audible
+      difference, it also gives you about 6. The ear's resolution is roughly logarithmic; the STFT's is uniform.
+    </p>
+    <p>
+      The <strong>mel scale</strong> fixes this by warping frequency to match perceived pitch spacing:
+    </p>
+    $$ m(f) = 2595 \log_{10}\!\left(1 + \frac{f}{700}\right) $$
+    <p>
+      A <strong>mel spectrogram</strong> is then computed by summing the STFT magnitudes into 40–128 triangular
+      bands equally spaced on this warped axis, and taking the log. The result is smaller (80 bins instead of 513),
+      perceptually uniform, and vastly more learnable. It is the default input to essentially every speech model
+      and the default <em>output</em> of every text-to-speech acoustic model.
+    </p>
+    <p>
+      Push one step further and you get <strong>MFCCs</strong>: take the discrete cosine transform of the log-mel
+      spectrum and keep the first 13 coefficients. The DCT decorrelates the bands and separates the slowly-varying
+      spectral envelope (which encodes <em>which phoneme</em>) from the fine harmonic structure (which encodes
+      <em>which pitch and speaker</em>). For twenty-five years, 13 MFCCs plus their first and second time
+      derivatives — 39 numbers per 10 ms frame — <em>were</em> speech recognition. Deep learning has largely
+      retired them, because the aggressive compression that made them tractable for Gaussian mixtures throws away
+      information a neural network would happily use. But they remain a strong, cheap baseline, and you will still
+      meet them everywhere.
+    </p>
+
+    <figure class="paper-figure">
+      <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+        <source src="assets/videos/three_views.mp4" type="video/mp4"/>
+      </video>
+      <figcaption>
+        <strong>One second of sound, three ways.</strong> Air molecules crowd and thin; a microphone reduces that
+        to a single number per instant; sampling reduces <em>that</em> to a list; and the STFT slides a window
+        along the list to build the time–frequency plane. Nothing here is the "true" representation of the sound —
+        each is a choice, and choosing well is most of the job.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="phase">
+    <h2>4. Phase, the neglected half</h2>
+    <p>
+      The STFT gives complex numbers. A spectrogram shows only their <em>magnitude</em>. Where did the other half
+      go, and does it matter?
+    </p>
+    <p>
+      The honest answer is: it matters enormously, it is nearly impossible to model directly, and the field has spent
+      thirty years working around it. Phase is hard because it is <strong>wrapped</strong> (defined modulo $2\pi$,
+      so it has no smooth structure to learn), because it looks like noise when plotted (a coherent tone has a phase
+      that advances by a different amount in every bin), and because the phases across overlapping frames must be
+      mutually <em>consistent</em> — most arrays of numbers are not the STFT of any real signal at all.
+    </p>
+    <p>
+      So the classical move is to discard it and reconstruct it later. <strong>Griffin–Lim</strong> (1984) does this
+      by alternating projection: guess a phase, inverse-transform, re-transform, keep the new phase with the target
+      magnitude, repeat 30–100 times. It converges to something plausible, and it sounds like it — the
+      characteristic thin, watery, slightly metallic artifact of Griffin–Lim is instantly recognizable once you know
+      it. Every early neural TTS system had it, which is why Tacotron 1 sounds like a robot in a swimming pool and
+      Tacotron 2 does not. The difference was replacing Griffin–Lim with a learned vocoder.
+    </p>
+
+    <div class="widget-frame" id="phase-lab">
+      <p class="widget-title">Widget 4 · Same spectrum, different sound</p>
+      <p class="widget-sub">
+        This is the demonstration that should convince you to never use waveform MSE. Randomize the phase of a
+        signal while leaving every magnitude bin <em>exactly</em> unchanged. The magnitude spectrum is bit-identical.
+        The waveform is unrecognizable. And it sounds completely different — the harmonic sound turns into a
+        whooshing hiss. Then try the shift: delay the waveform by 2.5 milliseconds and hear that it is
+        <em>indistinguishable</em>, while the sample-wise error explodes.
+      </p>
+    </div>
+
+    <p>
+      The modern answer is to stop reconstructing phase and start generating the waveform directly. That is what a
+      <strong>neural vocoder</strong> is: a model that maps a mel spectrogram (magnitude only, 80 numbers per frame)
+      to raw samples, learning the phase structure implicitly from data because it is trained on losses that do not
+      care about sample-wise alignment. HiFi-GAN does this with a GAN whose discriminators look at the signal at
+      several periodicities at once — which is a very direct way of saying "judge me on my harmonic structure, not
+      my sample offsets."
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="kinds">
+    <h2>5. Speech, music, and everything else</h2>
+    <p>
+      "Audio" is not one problem. The three big families differ in structure, in time scale, and in what counts as
+      success — and a method tuned for one will quietly fail on another.
+    </p>
+
+    <h3>Speech: a source and a filter</h3>
+    <p>
+      The most useful model of speech in existence is fifty years old and still correct.
+      <strong>Source–filter theory</strong> says speech is produced in two independent stages. The
+      <em>source</em> is the larynx: for voiced sounds, vibrating vocal folds emit a buzzy periodic pulse train at
+      the fundamental frequency $F_0$ (roughly 85–180 Hz for adult male voices, 165–255 Hz for adult female); for
+      unvoiced sounds like <code>s</code> and <code>f</code>, it is turbulent noise instead. The <em>filter</em> is
+      the vocal tract — throat, tongue, lips — a resonant tube whose shape you change to produce different sounds.
+      Its resonances are called <strong>formants</strong> ($F_1$, $F_2$, $F_3$).
+    </p>
+    <p>
+      In the frequency domain, the source contributes harmonics at multiples of $F_0$, and the filter contributes a
+      smooth envelope shaping their amplitudes. Multiplication in frequency, so addition in log-frequency — which
+      is precisely why the cepstrum and MFCCs can separate them. The consequences run deep:
+    </p>
+    <ul>
+      <li><strong>Which vowel you hear is set almost entirely by $F_1$ and $F_2$</strong>, not by pitch. This is why
+        you understand the same words whether they are whispered, sung, spoken by a child, or shouted.</li>
+      <li><strong>Speaker identity lives mostly in the filter</strong> (vocal tract length and shape) plus the
+        average $F_0$. Voice conversion is, at its heart, keeping the source and swapping the filter.</li>
+      <li><strong>Prosody</strong> — the $F_0$ contour, timing, and energy over a whole utterance — carries meaning
+        that the words do not: question vs. statement, emphasis, emotion, sarcasm. It is the part TTS got wrong for
+        decades and the reason modern TTS suddenly sounds human.</li>
+    </ul>
+
+    <div class="widget-frame" id="vowel-lab">
+      <p class="widget-title">Widget 5 · Synthesize a vowel from scratch</p>
+      <p class="widget-sub">
+        Source–filter, made audible. Set the pitch ($F_0$) and drag the point in the $F_1$–$F_2$ plane to reshape
+        the vocal tract. The labelled regions are where real English vowels sit. Nothing here is a recording —
+        it is a buzz through two resonant filters, and it says "ee" or "ah" purely because of where the resonances
+        are. Change $F_0$ alone and the vowel stays the same; move the point and it changes while the pitch does not.
+      </p>
+    </div>
+
+    <h3>Music: harmony, and much longer memory</h3>
+    <p>
+      Music shares the harmonic-series backbone — a plucked string produces energy at $f, 2f, 3f, \ldots$, and
+      timbre is the relative strength of those partials, which is exactly what you were dragging in Widget 1. But
+      music adds three things speech does not have.
+    </p>
+    <p>
+      <strong>Polyphony.</strong> Several sources sound simultaneously, and their harmonic series overlap and
+      collide — the third harmonic of a C is very nearly a G, so transcribing a chord is a genuinely ill-posed
+      un-mixing problem. <strong>Discrete pitch structure.</strong> Western music quantizes pitch to 12 equal steps
+      per octave, $f_n = 440 \cdot 2^{n/12}$ Hz, which gives strong priors a model can exploit (and makes the
+      constant-Q transform, with log-spaced bins, a better tool than the STFT here).
+      <strong>Long-range structure.</strong> A song has a beat grid, bar lines, repeated sections, and a key that
+      holds for minutes. Speech coherence is needed over a sentence; musical coherence is needed over three minutes,
+      which is why music generation lagged speech generation by several years and why it leaned on latent diffusion
+      over compressed representations rather than sample-by-sample autoregression.
+    </p>
+
+    <h3>Environmental audio: no structure to lean on</h3>
+    <p>
+      A door slam, rain, a dog bark, a car horn. This family has neither reliable harmonicity nor reliable rhythm.
+      Much of the information is in <strong>transients</strong> — the attack, the first 20 milliseconds — and in
+      broadband noise textures. Tasks are classification and detection (what happened, and when) rather than
+      transcription, benchmarked on <strong>AudioSet</strong>: 2 million YouTube clips over 527 event classes, the
+      ImageNet of audio. The practical difference is that time resolution matters more than frequency resolution
+      here, which pushes you toward shorter windows than a speech pipeline would use.
+    </p>
+
+    <h3>The time scales, side by side</h3>
+    <table class="results">
+      <thead>
+        <tr><th>Phenomenon</th><th>Time scale</th><th>What it constrains</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">One sample @ 16 kHz</td><td>0.0625 ms</td><td>the raw sequence length problem</td></tr>
+        <tr><td class="cat">Pitch period (100 Hz voice)</td><td>10 ms</td><td>why 25 ms windows see 2–3 periods</td></tr>
+        <tr><td class="cat">Transient / attack</td><td>5–20 ms</td><td>why long windows smear percussion</td></tr>
+        <tr><td class="cat">Phoneme</td><td>50–150 ms</td><td>the unit of ASR; sets the frame rate</td></tr>
+        <tr><td class="cat">Syllable / musical note</td><td>200–500 ms</td><td>rhythm, tempo, speaking rate</td></tr>
+        <tr><td class="cat">Word / musical bar</td><td>0.5–2 s</td><td>language-model context begins</td></tr>
+        <tr><td class="cat">Utterance / phrase</td><td>2–10 s</td><td>prosody, melodic phrasing</td></tr>
+        <tr><td class="cat">Conversation / song</td><td>1–5 min</td><td>speaker consistency, key, structure</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Read that table as a design document. It spans <strong>six orders of magnitude</strong>, and it is the reason
+      every audio architecture is fundamentally about downsampling: get from 16,000 events per second to something
+      like 50, without losing what matters. Dilated convolutions, strided encoders, and neural codecs are three
+      different answers to that one question.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="before">
+    <h2>6. The canon before deep learning</h2>
+    <p>
+      It is tempting to skip this. Don't — the pre-neural era is not obsolete history, it is the source of the
+      representations, the losses, and most of the evaluation metrics you will actually use. Modern systems are
+      full of 1970s DSP wearing a neural hat.
+    </p>
+
+    <h3>Recognition: MFCC + GMM-HMM</h3>
+    <p>
+      From roughly 1985 to 2012, essentially all speech recognition worked the same way. Extract 39 MFCC features
+      every 10 ms. Model each phoneme (in context: a <em>triphone</em>) as a 3-state hidden Markov model, with the
+      emission distribution of each state a Gaussian mixture. Tie the tens of thousands of resulting states down
+      with a decision tree. Decode with Viterbi against a weighted finite-state transducer composing the acoustic
+      model, a pronunciation lexicon, and an n-gram language model. <strong>HTK</strong> and later
+      <strong>Kaldi</strong> were the standard toolkits, and Kaldi is still worth reading — its recipes are the
+      clearest available statement of what the problem actually requires.
+    </p>
+    <p>
+      The first deep-learning win in audio, notably, was not end-to-end. It was swapping the GMM for a DNN that
+      predicted HMM state posteriors (Hinton et al., 2012), keeping the entire rest of the pipeline. That hybrid
+      cut error rates by a third and is what convinced industry that deep learning was real.
+    </p>
+
+    <h3>Synthesis: concatenation, then vocoders</h3>
+    <p>
+      Two competing approaches. <strong>Unit selection</strong> recorded tens of hours from one speaker, cut it into
+      diphones, and at synthesis time searched for the sequence of recorded units that minimized a join cost — the
+      output is real human audio, so it sounds great when the database has what you need and disastrous when it does
+      not, with audible seams. <strong>Statistical parametric</strong> synthesis (HTS) instead predicted vocoder
+      parameters from an HMM and resynthesized: always smooth, always consistent, and always audibly buzzy, because
+      averaging over acoustic states blurs exactly the fine detail the ear uses.
+    </p>
+    <p>
+      The vocoders themselves are worth knowing by name because they encode a real insight. <strong>LPC</strong>
+      (linear predictive coding) models the vocal tract as an all-pole filter and predicts each sample from the
+      previous ten or so — a startlingly effective compression of the source-filter model that ran phone networks
+      for decades. <strong>STRAIGHT</strong> and later <strong>WORLD</strong> decompose speech into three
+      near-independent streams: $F_0$, a spectral envelope, and an aperiodicity ratio. That factorization — pitch
+      here, timbre there, noisiness separate — is still exactly what a modern voice-conversion system tries to
+      learn, and WORLD is still a perfectly good baseline today.
+    </p>
+
+    <h3>Separation and music: NMF and onsets</h3>
+    <p>
+      Before neural separation there was <strong>non-negative matrix factorization</strong>: factor the magnitude
+      spectrogram $V \approx WH$, where $W$ is a dictionary of spectral templates and $H$ says when each is active.
+      Non-negativity does the work — you cannot cancel, only add, so the parts come out interpretable. It genuinely
+      worked for drums and simple mixtures. For stereo mixtures there was <strong>ICA</strong> and beamforming;
+      for beat tracking, an onset-detection function (spectral flux — how much the spectrum changed since the last
+      frame) followed by dynamic programming for a tempo-consistent beat grid. These are still solid tools when you
+      have ten minutes and no training data.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="after">
+    <h2>7. The canon after deep learning</h2>
+    <p>
+      The neural era has a shape, and it is worth stating up front because it makes a long list of papers into one
+      story. Audio went <strong>raw waveform → learned spectrogram intermediates → discrete learned tokens</strong>,
+      and once it arrived at tokens, every technique from language modelling became available at once. Here is the
+      lineage.
+    </p>
+
+    <h3>WaveNet (2016) — raw samples are possible</h3>
+    <p>
+      DeepMind's WaveNet modelled the waveform <em>directly</em>: an autoregressive model over µ-law-quantized
+      samples, $p(x) = \prod_t p(x_t \mid x_{<t})$, using dilated causal convolutions whose receptive field grows
+      exponentially with depth so a few dozen layers can see thousands of samples. The quality jump was enormous —
+      it halved the gap to human speech on MOS — and it proved that the buzzy, over-smoothed sound of parametric
+      synthesis was a modelling failure, not a law of nature. It was also unusably slow: 16,000 sequential forward
+      passes per second of audio. Nearly everything since is a response to that.
+    </p>
+
+    <h3>Tacotron (2017) — the two-stage split that stuck</h3>
+    <p>
+      Tacotron made text-to-speech end-to-end with a sequence-to-sequence model with attention: characters in,
+      mel spectrogram out. Tacotron 2 completed the design by feeding that mel into a WaveNet vocoder rather than
+      Griffin–Lim, reaching a MOS of 4.53 against 4.58 for real recorded speech — statistically a tie with human.
+      The architectural legacy is the <strong>split</strong>: an <em>acoustic model</em> (text → mel) plus a
+      <em>vocoder</em> (mel → waveform). Mel is a low-rate, smooth, learnable bottleneck; the hard, high-rate
+      waveform detail is handled by a specialist. FastSpeech later replaced the attention with an explicit duration
+      predictor, making synthesis non-autoregressive and hundreds of times faster while fixing the babbling and
+      word-skipping that attention failures caused.
+    </p>
+
+    <h3>Fast vocoders — Parallel WaveNet, WaveRNN, HiFi-GAN</h3>
+    <p>
+      A rapid sequence of ideas to make waveform generation real-time. Parallel WaveNet used probability density
+      distillation to train a parallel student from an autoregressive teacher. WaveRNN shrank the model until a
+      single-layer RNN could run faster than real time on a phone. Then <strong>HiFi-GAN</strong> (2020) largely
+      settled it with a GAN: a generator that upsamples mel to waveform, judged by multi-period and multi-scale
+      discriminators that look at the signal folded at several periodicities. It is fast, small, and near-transparent
+      in quality, and remains the default vocoder in a great deal of production code.
+    </p>
+
+    <h3>Recognition — CTC, Conformer, Whisper</h3>
+    <p>
+      End-to-end ASR needed a way to train without frame-level alignment. <strong>CTC</strong> supplied it: introduce
+      a blank symbol and sum over all alignments that collapse to the target text, differentiably. Attention-based
+      encoder-decoders (LAS) and the RNN-Transducer followed, the latter dominating streaming ASR because it emits
+      output as audio arrives. The <strong>Conformer</strong> (2020) became the standard encoder by interleaving
+      self-attention (global context) with convolution (local detail) — a very audio-shaped inductive bias. Then
+      <strong>Whisper</strong> (2022) changed the framing entirely: rather than clean supervised data, train a plain
+      encoder-decoder transformer on <strong>680,000 hours</strong> of weakly-labelled, messy, multilingual web
+      audio. It was not the best model on any clean benchmark, and it was dramatically more robust than everything
+      else on real recordings. Scale and diversity beat curation.
+    </p>
+
+    <h3>Self-supervision — wav2vec 2.0, HuBERT, WavLM</h3>
+    <p>
+      Labelled audio is expensive; raw audio is free. <strong>wav2vec 2.0</strong> masks spans of a learned latent
+      sequence and solves a contrastive task against quantized targets, then fine-tunes with CTC — famously reaching
+      competitive word error rates with <em>ten minutes</em> of labelled speech. <strong>HuBERT</strong> simplified
+      it into BERT-style masked prediction over targets from offline k-means clustering, bootstrapped over rounds;
+      <strong>WavLM</strong> added simulated overlapping speech and noise so the representation also serves
+      diarization and separation. The lasting contribution is not the recipes but the discovery that
+      <strong>discrete units discovered by clustering self-supervised features behave like phonemes</strong> —
+      audio has a latent alphabet, and you can find it without labels.
+    </p>
+
+    <h3>Neural codecs — the pivot to tokens</h3>
+    <p>
+      This is the most important development to understand, because it is what connects audio to modern LLMs.
+      <strong>SoundStream</strong> (2021) and <strong>EnCodec</strong> (2022) are autoencoders with
+      <strong>residual vector quantization</strong> in the middle: encode to ~50–75 frames per second, then quantize
+      each frame with a stack of codebooks where each one codes the residual left by the previous. The result is
+      transparent-quality audio at a few kilobits per second, expressed as a handful of integer streams.
+    </p>
+    <p>
+      The consequence is the whole game. A second of audio stops being 24,000 floats and becomes something like
+      $75 \times 8$ integers from a fixed vocabulary — <strong>audio has become text</strong>, structurally. Every
+      transformer trick applies. <strong>AudioLM</strong> made this explicit with a hierarchy of semantic tokens
+      (from HuBERT, carrying content) and acoustic tokens (from SoundStream, carrying detail and speaker identity).
+      <strong>VALL-E</strong> then treated TTS as codec-token language modelling and got zero-shot voice cloning
+      from a <em>three-second</em> prompt — not because it was trained to clone voices, but because in-context
+      learning came along for free once the problem was posed as next-token prediction.
+    </p>
+
+    <h3>Diffusion and the current frontier</h3>
+    <p>
+      Running in parallel: <strong>DiffWave</strong> and WaveGrad applied diffusion to waveforms;
+      <strong>AudioLDM</strong> and <strong>Stable Audio</strong> applied latent diffusion to text-to-audio and
+      text-to-music, generating in a compressed latent space and decoding once at the end.
+      <strong>CLAP</strong> supplied the CLIP-style text–audio embedding that made "generate the sound of rain on a
+      tin roof" possible and became a standard evaluation tool in its own right. And systems have gone
+      <strong>natively multimodal</strong> — audio in and out of a single LLM, with full-duplex conversation and
+      latency low enough to interrupt — which is the current frontier and mostly an engineering problem about
+      streaming and latency rather than a representation problem.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Era</th><th>Representation</th><th>Landmark</th><th>What it unlocked</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">1985–2012</td><td>MFCC, LPC, WORLD</td><td>GMM-HMM, HTS, Kaldi</td><td>the problem is tractable at all</td></tr>
+        <tr><td class="cat">2012–2016</td><td>log-mel</td><td>DNN-HMM hybrid</td><td>a third off the error rate</td></tr>
+        <tr><td class="cat">2016</td><td>raw waveform</td><td class="win">WaveNet</td><td>parametric buzz was never necessary</td></tr>
+        <tr><td class="cat">2017–2020</td><td>mel intermediate</td><td class="win">Tacotron 2, HiFi-GAN</td><td>human-parity TTS, in real time</td></tr>
+        <tr><td class="cat">2020–2022</td><td>learned latents</td><td class="win">wav2vec 2.0, HuBERT</td><td>ASR from ten minutes of labels</td></tr>
+        <tr><td class="cat">2022–</td><td>discrete tokens</td><td class="win">EnCodec, AudioLM, VALL-E</td><td>audio as a language-modelling problem</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="eval">
+    <h2>8. How to evaluate audio quality</h2>
+    <p>
+      This section is the one people skip, and then six months later they discover their model has been optimizing a
+      number that does not track what anyone hears. Audio evaluation is unusually treacherous, for one root reason:
+      <strong>the ground truth is a human perceptual judgement</strong>, and every automatic metric is a proxy for
+      it with a known failure mode.
+    </p>
+
+    <h3>The gold standard: ask people</h3>
+    <p>
+      <strong>MOS</strong> (mean opinion score) is the field's currency: play a clip, ask listeners to rate quality
+      or naturalness 1–5, average. Everything else is validated against it. It is also badly abused. MOS values are
+      <em>not comparable across papers</em> — scores depend on the listener pool, the instructions, the anchors
+      included, the playback hardware, and the other samples in the batch. A 4.2 in one study can be worse audio
+      than a 3.8 in another. Always report confidence intervals, always evaluate your baselines in the
+      <em>same</em> listening session, and treat any cross-paper MOS comparison as approximately meaningless.
+    </p>
+    <p>
+      Better protocols exist. <strong>MUSHRA</strong> presents all systems simultaneously with a hidden reference
+      and a hidden low-quality anchor, which controls for scale drift and catches inattentive listeners.
+      <strong>CMOS</strong> asks for a direct A/B preference on a −3…+3 scale, which is far more sensitive for
+      systems that are close. <strong>ABX</strong> tests mere discriminability: if listeners cannot beat chance,
+      your compression is transparent. For a small difference, use a comparative protocol, not absolute ratings.
+    </p>
+
+    <h3>Objective metrics that need a reference</h3>
+    <p>
+      When you have the clean target signal, several standardized metrics approximate a listener:
+    </p>
+    <ul>
+      <li><strong>PESQ</strong> (ITU-T P.862) and its successor <strong>POLQA</strong> — perceptual models built for
+        telephony, outputting roughly a MOS. Widely reported for speech enhancement; known to be unreliable on
+        neural-processed audio, which it was never designed for.</li>
+      <li><strong>ViSQOL</strong> — a spectro-temporal similarity measure that behaves better on modern codecs and
+        neural output than PESQ does.</li>
+      <li><strong>STOI</strong> / <strong>ESTOI</strong> — <em>intelligibility</em>, not quality. Crucially different:
+        heavily distorted speech can be perfectly intelligible and unpleasant, or clean and unintelligible.</li>
+      <li><strong>SI-SDR</strong> — the standard for source separation. The scale-invariant version exists because
+        plain SDR could be gamed by simply scaling the output; SI-SDR projects the estimate onto the target first,
+        making it immune to gain errors. If you see raw SDR reported in a modern separation paper, be suspicious.</li>
+      <li><strong>MCD</strong> (mel-cepstral distortion) and <strong>log-F0 RMSE</strong> — cheap TTS/voice-conversion
+        diagnostics measuring spectral and pitch error against a reference. Useful, but they require alignment, and
+        they punish valid prosodic variation as though it were error.</li>
+    </ul>
+
+    <h3>Metrics that do not need a reference</h3>
+    <p>
+      Generation has no reference — there is no "correct" waveform for "read this sentence." So the field trained
+      networks to predict MOS directly. <strong>DNSMOS</strong> (from the Deep Noise Suppression challenges),
+      <strong>NISQA</strong>, <strong>UTMOS</strong>, and Torchaudio's <strong>SQUIM</strong> all take a single clip
+      and output an estimated listener rating, correlating well with real MOS on the distributions they were trained
+      on. They are enormously convenient and they have a sharp edge: <em>they are themselves models</em>, and
+      optimizing against them directly will find their blind spots. Use them to monitor, not as a training loss.
+    </p>
+
+    <h3>Distributional metrics</h3>
+    <p>
+      For generative models, the question is not "how close is this sample to a target" but "does the set of things
+      this model produces look like the set of real things." That is <strong>FAD</strong>, the Fréchet Audio
+      Distance: embed real and generated sets with a pretrained audio network (VGGish classically, CLAP or better
+      encoders increasingly), fit Gaussians, compute the Fréchet distance. It is the FID of audio and inherits FID's
+      properties — sensitive to both quality and diversity, dependent on the embedding, and unstable on small sample
+      sets. Report which embedding you used or the number means nothing.
+    </p>
+
+    <h3>Task-proxy metrics, which are often the most honest</h3>
+    <p>
+      Some of the most informative numbers come from measuring what the audio can <em>do</em>. Run a fixed ASR model
+      over your TTS output and report <strong>WER</strong> — that is a direct measure of intelligibility with no
+      listener panel required, and it catches the pathologies (skipped words, babbling, mispronunciations) that
+      quality metrics miss entirely. Run a speaker-verification encoder and report <strong>cosine similarity</strong>
+      to the reference for voice cloning. Run a music-tagging model and check that generated audio has the requested
+      genre. These proxies are cheap, hard to game accidentally, and align with what users actually complain about.
+    </p>
+
+    <aside class="callout">
+      <strong>The one trap to internalize.</strong> Never use mean squared error on the waveform as your primary
+      loss or metric. Widget 4 is the proof: a perceptually identical signal shifted by a few samples has an enormous
+      MSE, while a perceptually destroyed signal with randomized phase can have a small one. Distance in sample
+      space is not distance in perceptual space. Use spectral losses (multi-resolution STFT magnitude), adversarial
+      losses, or feature-matching losses in a pretrained embedding — all three are ways of saying <em>"compare what
+      the ear compares."</em>
+    </aside>
+
+    <h3>What a defensible evaluation looks like</h3>
+    <p>
+      No single number is sufficient. A credible audio result reports a battery, chosen to cover the failure modes:
+      an intelligibility measure (WER via ASR, or STOI), a quality measure (a learned MOS predictor, or a reference
+      metric if you have references), a distributional measure if the task is generative (FAD), a task-specific
+      similarity if identity or content must be preserved (speaker cosine, MCD) — and, before you claim a win,
+      a listening test with your baselines evaluated in the same session, with confidence intervals. Everything
+      before the listening test is a fast proxy that lets you iterate. The listening test is the actual result.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="intuitions">
+    <h2>9. Insights to keep</h2>
+    <ul>
+      <li><strong>The ear is a spectrogram machine.</strong> Frequency analysis is not a technique we imposed; it is
+        the representation the receiver uses. That is why it works.</li>
+      <li><strong>Everything logarithmic is logarithmic for the same reason.</strong> Decibels, the mel scale,
+        musical semitones, µ-law — perception responds to ratios, not differences.</li>
+      <li><strong>Time and frequency resolution trade off exactly.</strong> $\Delta t \cdot \Delta f = 1$. Any
+        spectrogram is a committed position on that curve. Choose it for your phenomenon.</li>
+      <li><strong>Magnitude is learnable; phase is not.</strong> Almost every architectural decision in neural audio
+        is a way of avoiding modelling phase explicitly, from Griffin–Lim to GAN vocoders.</li>
+      <li><strong>Sample-space distance is not perceptual distance.</strong> Waveform MSE is actively misleading.
+        Compare spectra, or compare embeddings.</li>
+      <li><strong>The whole game is downsampling.</strong> Six orders of magnitude separate a sample from a song.
+        Dilated convolutions, strided encoders, and RVQ codecs are three answers to that one problem.</li>
+      <li><strong>Tokens changed everything.</strong> Once a neural codec turns a second of audio into ~600
+        integers, audio becomes a language-modelling problem and inherits the entire transformer toolkit.</li>
+      <li><strong>Old DSP is not dead, it is load-bearing.</strong> Mel filterbanks, µ-law, source–filter, and
+        overlap-add sit inside models published this year.</li>
+    </ul>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="bottom">
+    <h2>The bottom line</h2>
+    <p>
+      Audio is a one-dimensional signal that behaves nothing like a one-dimensional signal, because the metric you
+      care about lives somewhere the raw numbers cannot see. Every idea in this post — the decibel, the window
+      function, the mel scale, the vocoder, the codec token, the listening test — is somebody moving the problem
+      into a space where distance finally means what the ear means. Get that one idea and the rest of the field
+      reads as variations on it.
+    </p>
+    <p>
+      The way to make it stick is to listen. Load a ten-second clip in Python, plot the waveform, plot the log-mel,
+      and go back and forth until you can read one from the other. Then destroy it on purpose: zero out the phase
+      and listen; low-pass it at 4 kHz and hear the telephone; quantize it to 4 bits and hear the hiss; use a 5 ms
+      window and then a 200 ms window and watch the tradeoff you read about happen in front of you. An afternoon of
+      that is worth more than a month of reading, because audio is the one modality where you have a world-class
+      analysis instrument built into your head, already trained, and the whole skill is learning to trust it.
+    </p>
+  </section>
+
+  <footer>
+    <p>A crash course for people arriving in audio from somewhere else — physics, representation, tools, the canon, and evaluation. Go listen to something on purpose.</p>
+    <p class="tiny">All widgets synthesize audio in-browser with the Web Audio API; no recordings are used. Figures for the sample rates, hearing ranges, and benchmark numbers are standard values from the cited literature and are approximate.</p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>

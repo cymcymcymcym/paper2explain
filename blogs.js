@@ -21,6 +21,18 @@
 
 const BLOGS = [
   {
+    slug: "audio_fundamentals",
+    category: "Fundamentals & Theory",
+    title: "Sound, from Air to Tokens: an audio crash course",
+    tag: "crash course · sampling · STFT & mel · speech vs. music · the canon · evaluation",
+    authors: "A field guide",
+    venue: "Crash course & roadmap · for the ML person arriving in audio",
+    date: "July 2026",
+    paper: "Nyquist · STFT & mel · WaveNet · HiFi-GAN · HuBERT · EnCodec · VALL-E · MOS/FAD",
+    blurb: `Audio looks like the easiest modality — one number, 44,100 times a second — and then your MSE loss converges to static. The reason is that <strong>a waveform is a terrible representation of what you actually perceive</strong>, and nearly every tool in the field is a workaround for that one fact. Builds the models in order: pressure waves and why everything is logarithmic, Nyquist and the 6 dB per bit rule, the STFT and the <strong>Δt · Δf = 1</strong> limit you cannot escape, why phase is the half nobody models, source–filter theory for speech, the canon from GMM-HMM to <strong>WaveNet → HiFi-GAN → HuBERT → EnCodec → VALL-E</strong>, and how to evaluate audio without fooling yourself. <strong>All five widgets make sound</strong> — including one that proves waveform MSE is meaningless.`,
+    highlights: "5 audible widgets · 1 manim · ~6,700 words",
+  },
+  {
     slug: "guidance",
     category: "Diffusion & Generative",
     title: "Guidance in Diffusion and Flow Models",
