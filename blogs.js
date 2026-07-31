@@ -21,6 +21,25 @@
 
 const BLOGS = [
   {
+    slug: "image_encoders",
+    category: "3D, Vision & World Models",
+    title: "Image encoders in vision-language models: SigLIP, its rivals, and how they take any image size",
+    tag: "vision encoders · SigLIP · ViT · variable resolution · native aspect ratio · efficient inference",
+    authors: "A field guide",
+    venue: "built from the arXiv sources of SigLIP, SigLIP 2, NaViT, Pixtral, InternVL, Qwen2.5-VL and Perception Encoder",
+    date: "July 2026",
+    paper: "SigLIP 2303.15343 · SigLIP 2 2502.14786 · NaViT 2307.06304 · Pixtral 2410.07073 · Qwen2.5-VL 2502.13923",
+    blurb: `A language model reads tokens; an image is not tokens. The encoder in between sets a
+      hard ceiling on what the whole system can see. This takes it apart: the patch pipeline with
+      real arithmetic, why SigLIP's per-pair sigmoid loss trains a strong model on
+      <strong>four chips in one day</strong> where CLIP needed 256 for two weeks — and holds only a
+      <em>b&times;b</em> block in memory instead of the full 32,768&times;32,768 matrix — what
+      DINOv3, AIMv2 and Perception Encoder learn instead, the three different answers to "what if
+      the image is not 224&times;224?" (tiling, packing at native resolution, and flexible sequence
+      length), and what actually makes the encoder fast when you serve it.`,
+    highlights: "5 widgets · 1 manim · ~9,700 words",
+  },
+  {
     slug: "audio_fundamentals",
     category: "Fundamentals & Theory",
     title: "Sound, from Air to Tokens: an audio crash course",
