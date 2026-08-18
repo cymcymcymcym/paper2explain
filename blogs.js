@@ -21,6 +21,18 @@
 
 const BLOGS = [
   {
+    slug: "agent_context_large_codebase",
+    category: "Efficiency & Systems",
+    title: "How coding agents handle a codebase that does not fit: context, search, and compaction",
+    tag: "coding agents · context engineering · agentic search · compaction · AGENTS.md · context rot",
+    authors: "Anthropic, OpenAI, Chroma, Liu, Salesforce AI, ETH Zurich, ByteDance Seed",
+    venue: "engineering blogs + arXiv",
+    date: "2023–2026",
+    paper: "arXiv 2307.03172, 2511.13998, 2601.16746, 2602.11988",
+    blurb: `A two-million-line repo is 40M tokens; a 200K window holds half a percent. So Claude Code and Codex never hold the codebase — they grep it, read a few files, and compact when full (Codex fires at a computed <strong>167K</strong> of 200K, then re-reads 5 files). Then the evidence gets strange: single-turn, the same tasks collapse <strong>29% → 3%</strong> as context grows to 1M, but agents with tools stay flat at <strong>0.71–0.75</strong> across a 100× codebase increase. And machine-written <code>AGENTS.md</code> files improved success rates by an amount indistinguishable from noise while adding <strong>20–23%</strong> to cost.`,
+    highlights: "5 widgets · 1 manim · ~8,000 words",
+  },
+  {
     slug: "image_encoders",
     category: "3D, Vision & World Models",
     title: "Image encoders in vision-language models: SigLIP, its rivals, and how they take any image size",
