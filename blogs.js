@@ -21,6 +21,18 @@
 
 const BLOGS = [
   {
+    slug: "differentiable_simulators",
+    category: "Embodiment & Interaction",
+    title: "Differentiable simulators: physics you can take the derivative of",
+    tag: "differentiable physics · adjoint method · contact gradients · smoothing · robot co-design",
+    authors: "Nimble, Dojo, Brax, MJX, Warp, Newton, DiffHand",
+    venue: "a tour of the field, with one worked example",
+    date: "August 2026",
+    paper: "worked example: arXiv 2107.07501",
+    blurb: `A normal simulator says what happens. A <em>differentiable</em> one says what would change if you turned any knob — every knob at once, for about <strong>twice the cost of one rollout</strong>, where finite differences would cost 2n. This post derives the adjoint method, shows the three ways engines actually compute gradients, and spends real time on the thing that breaks them all: contact is not smooth, so an exact gradient can be flat, exploding, or confidently pointing the wrong way. Then it surveys what exists today and ends with a paper that stretched the parameter vector as far as it goes — differentiating with respect to the robot's own geometry, so a gradient step grows a hook on a fingertip that then gets 3D printed.`,
+    highlights: "6 widgets · 2 manim · ~7,000 words",
+  },
+  {
     slug: "agent_context_large_codebase",
     category: "Efficiency & Systems",
     title: "How coding agents handle a codebase that does not fit: context, search, and compaction",

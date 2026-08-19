@@ -1,0 +1,1152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Differentiable Simulators — an interactive explainer</title>
+  <meta name="description" content="What a differentiable simulator is, how the gradient is actually computed, why contact breaks it, which ones exist, and a worked example: designing robot hardware by gradient descent."/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"/>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left:'$$', right:'$$', display:true},
+        {left:'$',  right:'$',  display:false}
+      ],
+      throwOnError: false,
+      macros: {
+        '\\vx': '{\\mathbf{x}}',  '\\vw': '{\\mathbf{w}}',  '\\vn': '{\\mathbf{n}}',
+        '\\vq': '{\\mathbf{q}}',  '\\vu': '{\\mathbf{u}}',  '\\vp': '{\\mathbf{p}}',
+        '\\vf': '{\\mathbf{f}}',  '\\vg': '{\\mathbf{g}}',  '\\vlam': '{\\boldsymbol{\\lambda}}',
+        '\\Loss': '{\\mathcal{L}}'
+      }
+    });"></script>
+
+  <link rel="stylesheet" href="assets/style.css"/>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="toggle theme">☾</button>
+
+<article>
+  <header class="hero">
+    <p class="eyebrow">An interactive explainer</p>
+    <h1>Differentiable Simulators: physics you can take the derivative of</h1>
+    <p class="byline">
+      What they are · how the gradient is really computed · why contact breaks it · what exists today ·
+      and one worked example:
+      <a href="https://arxiv.org/abs/2107.07501" target="_blank" rel="noopener">DiffHand (RSS 2021)</a>
+    </p>
+    <p class="lede">
+      A normal physics simulator answers one question: given this robot and these motor commands, what
+      happens? A <em>differentiable</em> simulator answers a second, much more useful question: if I
+      change the commands a little — or the friction, or the mass, or the shape of the fingertip — how
+      would the outcome change? It hands you that answer as a derivative, for every input at once, for
+      about the price of running the simulation twice. That single capability turns physics into
+      something you can do gradient descent on, and it is the reason a growing list of simulators
+      (Nimble, Dojo, Brax, MuJoCo MJX, NVIDIA Warp, Newton, and more) now advertise gradients as a
+      headline feature. It also has a hard limit that took the field several years to state clearly:
+      <strong>contact</strong>. Where objects touch, the physics stops being smooth, and the exact
+      gradient of a simulator can be perfectly correct and completely useless at the same time. This
+      post explains the machinery, the failure, and the fixes — then walks through one paper that
+      pushed the idea somewhere surprising: differentiating with respect to the robot's own
+      <em>geometry</em>, so a gradient step reshapes the hardware.
+    </p>
+  </header>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#hook">The hook: a fingertip that came out of a gradient</a></li>
+      <li><a href="#what">What a differentiable simulator actually is</a></li>
+      <li><a href="#adjoint">Where the gradient comes from</a></li>
+      <li><a href="#three-routes">Three ways to build one</a></li>
+      <li><a href="#contact">The hard part: contact</a></li>
+      <li><a href="#smooth-sec">Smoothing, and what it costs</a></li>
+      <li><a href="#landscape">The landscape: what exists today</a></li>
+      <li><a href="#uses">What people use them for</a></li>
+      <li><a href="#diffhand">Worked example: differentiating the hardware</a></li>
+      <li><a href="#results">Does it work?</a></li>
+      <li><a href="#limits">When not to use one</a></li>
+      <li><a href="#what-it-means">What it means</a></li>
+    </ol>
+  </nav>
+
+  <!-- =============================================================== -->
+  <section id="hook">
+    <figure class="teaser">
+      <img src="assets/figures/teaser.jpg" alt="Left: control-only optimization fails the tasks. Middle: co-optimized morphology and control succeeds. Right: 3D-printed fingers."/>
+      <figcaption>
+        <strong>Figure 1.</strong> From the DiffHand paper. Left column: a fixed, ordinary finger with
+        an optimized control sequence fails the task. Middle column: when the fingertip's
+        <em>shape</em> is optimized along with the control, the same tasks succeed — the tip has grown
+        a curved hook. Right column: those shapes, 3D printed. The hook is not a human design choice.
+        It is the output of a gradient.
+      </figcaption>
+    </figure>
+
+    <p>
+      Start with what a gradient through physics buys you, because it is easy to underrate. In the
+      middle column of that figure, a robot finger flips a heavy box. In the left column, the same
+      optimizer with the same amount of compute fails, because the finger's shape was frozen at
+      whatever a person drew. The hook in the middle column was found by writing down "how far did the
+      box rotate", asking a physics simulator for the derivative of that number with respect to the
+      positions of points on the fingertip surface, and stepping downhill.
+    </p>
+    <p>
+      To do that you need a simulator that will tell you a derivative. Most will not. A standard
+      engine — Bullet, ODE, the original MuJoCo, PhysX — is a program that maps state and inputs to a
+      new state. You can run it, and you can run it again with a slightly different input and compare,
+      but it will not hand you $\partial(\text{outcome})/\partial(\text{input})$. Building an engine
+      that does, and doing it fast and correctly, is a genuine research area with about a decade of
+      history, several competing designs, and one shared enemy.
+    </p>
+    <p>
+      This post is mostly about that area. We will define what "differentiable simulator" means
+      precisely, derive where the gradient comes from, look at the three families of implementation,
+      spend real time on why contact is the hard case (with widgets you can break), survey what is
+      available today, and only then use DiffHand as the worked example — because it is a good one:
+      it needs derivatives with respect to something most simulators never expose.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what">
+    <h2>1. What a differentiable simulator actually is</h2>
+    <p>
+      A simulator is a function that advances state by one small time step:
+    </p>
+    <p class="eq">
+      $$ x_{t+1} \;=\; f\big(x_t,\; u_t,\; \theta\big) $$
+    </p>
+    <p>
+      $x_t$ is the state at step $t$ — for a robot, all the joint angles and joint velocities, plus
+      the position and velocity of every object it can touch. $u_t$ is the control input at step $t$,
+      usually the motor torques. $\theta$ is everything else that the physics depends on but that does
+      not change during the rollout: masses, inertias, friction coefficients, link lengths, contact
+      stiffness, the shape of every surface. A whole episode is that one function applied over and
+      over, $T$ times:
+    </p>
+    <p class="eq">
+      $$ x_T \;=\; f\big(\cdots f(f(x_0, u_0, \theta), u_1, \theta) \cdots , u_{T-1}, \theta\big) $$
+    </p>
+    <p>
+      Finally, you score the episode with a loss — a single number that says how badly it went:
+    </p>
+    <p class="eq">
+      $$ \Loss \;=\; \sum_{t=0}^{T} \ell\big(x_t, u_t\big) $$
+    </p>
+    <p>
+      where $\ell$ is a per-step cost, for example the squared distance from the object to where you
+      wanted it, plus a small penalty on energy used. Nothing so far is unusual: every simulator
+      computes this.
+    </p>
+    <p>
+      A simulator is <strong>differentiable</strong> when it will also give you
+    </p>
+    <p class="eq">
+      $$ \frac{\partial \Loss}{\partial u_{0:T-1}} \quad\text{and}\quad
+         \frac{\partial \Loss}{\partial \theta} \quad\text{and}\quad
+         \frac{\partial \Loss}{\partial x_0} $$
+    </p>
+    <p>
+      — that is, for every knob you could have turned, the direction and rate at which the score
+      would have changed. Two things about this definition are worth stating plainly, because they
+      are the source of most confusion in this area.
+    </p>
+    <p>
+      <strong>First: "differentiable" is a property of the implementation, not of physics.</strong>
+      Newtonian mechanics is smooth almost everywhere. Whether you can get a derivative out depends on
+      whether the code was written so that a derivative can be extracted, and on whether the specific
+      numerical scheme used (especially for contact) is smooth. A simulator that solves contact by an
+      if-statement — "are these two bodies touching? yes/no" — is a program with a jump in it, and the
+      derivative on either side of the jump knows nothing about the jump.
+    </p>
+    <p>
+      <strong>Second: what makes it valuable is not that a derivative exists but that it is
+      cheap.</strong> You can always estimate $\partial\Loss/\partial\theta$ without any special
+      simulator, by finite differences: run the episode, nudge one parameter, run again, subtract. For
+      $n$ parameters this costs about $2n$ episodes. A differentiable simulator gets the whole
+      gradient — all $n$ numbers — for roughly the cost of two episodes, no matter how large $n$ is.
+      That constant-versus-linear difference is the entire economic argument.
+    </p>
+
+    <div class="widget-frame" id="grad-cost">
+      <p class="widget-title">Widget 1 — what one gradient costs</p>
+      <p class="widget-sub">
+        Rollouts of the simulator needed to produce one gradient, as the number of parameters $n$
+        grows. The adjoint (reverse-mode) bar does not move. Note the second line under each bar: an
+        evolution strategy is cheap per gradient but each rollout it spends returns one score, while
+        the adjoint returns $n$ slopes.
+      </p>
+    </div>
+
+    <p>
+      The comparison against reinforcement learning is the same argument in different clothes. A
+      policy-gradient method treats the simulator as a black box and estimates the gradient from the
+      correlation between random action noise and the resulting reward. That estimate is unbiased but
+      noisy, and its noise grows with the number of parameters and the length of the episode. A
+      differentiable simulator differentiates <em>through</em> the physics instead of around it, so
+      the same information arrives without the sampling noise. When it works, it converges in tens of
+      episodes where model-free methods need thousands. Section 11 covers when it does not work.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="adjoint">
+    <h2>2. Where the gradient comes from</h2>
+    <p>
+      The rollout is a chain of functions, so the gradient is the chain rule applied along that chain.
+      The only question is the order in which you multiply the terms, and that choice decides
+      everything about the cost.
+    </p>
+    <p>
+      Write $A_t = \partial f/\partial x_t$ — the Jacobian of one simulation step with respect to the
+      state, an $|x| \times |x|$ matrix — and $B_t = \partial f/\partial\theta$, the Jacobian of one
+      step with respect to the parameters. The sensitivity of the final state to the parameters is a
+      long product:
+    </p>
+    <p class="eq">
+      $$ \frac{\partial x_T}{\partial \theta} \;=\;
+         \sum_{t=0}^{T-1} \Big( A_{T-1} A_{T-2} \cdots A_{t+1} \Big) B_t . $$
+    </p>
+    <p>
+      Read the two ways to evaluate this. Multiplying left to right means carrying an
+      $|x|\times|\theta|$ matrix of sensitivities forward through time; this is
+      <strong>forward mode</strong>, and its cost scales with the number of parameters
+      $|\theta|$. Multiplying right to left means carrying a single vector backwards through
+      time; this is <strong>reverse mode</strong>, also called the <strong>adjoint method</strong>,
+      and its cost scales with the number of <em>outputs</em>, which is one, because the loss is one
+      number.
+    </p>
+    <p>
+      Concretely, the adjoint method defines a vector $\lambda_t = \partial\Loss/\partial x_t$, the
+      sensitivity of the final score to the state at step $t$. It is computed by a backward recursion:
+    </p>
+    <p class="eq">
+      $$ \lambda_T = \frac{\partial \ell}{\partial x_T}, \qquad
+         \lambda_t = \frac{\partial \ell}{\partial x_t} + A_t^{\top}\, \lambda_{t+1}, $$
+    </p>
+    <p>
+      and the parameter gradient is accumulated as you sweep:
+    </p>
+    <p class="eq">
+      $$ \frac{\partial \Loss}{\partial \theta}
+         \;=\; \sum_{t=0}^{T-1} B_t^{\top}\, \lambda_{t+1},
+         \qquad
+         \frac{\partial \Loss}{\partial u_t} \;=\;
+         \frac{\partial \ell}{\partial u_t} + \Big(\frac{\partial f}{\partial u_t}\Big)^{\!\top} \lambda_{t+1}. $$
+    </p>
+    <p>
+      Every symbol here is concrete. $\lambda_{t+1}$ is a vector the same size as the state.
+      $A_t^\top \lambda_{t+1}$ is one matrix-vector product per time step, not a matrix-matrix product,
+      which is why the whole backward sweep costs about as much as the forward one. The sum over $t$
+      is why you must keep something from each forward step: at minimum the state, and in practice
+      also whatever the solver computed at that step.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/adjoint_rollout.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      The whole idea in one picture. A ball is launched with parameter $\theta$; the simulator steps it
+      forward (orange), bounces it off the ground, and ends far from the target. The loss is the miss
+      distance. The green arrows are the adjoint sweep: starting from $\lambda_T$ at the last state, it
+      walks backwards along the same chain, multiplying by $A_t^\top$ at each step and accumulating
+      $d\Loss/d\theta$ at the launch. One gradient step on $\theta$, re-run the same simulator, and the
+      ball lands in the ring. The red circle marks the bounce — the one step in the chain where
+      $A_t$ is not a nice smooth matrix. That is section 4.
+    </p>
+
+    <h3>What you have to store</h3>
+    <p>
+      The backward sweep needs $A_t$ at every step, and $A_t$ depends on the state at that step. So
+      either you store every intermediate state — memory proportional to $T$ — or you recompute them.
+      This is the same trade-off as backpropagation through a deep network, and the same fix applies:
+      <strong>checkpointing</strong>, where you store the state every $k$ steps and re-run the forward
+      pass in short bursts during the backward pass, trading a constant factor of extra compute for a
+      factor of $k$ less memory. For a 600-step rollout with a few hundred state variables this is
+      usually not a problem. For a 10,000-step deformable-body simulation with a million particles, it
+      is the whole engineering problem.
+    </p>
+
+    <h3>Implicit integrators need one more idea</h3>
+    <p>
+      Good robot simulators do not use explicit time stepping, because contact forces are stiff and
+      explicit schemes blow up unless the time step is tiny. They use <strong>implicit</strong>
+      integration: the next state is defined as the solution of an equation in which it appears on
+      both sides,
+    </p>
+    <p class="eq">
+      $$ g\big(x_{t+1};\, x_t, u_t, \theta\big) \;=\; 0, $$
+    </p>
+    <p>
+      solved numerically with Newton's method. There is no formula for $x_{t+1}$ to differentiate. The
+      way out is the <strong>implicit function theorem</strong>: if $g$ is zero at the solution and its
+      Jacobian in $x_{t+1}$ is invertible, then
+    </p>
+    <p class="eq">
+      $$ \frac{\partial x_{t+1}}{\partial \theta}
+         \;=\; -\left(\frac{\partial g}{\partial x_{t+1}}\right)^{-1}
+                \frac{\partial g}{\partial \theta}. $$
+    </p>
+    <p>
+      Read what that says operationally: you differentiate the <em>equation the solver solved</em>,
+      not the iterations the solver took to solve it. That matters twice over. It is cheaper — the
+      Newton solve at the last iteration already produced and factorized
+      $\partial g/\partial x_{t+1}$, so the backward pass reuses that factorization instead of
+      redoing work. And it is more accurate — differentiating the iterations gives you the derivative
+      of your particular convergence path, complete with whatever error it stopped at, whereas
+      implicit differentiation gives the derivative of the exact solution. Simulators that
+      differentiate by naive automatic differentiation through the solver loop pay for every
+      iteration; simulators built on the implicit function theorem do not.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="three-routes">
+    <h2>3. Three ways to build one</h2>
+    <p>
+      Every differentiable simulator in existence uses one of three strategies, or a mix.
+    </p>
+
+    <h3>Route A — write the simulator in an autodiff framework</h3>
+    <p>
+      Express the physics in a language that already knows how to differentiate itself, and let the
+      tool do the work. This is the oldest route: Degrave and colleagues did it in 2016 by writing a
+      rigid-body engine as a Theano expression graph. It is also the most modern one: Brax (2021)
+      and MuJoCo MJX write the physics in <a href="https://github.com/google/brax" target="_blank"
+      rel="noopener">JAX</a>, so gradients come from the same machinery that differentiates neural
+      networks, and the whole rollout runs batched across thousands of parallel environments on a GPU
+      or TPU. NVIDIA's Warp does the same for hand-written CUDA-style kernels.
+    </p>
+    <p>
+      Strengths: fast to build, easy to keep correct, and it composes with learned components — you
+      can put a neural network inside the physics and differentiate through both. Weaknesses: memory,
+      because the tape records everything; and cost through iterative solvers, since automatic
+      differentiation dutifully differentiates every Newton iteration rather than the converged
+      answer.
+    </p>
+
+    <h3>Route B — derive the adjoint by hand</h3>
+    <p>
+      Work out $A_t$, $B_t$ and the backward recursion analytically on paper, and implement them.
+      This is what ADD (Geilinger et al., SIGGRAPH Asia 2020) does for articulated rigid bodies and
+      deformables with frictional contact, and what DiffHand does on top of it. It is more work per
+      feature — every new force model needs its derivative derived and coded — but it produces the
+      fastest and most memory-frugal implementations, and it lets you choose exactly which quantities
+      to expose. That last point is why DiffHand took this route: it needed derivatives with respect
+      to contact point positions, which no autodiff tool would have given it for free because most
+      simulators do not treat those as inputs at all.
+    </p>
+
+    <h3>Route C — implicitly differentiate the contact solve</h3>
+    <p>
+      Formulate contact as a mathematical program — a linear complementarity problem (LCP), a
+      nonlinear one (NCP), or a convex cone program — solve it with a dedicated solver, and apply the
+      implicit function theorem to the optimality conditions of that program. Nimble (Werling et al.,
+      RSS 2021) does this for an LCP formulation of hard inelastic contact, exploiting the sparsity of
+      the LCP solution so the gradient is cheap. Dojo (Howell et al., 2022) does it for an NCP with
+      second-order cone friction constraints, solved by a custom primal-dual interior-point method,
+      and gets smooth gradient approximations out of the interior-point relaxation almost for free.
+    </p>
+    <p>
+      This route gives the most physically faithful contact — no spongy interpenetration — and exact
+      derivatives of the solved problem. The cost is that the contact solver is now the centre of the
+      engine, and everything else has to be arranged around it.
+    </p>
+
+    <aside class="callout">
+      <strong>The gradients are not always what you expect, even when they are correct.</strong>
+      Suppose a block rests on a table and you differentiate the final position with respect to the
+      pushing force. Below the friction threshold the block does not move at all, so the exact
+      derivative is exactly zero — for every force in that range. The simulator is right. The
+      information you wanted ("push harder and it will eventually slide") is simply not present in the
+      local slope. Keep this example in mind; it is the whole of the next two sections.
+    </aside>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="contact">
+    <h2>4. The hard part: contact</h2>
+    <p>
+      Everything above works cleanly for a swinging arm in free space. Robots that do useful work
+      touch things, and touching is where the mathematics turns hostile. There are three separate
+      problems, and they are often mixed up.
+    </p>
+
+    <h3>Problem 1: the physics is not smooth</h3>
+    <p>
+      Contact introduces genuine non-smoothness. The normal force is zero when the gap is positive and
+      jumps to whatever is needed when the gap closes. Friction has two regimes — sticking and sliding
+      — with a kink between them. An impact changes velocity discontinuously. None of these are
+      artifacts of a numerical method; they are what the standard rigid-body model of contact says
+      happens.
+    </p>
+    <p>
+      The consequence for optimization is that the loss as a function of your parameters has flat
+      regions, kinks, and outright jumps. In a flat region the gradient is zero and tells you nothing.
+      At a jump the gradient does not exist, and whatever number the code returns describes only the
+      side you happen to be standing on. This is not a bug you can fix by being more careful with your
+      derivatives — a perfectly exact gradient of a flat function is still zero.
+    </p>
+
+    <div class="widget-frame" id="contact-landscape">
+      <p class="widget-title">Widget 2 — what contact does to the loss surface</p>
+      <p class="widget-sub">
+        A pusher reaches a distance $\theta$ toward a block and shoves it; the loss is how far the
+        block ends up from its target. Below $\theta = 0.35$ the pusher misses, so the loss is exactly
+        flat and its gradient is exactly zero. Start with softness $\varepsilon$ at its smallest and
+        press "run gradient descent" — the optimizer never moves. Now raise $\varepsilon$, which
+        replaces the hard contact with a soft one that pushes a little even before it touches. Watch
+        the gradient come alive, and watch the row labelled "answer shifted by softening" get worse at
+        the same time.
+      </p>
+    </div>
+
+    <p>
+      That widget contains the entire trade-off of the field. The exact model gives you the right
+      answer and no way to find it. The softened model gives you a signal you can descend, and a
+      slightly wrong answer. The design of a differentiable contact model is the design of that
+      compromise. Three families are in use.
+    </p>
+
+    <h3>Contact model family 1: penalty and compliant contact</h3>
+    <p>
+      Allow the bodies to overlap slightly, and push them apart with a force proportional to the
+      overlap depth $d$: $f_n = k\,d$ for $d > 0$, where $k$ is a stiffness constant. This is a smooth
+      function of position wherever $d>0$, so it differentiates cleanly. It is what ADD, DiffHand, and
+      Brax's spring pipeline use.
+    </p>
+    <p>
+      The refinement that matters is <strong>mollification</strong> — deliberately smoothing the
+      corner at $d = 0$. ADD's contribution is doing this in a principled way for both the normal and
+      the tangential (friction) forces, so that the whole contact law is a smooth function rather than
+      a piecewise one. The widget's $\varepsilon$ slider is exactly a mollification width: the softened
+      force is $f_n = k\,\varepsilon \log\!\big(1 + e^{\,d/\varepsilon}\big)$, which equals $k\,d$ when
+      the overlap is deep, tends to zero as the gap opens, and — crucially — is never exactly zero, so
+      a gradient always exists.
+    </p>
+    <p>
+      DiffHand adds a second mollification of its own, on the damping term. Contact needs damping or
+      bodies bounce forever. The original ADD damping force is proportional to the penetration speed,
+      $\dot d\,\vn$, which has a jump at the instant of first touch: at that moment $d = 0$ but
+      $\dot d \neq 0$, because the bodies are approaching at a finite speed, so the force leaps from
+      nothing to something. Newton's method inside an implicit integrator fails on jumps. DiffHand
+      makes the damping proportional to depth <em>and</em> speed,
+    </p>
+    <p class="eq">
+      $$ f_{\text{damp}} \;\propto\; d\,\dot d\,\vn, $$
+    </p>
+    <p>
+      which is zero at $d=0$ regardless of $\dot d$ and therefore grows continuously from the moment of
+      contact. That is a one-symbol change that turned a diverging solver into a converging one.
+    </p>
+
+    <h3>Contact model family 2: complementarity</h3>
+    <p>
+      Model contact exactly, as a constraint: either the gap is zero and the force is positive, or the
+      gap is positive and the force is zero, never both positive. Written down, that is
+      $0 \le d \perp f_n \ge 0$, where $\perp$ means the product is zero. Collect all contacts and you
+      get a complementarity problem — linear (LCP) if you approximate the friction cone by a polygon,
+      nonlinear (NCP) if you keep the true cone. Nimble solves an LCP; Dojo solves an NCP with a
+      second-order cone; MuJoCo uses a convex relaxation.
+    </p>
+    <p>
+      The gradient comes from implicitly differentiating the optimality conditions, and it is exact
+      for the model. But the model itself is the non-smooth one, so you inherit the flat regions and
+      the jumps. Dojo's answer is instructive: its interior-point solver never drives the
+      complementarity all the way to zero, keeping a small relaxation parameter, and that relaxation
+      acts as a built-in smoothing — you get an approximate gradient that is actually informative,
+      with a knob controlling how approximate.
+    </p>
+
+    <h3>Problem 2: stiffness makes gradients explode</h3>
+    <p>
+      The backward recursion multiplies by $A_t^\top$ once per time step. If the physics is stiff —
+      hard contact, high stiffness $k$ — then $A_t$ has large entries, and a product of $T$ of them
+      can be astronomically large or vanishingly small. This is exactly the exploding and vanishing
+      gradient problem of recurrent networks, arriving through physics instead of through weight
+      matrices. Over a 1,000-step rollout with hard contact, the gradient you get back can be numeric
+      nonsense even though every individual step was differentiated correctly.
+    </p>
+
+    <h3>Problem 3: chaos</h3>
+    <p>
+      Some physical systems are genuinely chaotic: two nearly identical initial states diverge
+      exponentially. In such a system the true gradient over a long horizon is enormous and points in
+      a direction that is meaningless beyond a few steps, because the loss surface at that scale is a
+      fine-grained mess. A bouncing, colliding pile of objects gets there quickly. No amount of
+      implementation quality helps; the gradient is correct and useless. The standard practical
+      response is to shorten the horizon — differentiate through 30 steps, not 3,000, and use a
+      learned value function to summarize the rest, which is what the SHAC method does.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="smooth-sec">
+    <h2>5. Smoothing, and what it costs</h2>
+    <p>
+      All the fixes are versions of one idea: replace the sharp loss with a blurred one. Formally,
+      instead of minimizing $\Loss(\theta)$, minimize
+    </p>
+    <p class="eq">
+      $$ \Loss_\sigma(\theta) \;=\; \mathbb{E}_{w \sim \mathcal{N}(0, \sigma^2 I)}
+         \big[\Loss(\theta + w)\big], $$
+    </p>
+    <p>
+      the average of the loss over random nudges of size $\sigma$ around where you are standing. This
+      function is smooth even when $\Loss$ is not, its gradient exists everywhere, and as $\sigma \to
+      0$ it converges back to the original. This is <strong>randomized smoothing</strong>, and it
+      unifies several things that look different: mollified contact models smooth the physics
+      directly; interior-point relaxation smooths the contact solve; adding action noise during
+      training smooths the loss. They all target $\Loss_\sigma$ rather than $\Loss$.
+    </p>
+    <p>
+      Now the important question: how do you estimate $\nabla\Loss_\sigma$? There are two ways, and
+      the difference between them is the single most useful thing to understand about differentiable
+      simulators.
+    </p>
+    <p class="eq">
+      $$ \underbrace{\hat g_1 = \frac{1}{N}\sum_{i=1}^{N} \nabla\Loss(\theta + w_i)}_{\text{first order}}
+         \qquad\qquad
+         \underbrace{\hat g_0 = \frac{1}{N}\sum_{i=1}^{N} \frac{w_i}{\sigma^2}\,\Loss(\theta + w_i)}_{\text{zeroth order}} $$
+    </p>
+    <p>
+      The first-order estimator averages <em>gradients</em>, which is what a differentiable simulator
+      makes possible. The zeroth-order estimator averages <em>loss values</em> weighted by the noise
+      that produced them, which is what an evolution strategy or a policy gradient method computes and
+      which needs no derivatives at all. Both are estimates of the same quantity,
+      $\nabla\Loss_\sigma$. They differ in two ways that matter enormously.
+    </p>
+    <p>
+      <strong>Variance.</strong> When the loss is smooth, the first-order estimator has far lower
+      variance — every sample contributes a full direction rather than one scalar comparison — so it
+      converges in far fewer samples. This is the good case, and it is the usual argument for
+      differentiable simulation.
+    </p>
+    <p>
+      <strong>Bias.</strong> When the loss has a jump, the first-order estimator is
+      <em>biased</em>, and not slightly. A gradient evaluated at a sample point measures the slope
+      where that sample landed. It cannot see a cliff that it did not land on. The zeroth-order
+      estimator compares loss values across samples, so a sample that lands on the far side of a cliff
+      reports a completely different number and the estimate moves. Suh, Simchowitz, Zhang and
+      Tedrake proved this out in <em>Do Differentiable Simulators Give Better Policy Gradients?</em>
+      (ICML 2022): first-order estimates win on Lipschitz-continuous systems with bounded gradients,
+      and can lose badly on stiff, discontinuous, or chaotic ones. Their proposed remedy is an
+      $\alpha$-order estimator that interpolates between the two, taking the efficiency of the
+      first-order estimate where it is trustworthy and the robustness of the zeroth-order one where it
+      is not.
+    </p>
+
+    <div class="widget-frame" id="smoothing">
+      <p class="widget-title">Widget 3 — what a gradient can and cannot see</p>
+      <p class="widget-sub">
+        Same pusher as before, plus a second strategy available below $\theta = 0.20$: reach under the
+        block instead of shoving it. It scores better than anything on the right, and it is a
+        <em>jump</em> away, not a slope away. Stand at $\theta = 0.25$, on the flat plateau. The exact
+        gradient is exactly zero, so the red arrow has no length. Now read the three numbers. The
+        blurred gradient — the honest target — is strongly positive, meaning "go left, toward the
+        cliff". The zeroth-order arrow agrees. The first-order arrow points the other way, because it
+        averages slopes and no slope it lands on knows the cliff is there. It is not noisy. It is
+        confidently wrong.
+      </p>
+    </div>
+
+    <p>
+      Play with the sample count too. With $N$ small the zeroth-order arrow jumps around every time you
+      redraw — that is its variance, and it is why model-free methods need thousands of episodes. The
+      first-order arrow is steady, and steadily pointed at an answer that ignores the cliff. Neither
+      is simply better. Knowing which failure you are facing is the skill.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="landscape">
+    <h2>6. The landscape: what exists today</h2>
+    <p>
+      Here is the field as of mid-2026, ordered by when each appeared. "Gradient route" refers to the
+      three families in section 3.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Simulator</th><th>Year</th><th>Physics</th><th>Gradient route</th><th>Contact model</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">Degrave et al.</td><td>2016</td><td>rigid bodies</td><td>A — autodiff (Theano)</td><td>spring / penalty</td><td>the first demonstration; a physics engine written as an expression graph</td></tr>
+        <tr><td class="cat">ChainQueen</td><td>2019</td><td>soft bodies (MLS-MPM)</td><td>A + B</td><td>particle-grid transfer</td><td>real-time differentiable soft robotics; ancestor of DiffTaichi</td></tr>
+        <tr><td class="cat">DiffTaichi</td><td>2020</td><td>10 simulators: MPM, rigid, fluid, cloth</td><td>A — source-transform autodiff</td><td>varies by simulator</td><td>a language, not an engine; 188× faster than the same code in TensorFlow</td></tr>
+        <tr><td class="cat">ADD</td><td>2020</td><td>articulated rigid + deformable</td><td>B — analytic adjoint</td><td>mollified frictional penalty</td><td>introduced principled smoothing of normal and friction forces</td></tr>
+        <tr><td class="cat">Nimble</td><td>2021</td><td>articulated rigid</td><td>C — implicit diff of an LCP</td><td>hard LCP contact</td><td>exploits LCP sparsity; exact hard contact with analytic gradients</td></tr>
+        <tr><td class="cat">Brax</td><td>2021</td><td>rigid bodies</td><td>A — JAX autodiff</td><td>spring, positional, generalized</td><td>massively parallel on TPU/GPU; physics now folded into MuJoCo MJX</td></tr>
+        <tr><td class="cat"><strong>DiffHand</strong></td><td>2021</td><td>articulated rigid + <em>geometry</em></td><td>B — analytic adjoint</td><td>penalty with a signed distance field</td><td>gradients w.r.t. contact point positions; the example in section 8</td></tr>
+        <tr><td class="cat">PlasticineLab</td><td>2021</td><td>elastoplastic material (MPM)</td><td>A — DiffTaichi</td><td>soft, no rigid contact</td><td>a benchmark of soft-body manipulation tasks with gradients</td></tr>
+        <tr><td class="cat">Dojo</td><td>2022</td><td>rigid bodies</td><td>C — implicit function theorem</td><td>NCP, second-order friction cone</td><td>interior-point relaxation doubles as smoothing; Julia with Python bindings</td></tr>
+        <tr><td class="cat">NVIDIA Warp</td><td>2022</td><td>rigid, cloth, particles, FEM</td><td>A — kernel-level autodiff</td><td>penalty / soft</td><td>write CUDA-style kernels in Python and get gradients; base layer for others</td></tr>
+        <tr><td class="cat">MuJoCo MJX</td><td>2023</td><td>articulated rigid</td><td>A — JAX autodiff</td><td>convex relaxation (CCP)</td><td>MuJoCo rewritten in JAX; gradients supported, best for small scenes</td></tr>
+        <tr><td class="cat">Genesis</td><td>2024</td><td>rigid, MPM, fluids, cloth</td><td>A — compiler autodiff + hand-written kernels</td><td>varies by solver</td><td>the MPM and tool solvers are differentiable; rigid-body gradients are still being added</td></tr>
+        <tr><td class="cat">MuJoCo Warp</td><td>2025</td><td>articulated rigid</td><td>—</td><td>convex relaxation</td><td>MuJoCo on Warp for large scenes; very fast, differentiability not yet available</td></tr>
+        <tr><td class="cat">Newton</td><td>2025</td><td>multi-solver, GPU</td><td>A — Warp</td><td>pluggable</td><td>Disney Research + Google DeepMind + NVIDIA, now under the Linux Foundation; built on Warp and OpenUSD with differentiable physics as a stated goal</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      Years are first public release or publication. This is a selection, not a census — the soft-body,
+      cloth, fluid and cutting literature each have their own differentiable engines.
+    </p>
+
+    <h3>How fast is fast?</h3>
+    <p>
+      Speed numbers in this area are hard to compare because they measure different things, but one
+      set is worth quoting because it shows the range. A 2024 analytic-adjoint engine reports
+      gradient computation times on an Apple M3 CPU of 4.1 microseconds for a UR5 arm, 14.7
+      microseconds for a half-cheetah, and 95.2 microseconds for a 36-degree-of-freedom humanoid,
+      against about 1 millisecond for the half-cheetah in Nimble — roughly a hundredfold gap between
+      implementations of the same idea, and 75 to 280 times faster than finite differences on the same
+      systems. The lesson is not that one engine wins. It is that "differentiable" spans several
+      orders of magnitude in cost, and the constant factor decides whether you can afford to use the
+      gradient inside a training loop.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="uses">
+    <h2>7. What people use them for</h2>
+
+    <h3>System identification</h3>
+    <p>
+      The most reliable use, and the one that works today with the least fuss. You have a real robot
+      and a video or a log of it moving. You have a simulator whose parameters — masses, friction
+      coefficients, motor constants, damping — you do not know exactly. Define the loss as the
+      mismatch between simulated and recorded trajectories, and descend on the parameters. This is a
+      small, static parameter vector and a short horizon, so none of the pathologies bite hard. It is
+      the classic use of adjoint methods in engineering, decades older than the robotics work.
+    </p>
+
+    <h3>Trajectory optimization</h3>
+    <p>
+      Optimize the open-loop control sequence $u_{0:T-1}$ directly for one task from one initial
+      state. This is what DiffHand does, and it is where gradients shine: hundreds of variables, one
+      well-defined loss, no need to generalize. The output is a single motion, not a policy — change
+      the starting conditions and you re-run the optimizer.
+    </p>
+
+    <h3>Policy learning</h3>
+    <p>
+      Replace the sampling-based gradient of reinforcement learning with the analytic one. This is the
+      most attractive use and the most fragile, for all the reasons in sections 4 and 5. The methods
+      that make it work do not differentiate through the whole episode: SHAC (Xu et al., ICML 2022 —
+      same first author as DiffHand) differentiates through a short window of steps and uses a learned
+      critic to stand in for everything after it, which keeps the gradient short enough to stay sane
+      while still using first-order information. Others blend first- and zeroth-order estimates, as
+      Suh et al. propose.
+    </p>
+
+    <h3>Design and co-design</h3>
+    <p>
+      Optimize the robot's physical parameters rather than its commands. Simple versions optimize link
+      lengths or motor sizes. The hard version — optimizing shape, so that the geometry of contact
+      changes — is what section 8 is about, and it needs derivatives that most simulators do not
+      expose.
+    </p>
+
+    <h3>Soft bodies, cloth, and fluids</h3>
+    <p>
+      Deformable simulation is a natural fit, because there is no rigid contact discontinuity to
+      fight: the material itself is the smoothing. ChainQueen, DiffTaichi and PlasticineLab all live
+      here, and gradient-based control of deformables is noticeably more reliable than gradient-based
+      control of rigid contact.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="diffhand">
+    <h2>8. Worked example: differentiating the hardware</h2>
+    <p>
+      Now the example. <em>An End-to-End Differentiable Framework for Contact-Aware Robot Design</em>
+      (Xu, Chen, Zlokapa, Foshey, Matusik, Sueda and Agrawal, RSS 2021) is a good case study because
+      it pushes on the weakest point of the whole idea. Everything in sections 1 through 5 assumed
+      that $\theta$ is a list of physical constants. DiffHand asks what happens when $\theta$ is the
+      <em>shape</em> of the robot — and therefore, since contact happens on surfaces, when changing
+      $\theta$ moves the very points where the physics is non-smooth.
+    </p>
+    <p>
+      Two problems have to be solved to make that work. First, you need a way to describe a
+      complicated 3D shape with a handful of numbers, such that every setting of those numbers is a
+      robot you could actually build, and such that the map from numbers to geometry is
+      differentiable. Second, you need a simulator that reports derivatives with respect to geometry,
+      not just controls.
+    </p>
+
+    <h3>Describing a shape with 9 numbers: cage-based deformation</h3>
+    <p>
+      The shape trick comes from computer graphics. Wrap the detailed mesh of a robot part inside a
+      coarse closed surface called a <strong>cage</strong>, whose corners are called
+      <strong>handles</strong>. Precompute, once, a set of weights $\vw$ for every point in the mesh
+      such that the point is the weighted average of the handles:
+    </p>
+    <p class="eq">
+      $$ \tilde s \;=\; \sum_{j=1}^{|H|} \vw_j\, \tilde\psi_h(j)
+         \qquad\text{with}\qquad \sum_{j=1}^{|H|} \vw_j = 1 , $$
+    </p>
+    <p>
+      where $j$ indexes the handles, $|H|$ is how many there are, $\tilde\psi_h(j) \in \mathbb{R}^3$
+      is handle $j$'s position in the original shape, and $\tilde s$ is the original position of the
+      mesh point. Then at run time, move the handles to new positions $\psi_h$ and recompute the point
+      with the <em>same</em> weights:
+    </p>
+    <p class="eq">
+      $$ s \;=\; \sum_{j=1}^{|H|} \vw_j\, \psi_h(j) . $$
+    </p>
+    <p>
+      That is the whole method, and it gives three things at once. It is a weighted average, so the
+      map from handles to mesh is <strong>linear</strong> — fast to evaluate, and its derivative is
+      the constant weight matrix, known in closed form with no run-time cost. It is smooth in space,
+      so nearby mesh points always move to nearby places and local details keep their proportions. And
+      it is <strong>low-dimensional</strong>: a mesh with thousands of vertices is driven by a dozen
+      handles.
+    </p>
+    <p>
+      The specific weights are <strong>mean value coordinates</strong>. For a point $v$ inside a
+      polygonal cage in two dimensions, with $\alpha_i$ the angle at $v$ subtended by the edge from
+      handle $p_i$ to handle $p_{i+1}$:
+    </p>
+    <p class="eq">
+      $$ \hat w_i = \frac{\tan(\alpha_{i-1}/2) + \tan(\alpha_i/2)}{\lVert p_i - v\rVert},
+         \qquad \vw_i = \frac{\hat w_i}{\sum_k \hat w_k}. $$
+    </p>
+    <p>
+      Handles far from the point get small weights; handles whose edges fill more of the point's field
+      of view get larger ones. The three-dimensional version replaces angles with solid angles.
+      Precomputing costs $\mathcal{O}(|V|\cdot|H|)$ — one weight per vertex-handle pair — so a part
+      with 3,000 vertices and 16 handles stores 48,000 numbers, once.
+    </p>
+
+    <div class="widget-frame" id="cage-lab">
+      <p class="widget-title">Widget 4 — drag the cage, watch the mesh follow</p>
+      <p class="widget-sub">
+        The orange outline is the detailed fingertip mesh; the blue dashed polygon is the cage and the
+        blue circles are its handles. Drag any handle. This is a real mean value coordinates
+        implementation — the weights are computed once from the rest shape and then held fixed, exactly
+        as in the equations above. The mesh never tears and never develops a sharp kink. Press "grow a
+        hook" to see the deformation that the optimizer found in Figure 1.
+      </p>
+    </div>
+
+    <h3>Keeping the robot in one piece</h3>
+    <p>
+      A robot is many parts bolted together, and if each cage moves independently the parts drift
+      apart into a design nobody can build. Two constraints fix this.
+    </p>
+    <p>
+      The <strong>fabrication constraint</strong> gives different parts different freedom. A phalanx
+      segment is 3D printed, so its handles may go anywhere. A joint houses a standard-size bearing
+      and pin, so squashing it across the axis makes it useless; its cage may only stretch
+      <em>along</em> the axis of rotation. This is encoded by driving each part's handles from a small
+      set of allowed scale parameters rather than from free coordinates.
+    </p>
+    <p>
+      The <strong>connectivity constraint</strong> is the interesting one, and mean value coordinates
+      solve it with a property that falls out of the formula. If a point lies exactly in the plane of
+      a cage face, and inside that face's triangle $\langle H_1,H_2,H_3\rangle$, then
+    </p>
+    <p class="eq">
+      $$ \vw^{s}_i =
+         \begin{cases}
+           0, & i \notin \{H_1,H_2,H_3\} \\[2pt]
+           > 0, & i \in \{H_1,H_2,H_3\}
+         \end{cases} $$
+    </p>
+    <p>
+      — a point on a face is controlled only by that face's handles, and by nothing else in the cage.
+      So DiffHand builds every part's cage with a face coplanar with, and containing, the surface where
+      that part bolts to its neighbour. The handles on that face are the <strong>connection
+      handles</strong>, every connectable pair of parts is given identical connection handle layouts,
+      and when two parts are joined their overlapping connection handles are <em>merged</em> into one
+      shared variable. The two interface surfaces are then weighted averages of the same handles, so
+      they move identically, for every value of the parameters, with no constraint solver and no
+      penalty term. The constraint holds by construction.
+    </p>
+
+    <div class="widget-frame" id="connect-lab">
+      <p class="widget-title">Widget 5 — merged handles vs. independent cages</p>
+      <p class="widget-sub">
+        A joint (green cage, allowed to stretch only along its axis) and a phalanx segment (yellow
+        cage, free). Drag any handle. Switch to "independent cages" and drag a shared handle: the parts
+        come apart and the readout reports the mismatch in pixels. Switch back to merged and the same
+        drag reshapes the robot with the interface staying exactly matched.
+      </p>
+    </div>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/component_database.jpg" alt="Five manipulator components with their deformation cages."/>
+      <img src="assets/figures/articulated_CBD.jpg" alt="A joint and a phalanx, their cages, merged connection handles, and a valid versus invalid deformation."/>
+      <figcaption>
+        <strong>Figure 2.</strong> Left: the whole component library — finger base, phalanx segment,
+        fingertip, knuckle, joint. Parts in yellow cages deform freely because they are printed; parts
+        in green cages stretch only along the joint axis because they hold bought hardware. Right: the
+        connection surfaces (blue) sit inside coplanar cage faces; merging those handles ties the parts
+        together, and panel (c) shows what happens without the merge — the design falls apart.
+      </figcaption>
+    </figure>
+
+    <p>
+      The result of both constraints is a design vector $\psi_c$ of just <strong>9 numbers</strong> for
+      a single finger and <strong>17</strong> for a two-finger gripper, consisting of cage scale
+      lengths and a few auxiliary offsets. Every setting inside its box of bounds is connected,
+      manufacturable and simulatable — there is no such thing as an invalid design to reject or
+      repair.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/gallery.jpg" alt="Randomly sampled morphology designs for a single finger and a two-finger gripper."/>
+      <figcaption>
+        <strong>Figure 3.</strong> What 9 and 17 numbers can express. Leftmost column: the starting
+        designs. Everything else: random samples of $\psi_c$. Every one is a buildable robot.
+      </figcaption>
+    </figure>
+
+    <h3>The simulator side: derivatives with respect to geometry</h3>
+    <p>
+      Now the part that connects back to sections 1 through 5. A simulator does not consume a mesh; it
+      consumes physical quantities. DiffHand's third map, $\mathcal{P}$, converts mesh vertex positions
+      into five simulation parameters: the joint transforms $E_j$ and body transforms $E_b$ (both in
+      $\mathrm{SE}(3)$, meaning a rotation plus a translation), the generalized inertia $I$, the
+      contact point positions $C_b$ expressed in each body's own frame, and the surface area $a$
+      associated with each contact point.
+    </p>
+    <p>
+      Changing the shape changes all five. A longer phalanx moves the next joint outward: that is
+      $E_j$. A thicker one changes how hard it is to spin: that is $I$. Inertia is computed by fitting
+      a cuboid to the deformed part, because a cuboid's inertia is a short closed-form expression in
+      its side lengths — and because a 3D printed part has an internal infill pattern, so a
+      mesh-exact inertia would not match the real object anyway.
+    </p>
+    <p>
+      The contact points are the clever bit. Before optimization, DiffHand samples points uniformly
+      over each part's rest-shape surface. These are points inside the cage, so they have mean value
+      coordinates just like mesh vertices, and they are carried along by the same weighted average.
+      Stretch the fingertip and its candidate contact points stretch with it, with a derivative that is
+      the same constant weight matrix. The contact area $a$, which scales how much friction force each
+      point can carry, comes from the ratio of the cage's total surface area before and after
+      deformation — a bigger pad grips harder.
+    </p>
+    <p>
+      On the physics side the simulator uses reduced coordinates — state is the joint angles, so joints
+      are satisfied exactly and there are no constraint forces to differentiate — with BDF2 implicit
+      integration (SDIRK2 for the first step, since BDF2 needs two past states), Newton's method with
+      line search at each step, and the adjoint method of section 2 for gradients, reusing each step's
+      final Newton factorization in a block banded triangular solve. Contact is the mollified penalty
+      model of section 4, with a signed distance field attached to the manipulated object. Querying it
+      at a contact point's world position returns the penetration distance $d$, penetration speed
+      $\dot d$, contact normal $\vn$ and tangential velocity — and the derivatives of all four with
+      respect to the robot's joint angles $q_b$, the object's coordinates $q_o$, <em>and</em> the
+      contact point position $C_b$.
+    </p>
+    <p>
+      That last derivative is the one that does not exist in other simulators, and it is the one that
+      says "this contact would have gone better if the fingertip surface were <em>there</em> instead of
+      here". Two changes were needed to get it: extending ADD's contact model from one moving body
+      against a static surface to two moving bodies, and the $d\,\dot d\,\vn$ damping fix from section
+      4.
+    </p>
+
+    <h3>The chain</h3>
+    <p>
+      Stack the three maps and you have the whole thing:
+    </p>
+    <p class="eq">
+      $$ \mathcal{F} = \mathcal{P} \circ \mathcal{M} \circ \mathcal{H}:\;
+         \mathbb{R}^{m} \to \mathbb{R}^{|H|\times 3} \to \mathbb{R}^{|V|\times 3} \to \mathbb{R}^{p},
+         \qquad
+         \psi_h = \mathcal{H}(\psi_c),\;\; \psi_M = \mathcal{M}(\psi_h),\;\; \psi_p = \mathcal{P}(\psi_M) $$
+    </p>
+    <p>
+      with $m$ the number of design numbers (9 or 17), $|H|$ the handle count, $|V|$ the mesh vertex
+      count, and $p$ the number of simulation parameters (376 to 9,228 depending on the task).
+      $\mathcal{H}$ is scaling, $\mathcal{M}$ is the weight matrix, $\mathcal{P}$ is closed-form
+      geometry. All three are analytically differentiable, so
+    </p>
+    <p class="eq">
+      $$ \frac{d\psi_p}{d\psi_c} = \frac{d\psi_p}{d\psi_M}\frac{d\psi_M}{d\psi_h}\frac{d\psi_h}{d\psi_c},
+         \qquad
+         \frac{d\Loss}{d\psi_c} = \frac{d\Loss}{d\psi_p}\,\frac{d\psi_p}{d\psi_c}. $$
+    </p>
+    <p>
+      Stack $d\Loss/d\psi_c$ and $d\Loss/du$ into one vector, hand it to L-BFGS-B — a quasi-Newton
+      optimizer that builds a curvature estimate from past gradients and handles simple upper and lower
+      bounds on variables, which is all the constraint structure this problem has — and you are doing
+      gradient descent on a robot's body and brain at the same time.
+    </p>
+
+    <video class="manim-video" autoplay loop muted playsinline preload="metadata">
+      <source src="assets/videos/codesign_loop.mp4" type="video/mp4"/>
+    </video>
+    <p class="video-caption">
+      DiffHand's loop. Blue: the forward chain from design numbers $\psi_c$ through handles, mesh and
+      simulation parameters to the loss. With a flat fingertip the finger can only push, and the heavy
+      box falls back. Green: the backward pass, which reaches all the way to the cage handles, so the
+      tip grows a hook. Run the same controller again and the hook catches the far face. The thing that
+      changed is the hardware.
+    </p>
+
+    <figure class="paper-figure">
+      <img src="assets/figures/pipeline.png" alt="The full DiffHand pipeline from morphology parameters to loss with gradients flowing back."/>
+      <figcaption>
+        <strong>Figure 4.</strong> The paper's own diagram. Blue arrows are $\mathcal{H}$,
+        $\mathcal{M}$, $\mathcal{P}$ and the loss; green arrows are their derivatives. The top-left
+        block shows the two-level shape hierarchy: coloured arrows are the entries of $\psi_c$, which
+        set the cage handles, which deform the mesh.
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="results">
+    <h2>9. Does it work?</h2>
+    <p>
+      Four contact-rich tasks. <em>Finger Reach</em>: touch four scattered targets in sequence with a
+      wall-mounted finger that starts too short to reach two of them. <em>Flip Box</em>: rotate a heavy
+      hinged box by 90 degrees using as little energy as possible. <em>Rotate Rubik's Cube</em>: turn
+      the top layer of a fixed cube by 90 degrees, with a loss that deliberately gives almost no hint
+      about where to push. <em>Assemble</em>: two fingers push a small cube into a nearly
+      identically-sized hole in a mount that is free to slide away and is penalized for doing so.
+    </p>
+    <p>
+      Flip Box makes the losses concrete:
+    </p>
+    <p class="eq">
+      $$ \Loss = \sum_{t=1}^{T} c_u \lVert u_t\rVert^2
+         + c_{\text{touch}}\lVert p_t - p_{\text{touch}}\rVert^2
+         + c_{\text{flip}}\big\lVert \theta_t - \tfrac{\pi}{2}\big\rVert^2 $$
+    </p>
+    <p>
+      with $c_u = 5$, $c_{\text{flip}} = 50$, and $c_{\text{touch}} = 1$ for $t < T/2$ then $0$. Here
+      $u_t \in [-1,1]$ is the control, $p_t$ the fingertip position, $p_{\text{touch}}$ a point on the
+      box's back face, and $\theta_t$ the box's rotation angle. The touch term is a hint that only
+      applies in the first half of the episode — get over to the far face early — after which the
+      episode is judged purely on whether the box turned. The run is 150 steps at
+      $\Delta t_s = 0.005$ s with a new control every 5 steps over 6 joint degrees of freedom, giving
+      $|u| = 30 \times 6 = 180$ control numbers alongside the 9 shape numbers. Assemble is the largest:
+      500 steps at $\Delta t_s = 0.001$ s, control every 5 steps over 8 degrees of freedom, so
+      $|u| = 100\times 8 = 800$, plus 17 shape numbers.
+    </p>
+    <p>
+      The baselines are two evolutionary strategies (CMA-ES and (1+1)-ES), the reinforcement learning
+      co-optimization method of Luck et al. (soft actor-critic plus particle swarm), and — the
+      ablation that matters — the identical method with the shape parameters frozen. All use the same
+      shape parameterization; all were tuned; every method was run 5 times with different seeds.
+    </p>
+
+    <table class="results">
+      <thead>
+        <tr><th>Method</th><th>Finger Reach</th><th>Flip Box</th><th>Rotate Rubik's Cube</th><th>Assemble</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="cat">CMA-ES</td><td>0.39 ± 0.02</td><td class="win">0.00 ± 0.00</td><td class="win"><strong>0.02 ± 0.01</strong></td><td>0.28 ± 0.03</td></tr>
+        <tr><td class="cat">(1+1)-ES</td><td>0.35 ± 0.04</td><td>0.69 ± 0.39</td><td>0.87 ± 0.15</td><td>0.39 ± 0.09</td></tr>
+        <tr><td class="cat">RL (Luck et al.)</td><td>0.61 ± 0.05</td><td>0.41 ± 0.48</td><td>0.79 ± 0.31</td><td>0.91 ± 0.11</td></tr>
+        <tr><td class="cat">L-BFGS-B, control only</td><td>0.41 ± 0.00</td><td>1.00 ± 0.00</td><td>0.42 ± 0.39</td><td>0.77 ± 0.03</td></tr>
+        <tr><td class="cat"><strong>L-BFGS-B, co-design</strong></td>
+            <td class="win"><strong>0.17 ± 0.01</strong></td>
+            <td class="win"><strong>0.00 ± 0.00</strong></td>
+            <td>0.07 ± 0.09</td>
+            <td class="win"><strong>0.12 ± 0.11</strong></td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">
+      Lower is better; normalized so 1.00 is the worst observed and 0.00 the best. Metrics are
+      task-specific: time-averaged distance to targets; final angle error; final angle error; distance
+      from the cube's center to the hole's center. Mean ± standard deviation over 5 seeds.
+    </p>
+    <p>
+      <strong>Flip Box is the cleanest ablation.</strong> Same optimizer, same simulator, same loss —
+      the only difference is whether 9 numbers are allowed to move. Frozen, the method scores the worst
+      possible value on all 5 seeds. Unfrozen, the best possible value on all 5. The optimized design
+      explains why: a hook at the fingertip catches the box's back face and pulls, instead of trying to
+      push a heavy object uphill. CMA-ES also reaches 0.00 here, which is worth saying plainly — this
+      design space is small enough that random search can find the hook too, it just needs far more
+      episodes.
+    </p>
+    <p>
+      <strong>Assemble is where the gradient's advantage is largest,</strong> and the only task where
+      one method clearly succeeds. 17 shape numbers plus 800 control numbers is 817 dimensions, and
+      sampling in 817 dimensions with a few thousand episodes is hopeless. The optimized gripper has
+      fingers of <em>different lengths</em> — the long right finger pushes the cube while the short left
+      one braces the mount so it does not slide — and both fingers are flat and wide, which spreads
+      contact over more area and keeps the push stable. Overall the paper reports 10 to 30 times fewer
+      simulated episodes than the sampling baselines.
+    </p>
+    <p>
+      <strong>Rotate Rubik's Cube is the honest loss.</strong> CMA-ES wins it at 0.02 against 0.07, and
+      the paper's standard deviation of ±0.09 exceeds its mean, so at least one seed did badly. This is
+      section 4 and 5 arriving on schedule: that task's loss deliberately gives no hint about where to
+      make contact, so the surface near the start is flat, and a gradient method walks into a poor
+      corner and stays. Wide sampling finds the right strategy more reliably. It is the price of
+      following a slope.
+    </p>
+
+    <div class="widget-frame" id="codesign-landscape">
+      <p class="widget-title">Widget 6 — control-only vs. co-design vs. sampling</p>
+      <p class="widget-sub">
+        A stand-in loss surface over one design number (horizontal) and one control number (vertical);
+        darker is lower. "Control only" is trapped on a vertical line because the design is frozen.
+        "Co-design" follows the gradient in both directions. "CMA-ES" samples. Watch the final loss and
+        the episode counter together — the gap in the counter is the real result.
+      </p>
+    </div>
+
+    <figure class="paper-figure two-up">
+      <img src="assets/figures/task_visual.png" alt="Optimized designs and control trajectories for the four manipulation tasks."/>
+      <img src="assets/figures/results_curves.png" alt="Optimization curves for all methods on all four tasks."/>
+      <figcaption>
+        <strong>Figure 5.</strong> Left: the optimized design and motion for each task — note the
+        hooked tip in Flip Box, and the two clearly different finger lengths in Assemble. Right: loss
+        against number of simulated episodes, averaged over 5 seeds. The horizontal axis is the
+        currency that matters, since each episode is a full physics rollout. The gradient curves fall
+        to their final value within a few hundred episodes; the sampling curves are still descending
+        after thousands.
+      </figcaption>
+    </figure>
+
+    <h3>Two details worth keeping</h3>
+    <p>
+      <strong>A contact curriculum.</strong> Assemble needed one extra idea, and it is a direct
+      application of section 5. Contact makes the loss rough, so the paper scales the contact forces
+      down by $0.01$ in a first optimization stage, $0.1$ in a second, and $1$ — the true value — in a
+      third, moving on whenever L-BFGS-B converges. Weak contact means a smooth objective on which the
+      optimizer can find approximately the right shape and motion; then the forces are restored and the
+      solution is refined. This is smoothing by another name, applied as a schedule. Notably it did
+      <em>not</em> help the baselines: given the same three-stage budget they could not solve even the
+      easiest stage, so an easier warm-up gave them nothing and simply cost them two thirds of their
+      episodes.
+    </p>
+    <p>
+      <strong>It survived contact with reality.</strong> Two optimized fingers were 3D printed on a
+      Markforged printer in Onyx, a nylon filled with chopped carbon fiber, with almost no manual
+      editing needed — the payoff of building the manufacturing constraints into the parameterization
+      instead of checking them afterwards. The Flip Box finger was then tendon-driven with Vectran
+      cables pulled by Dynamixel servos, mounted on a UR5 arm, and hand-programmed to follow waypoints
+      from the optimized trajectory. It flipped the cube, and cubes of several other sizes the
+      optimizer had never seen.
+    </p>
+    <p>
+      One more result worth a sentence, because it is about parameterization rather than physics. In a
+      free-form grasping task the paper compared its cage handles (396 variables) against optimizing
+      mesh vertex positions directly (8,946 variables) inside the same differentiable framework. The
+      mesh version succeeded on 30 of 30 runs against 29 of 30, but the cage version reached a better
+      average loss and produced smooth printable surfaces where the mesh version produced spikes and
+      self-crossing triangles. A mesh vertex moved alone has no reason to stay near its neighbours; a
+      cage handle drags a smooth neighbourhood with it.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="limits">
+    <h2>10. When not to use one</h2>
+    <p>
+      It is worth writing the negative cases down explicitly, because enthusiasm in this area has
+      outrun the evidence more than once.
+    </p>
+    <ul>
+      <li><strong>Long horizons with hard contact.</strong> Hundreds of stiff contact events multiply
+        together in the backward recursion and the gradient becomes numerically meaningless. Shorten
+        the window and use a learned critic for the tail, or fall back on sampling.</li>
+      <li><strong>Losses whose useful structure is a jump.</strong> If the good strategy is
+        qualitatively different from your current one — grasp from the other side, re-orient before
+        pushing — no local slope points at it. This is what widget 3 shows and what the Rubik's cube
+        row measures.</li>
+      <li><strong>Chaotic contact piles.</strong> Many objects colliding is chaotic. The gradient is
+        correct and describes a landscape too fine to descend.</li>
+      <li><strong>When the simulator is wrong in a way the gradient will exploit.</strong> A softened
+        contact model that lets bodies sink into each other by a millimetre offers the optimizer free
+        grip that does not exist in reality. Gradient-based optimizers are excellent at finding such
+        gifts. The more you smooth, the more you should distrust the result.</li>
+      <li><strong>When you only have a handful of parameters.</strong> With 3 unknowns, finite
+        differences costs 6 rollouts and needs no special engine. The gradient's advantage is a
+        function of $n$; below some $n$ it is not worth the engineering.</li>
+    </ul>
+    <p>
+      The positive cases are equally clear: many parameters, short horizons, a smooth or smoothable
+      loss, and a well-posed target — system identification, trajectory optimization, deformable
+      manipulation, and design.
+    </p>
+  </section>
+
+  <!-- =============================================================== -->
+  <section id="what-it-means">
+    <h2>11. What it means</h2>
+    <p>
+      The general idea is small and keeps paying off: <strong>if you can differentiate it, you can
+      optimize it directly instead of searching around it.</strong> Deep learning learned that lesson
+      about function approximation twenty years ago. Differentiable simulation is the same lesson
+      applied to physics, and the reason it took longer is that physics contains one operation that
+      genuinely resists it — two surfaces meeting.
+    </p>
+    <p>
+      Most of the engineering in this area is downstream of that single problem. Penalty models,
+      mollified friction, interior-point relaxations, contact curricula, randomized smoothing,
+      short-horizon truncation, blended first- and zeroth-order estimators — all of them are
+      negotiations with the fact that contact is not smooth and optimization wants it to be. There is
+      no way around it, only a choice about how much bias to accept for how much signal.
+    </p>
+    <p>
+      What DiffHand adds to that story is a demonstration of how far the parameter vector can be
+      stretched. Once the simulator reports derivatives with respect to where the contact points are,
+      geometry becomes just another block of the gradient, and the boundary between "hardware" and
+      "software" turns out to be a choice about where you put your variables rather than a fact about
+      engineering. The hook on that fingertip is, formally, a learned parameter. It was found the same
+      way a network weight is found: forward pass, loss, backward pass, step.
+    </p>
+
+    <h3>Open problems</h3>
+    <ul>
+      <li><strong>Contact that is both exact and differentiable.</strong> Every current answer trades
+        one for the other. Dojo's relaxation and ADD's mollification are the best compromises so far,
+        not solutions.</li>
+      <li><strong>Gradients that survive long rollouts.</strong> Truncation with a critic works but
+        gives up the very thing that made the gradient attractive: knowing how a decision now affects
+        an outcome much later.</li>
+      <li><strong>Local minima and exploration.</strong> The clearest open direction, named in
+        DiffHand's own discussion: combine the wide search of sampling methods with the precision of
+        gradients, rather than choosing one.</li>
+      <li><strong>Discrete structure.</strong> Continuous shape has a gradient; the number of fingers
+        does not. Searching topology and geometry together needs an optimizer for mixed
+        discrete-continuous spaces.</li>
+      <li><strong>The reality gap, differentiated.</strong> DiffHand's printed finger worked with a
+        hand-programmed controller following optimized waypoints, not with the optimized torques
+        replayed directly. Transferring both design and control automatically means the simulator's
+        contact model has to be right, not just smooth.</li>
+    </ul>
+
+    <h3>The bottom line</h3>
+    <p>
+      A differentiable simulator is a physics engine that answers "what if" for every input at once,
+      for about twice the cost of answering "what happens". That is a large enough win to have
+      reorganized a corner of robotics around it — and small enough to disappear entirely the moment
+      your loss develops a cliff. Learn where the cliffs are, smooth deliberately rather than by
+      accident, and the gradient will reach places you would not have thought to look: including,
+      apparently, the shape of a fingertip.
+    </p>
+  </section>
+
+  <footer>
+    <p>
+      Worked example: <a href="https://arxiv.org/abs/2107.07501" target="_blank" rel="noopener">DiffHand, arXiv:2107.07501</a>
+      (RSS 2021) &nbsp;·&nbsp; <a href="http://diffhand.csail.mit.edu" target="_blank" rel="noopener">project page</a>
+    </p>
+    <p class="tiny">
+      Other work referenced: Degrave et al. 2016; ChainQueen (Hu et al., ICRA 2019);
+      DiffTaichi (Hu et al., ICLR 2020); ADD (Geilinger et al., SIGGRAPH Asia 2020);
+      Nimble (Werling et al., RSS 2021); Brax (Freeman et al. 2021); PlasticineLab (Huang et al., ICLR 2021);
+      Dojo (Howell et al. 2022); SHAC (Xu et al., ICML 2022);
+      <em>Do Differentiable Simulators Give Better Policy Gradients?</em> (Suh, Simchowitz, Zhang, Tedrake, ICML 2022);
+      MuJoCo MJX; NVIDIA Warp; Genesis; Newton (Disney Research, Google DeepMind, NVIDIA, Linux Foundation 2025).
+      All figures © their original authors, used here for educational explanation.
+    </p>
+  </footer>
+</article>
+
+<script src="assets/widgets.js"></script>
+</body>
+</html>
